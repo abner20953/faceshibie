@@ -1,0 +1,10638 @@
+package com.bidding.glasses
+
+import android.Manifest
+
+import android.app.Activity
+
+import android.content.ClipData
+
+import android.content.ClipboardManager
+
+import android.content.ContentUris
+
+import android.content.Context
+
+import android.content.Intent
+
+import android.content.pm.PackageManager
+
+import android.graphics.Bitmap
+
+import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+
+import android.graphics.Color
+
+import android.graphics.Matrix
+
+import android.graphics.Rect
+
+import android.hardware.display.DisplayManager
+
+import android.media.AudioAttributes
+
+import android.media.AudioManager
+
+import android.media.ExifInterface
+
+import android.media.MediaMetadataRetriever
+
+import android.media.ToneGenerator
+
+import android.net.Uri
+
+import android.os.Bundle
+
+import android.os.Handler
+
+import android.os.Looper
+
+import android.os.Build
+
+import android.provider.MediaStore
+
+import android.provider.OpenableColumns
+
+import android.speech.tts.TextToSpeech
+
+import android.util.Base64
+
+import android.util.Log
+
+import android.util.Size
+
+import android.view.Display
+
+import android.view.KeyEvent
+
+import android.view.MotionEvent
+
+import android.view.View
+
+import android.view.animation.AlphaAnimation
+
+import android.widget.Button
+
+import android.widget.FrameLayout
+
+import android.widget.ImageView
+
+import android.widget.LinearLayout
+
+import android.widget.ScrollView
+
+import android.widget.TextView
+
+import android.widget.Toast
+
+import androidx.appcompat.app.AlertDialog
+
+import androidx.appcompat.app.AppCompatActivity
+
+import androidx.core.app.ActivityCompat
+
+import androidx.core.content.ContextCompat
+
+import com.bidding.glasses.databinding.ActivityMainBinding
+
+import com.google.android.gms.tasks.Tasks
+
+import com.google.gson.Gson
+
+import com.google.gson.JsonObject
+
+import com.google.gson.reflect.TypeToken
+
+import com.google.mlkit.vision.common.InputImage
+
+import com.google.mlkit.vision.face.Face
+
+import com.google.mlkit.vision.face.FaceDetection
+
+import com.google.mlkit.vision.face.FaceDetector
+
+import com.google.mlkit.vision.face.FaceDetectorOptions
+
+import okhttp3.*
+
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+
+import okhttp3.RequestBody.Companion.toRequestBody
+
+import java.io.ByteArrayOutputStream
+
+import java.io.ByteArrayInputStream
+
+import java.io.File
+
+import java.io.IOException
+
+import java.text.SimpleDateFormat
+
+import java.util.*
+
+import java.util.concurrent.ExecutorService
+
+import java.util.concurrent.Executors
+
+import java.util.concurrent.RejectedExecutionException
+
+import java.util.concurrent.TimeUnit
+
+import kotlin.math.abs
+
+import kotlin.math.roundToInt
+
+// 引入 Rokid 官方 CXR-L (Cross Reality Link) 标准跨端协同开发包
+
+import com.rokid.cxr.link.CXRLink
+
+import com.rokid.cxr.link.callbacks.ICXRLinkCbk
+
+import com.rokid.cxr.link.callbacks.IImageStreamCbk
+
+import com.rokid.cxr.link.utils.CxrDefs
+
+import com.rokid.cxr.link.utils.GlassInfo
+
+import com.rokid.sprite.aiapp.externalapp.auth.AuthResult
+
+import com.rokid.sprite.aiapp.externalapp.auth.AuthorizationHelper
+
+import com.rokid.sprite.aiapp.externalapp.auth.GlassPermission
+
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+
+    private lateinit var binding: ActivityMainBinding
+
+    private lateinit var workExecutor: ExecutorService
+
+    private lateinit var thumbnailExecutor: ExecutorService
+
+    private val faceDetector: FaceDetector by lazy {
+
+        FaceDetection.getClient(
+
+            FaceDetectorOptions.Builder()
+
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+
+                .setMinFaceSize(0.08f)
+
+                .build()
+
+        )
+
+    }
+
+    private val sensitiveFaceDetector: FaceDetector by lazy {
+
+        FaceDetection.getClient(
+
+            FaceDetectorOptions.Builder()
+
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+
+                .setMinFaceSize(0.04f)
+
+                .build()
+
+        )
+
+    }
+
+    private val videoFaceDetector: FaceDetector by lazy {
+
+        FaceDetection.getClient(
+
+            FaceDetectorOptions.Builder()
+
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+
+                .setMinFaceSize(0.04f)
+
+                .enableTracking()
+
+                .build()
+
+        )
+
+    }
+
+    
+
+    // Rokid CXR-L 核心链路管理器与最新视频帧缓存
+
+    private var cxrLink: CXRLink? = null
+
+    private var cxrAuthToken: String? = null
+
+    @Volatile private var isCxrServiceConnected = false
+
+    @Volatile private var isGlassWirelessConnected = false
+
+    @Volatile private var pendingGlassCapture = false
+
+    @Volatile private var activeCaptureTaskId: String? = null
+
+    @Volatile private var timedOutCaptureTaskId: String? = null
+
+    @Volatile private var timedOutCaptureAcceptUntil = 0L
+
+    @Volatile private var activeCaptureRequestStartedAt = 0L
+
+    @Volatile private var activeCaptureRequestWidth = 0
+
+    @Volatile private var activeCaptureRequestHeight = 0
+
+    @Volatile private var activeCaptureRequestQuality = 0
+
+    @Volatile private var activeCaptureTimeoutMs = GLASS_CAPTURE_TIMEOUT_MS
+
+    @Volatile private var latestFrameBytes: ByteArray? = null
+
+    @Volatile private var capturedFrameBytes: ByteArray? = null // 用于缓存抓拍那一刻的图片数据，防止网络延迟后流画面更新导致裁剪错位
+
+    @Volatile private var lastLocalFaceCrop: Bitmap? = null
+
+    @Volatile private var isMatchingRequestRunning = false
+
+    @Volatile private var lastExternalCaptureTriggerAt = 0L
+
+    
+
+    // 缓存当前正在对比的 Bitmap 实例以防内存溢出与异步翻页冲突
+
+    private var currentLiveFace: Bitmap? = null
+
+    private var currentSystemFace: Bitmap? = null
+
+    // Rokid 官方双目 AR 防抖平视投影显示窗口 (用于在眼镜端投射半透明卡片)
+
+    private var arPresentation: CxrArPresentation? = null
+
+    
+
+    // 缓存多人匹配核验的结果列表以及当前显示的专家索引 (多人轮播核心状态)
+
+    private val matchedExpertsList = ArrayList<ExpertInfo>()
+
+    private var currentDisplayIndex = 0
+
+    private val recognitionRecords = Collections.synchronizedList(mutableListOf<RecognitionRecord>())
+
+    private var galleryPreviewPhotos: List<GalleryPhoto> = emptyList()
+
+    private val selectedGalleryPhotoKeys = Collections.synchronizedSet(mutableSetOf<String>())
+
+    private val processedGalleryPhotoKeys = Collections.synchronizedSet(mutableSetOf<String>())
+
+    @Volatile private var isGalleryPreviewLoading = false
+
+    private var isHandlingBottomNavSelection = false
+
+    private var isUpdatingBottomNavSelection = false
+
+    private var galleryPullStartY = 0f
+
+    private var isGalleryPulling = false
+
+    @Volatile private var isGalleryRefreshing = false
+
+    private val galleryBatchLock = Any()
+
+    @Volatile private var isGalleryBatchRunning = false
+
+    @Volatile private var galleryBatchFaceCount = 0
+
+    @Volatile private var galleryBatchExpertCount = 0
+
+    private var activeGalleryBatchId = 0L
+
+    private var activeGalleryBatchTotal = 0
+
+    private val activeGalleryBatchRecordIds = mutableSetOf<String>()
+
+    private val completedGalleryBatchRecordIds = mutableSetOf<String>()
+
+    private var videoPreviewItems: List<GalleryVideo> = emptyList()
+
+    private val selectedVideoKeys = Collections.synchronizedSet(mutableSetOf<String>())
+
+    @Volatile private var isVideoPreviewLoading = false
+
+    @Volatile private var isVideoRecognitionRunning = false
+
+    @Volatile private var activeVideoBatchId = 0L
+
+    private var videoPullStartY = 0f
+
+    private var isVideoPulling = false
+
+    @Volatile private var isVideoRefreshing = false
+
+    // 网络请求与配置
+
+    private val okHttpClient = OkHttpClient()
+
+    private var serverBaseUrl = "http://82.157.244.174"
+
+    private var glassCaptureWidth = DEFAULT_GLASS_CAPTURE_WIDTH
+
+    private var glassCaptureHeight = DEFAULT_GLASS_CAPTURE_HEIGHT
+
+    private var glassCaptureQuality = DEFAULT_GLASS_CAPTURE_QUALITY
+
+    private var soundPromptEnabled = true
+
+    
+
+    // 语音播报 TTS
+
+    private var tts: TextToSpeech? = null
+
+    private var isTtsInitialized = false
+
+    
+
+    // UI 自动淡出 Handler
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val diagnosticTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.CHINA)
+
+    private val historyTimeFormat = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
+
+    private val diagnosticLines = ArrayDeque<String>()
+
+    private val hideArRunnable = Runnable { hideArOverlay() }
+
+    private val glassCaptureTimeoutRunnable = Runnable {
+
+        if (pendingGlassCapture) {
+
+            val timeoutTaskId = activeCaptureTaskId
+
+            timedOutCaptureTaskId = timeoutTaskId
+
+            timedOutCaptureAcceptUntil = System.currentTimeMillis() + LATE_CAPTURE_ACCEPT_MS
+
+            pendingGlassCapture = false
+
+            activeCaptureTaskId = null
+
+            isMatchingRequestRunning = false
+
+            updateRecognitionRecord(timeoutTaskId) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "眼镜拍照超时"
+
+                it.errorMessage = "眼镜拍照超时；若照片稍后回传，App 会继续尝试识别"
+
+            }
+
+            recordDiagnostic(
+
+                "抓拍超时: service=$isCxrServiceConnected, glass=$isGlassWirelessConnected, " +
+
+                    "latestFrameBytes=${latestFrameBytes?.size ?: 0}, lateAcceptMs=$LATE_CAPTURE_ACCEPT_MS"
+
+            )
+
+            playResultBeep(success = false)
+
+            updateStatus("眼镜拍照超时，若照片稍后回传将继续识别", isWorking = false)
+
+        }
+
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+
+        super.onCreate(savedInstanceState)
+
+        binding = ActivityMainBinding.inflate(layoutInflater)
+
+        setContentView(binding.root)
+
+        // 初始化本地语音播报和线程池
+
+        tts = TextToSpeech(this, this)
+
+        workExecutor = Executors.newFixedThreadPool(MAX_PARALLEL_WORKERS)
+
+        thumbnailExecutor = Executors.newCachedThreadPool()
+
+        loadRecognitionRecords()
+
+        loadProcessedGalleryPhotoKeys()
+
+        markInterruptedRecordsForRetry()
+
+        cleanupExpiredRecognitionRecords()
+
+        loadCaptureParams()
+
+        loadSoundSettings()
+
+        setupCaptureParamControls()
+
+        setupSoundSettingsControls()
+
+        renderHistoryList()
+
+        recordDiagnostic("App启动: ${deviceBrief()} app=${appVersionBrief()}")
+
+        // 1. 申请核心权限
+
+        if (!allPermissionsGranted()) {
+
+            recordDiagnostic("运行时权限未全部授予，开始请求: ${runtimePermissionStatus()}")
+
+            ActivityCompat.requestPermissions(
+
+                this, requiredRuntimePermissions(), REQUEST_CODE_PERMISSIONS
+
+            )
+
+        } else {
+
+            recordDiagnostic("运行时权限已满足: ${runtimePermissionStatus()}")
+
+            requestCxrAuthorizationAndConnect()
+
+        }
+
+        // 2. 绑定配置保存按钮
+
+        binding.btnSaveConfig.setOnClickListener {
+
+            val ipInput = binding.etServerIp.text.toString().trim()
+
+            if (ipInput.isNotEmpty()) {
+
+                serverBaseUrl = ipInput
+
+                Toast.makeText(this, "服务器配置已保存: $serverBaseUrl", Toast.LENGTH_SHORT).show()
+
+                recordDiagnostic("服务器地址已保存: $serverBaseUrl")
+
+            }
+
+            requestCxrAuthorizationAndConnect()
+
+            showMainPage()
+
+        }
+
+        // 手机屏幕上的手动抓拍比对按钮
+
+        binding.btnCapture.setOnClickListener {
+
+            recordDiagnostic("用户点击现场抓拍比对")
+
+            takePhotoAndMatch()
+
+        }
+
+        binding.btnOpenSettings.setOnClickListener {
+
+            showSettingsPage()
+
+        }
+
+        binding.btnOpenHistory.setOnClickListener {
+
+            showHistoryPage()
+
+        }
+
+        binding.btnBackMain.setOnClickListener {
+
+            showMainPage()
+
+        }
+
+        binding.btnBackFromHistory.setOnClickListener {
+
+            showMainPage()
+
+        }
+
+        binding.bottomNav.setOnItemSelectedListener { item ->
+
+            if (isUpdatingBottomNavSelection) {
+
+                return@setOnItemSelectedListener true
+
+            }
+
+            isHandlingBottomNavSelection = true
+
+            try {
+
+                when (item.itemId) {
+
+                    R.id.navCapture -> showMainPage()
+
+                    R.id.navGallery -> showGalleryPage()
+
+                    R.id.navVideo -> showVideoPage()
+
+                    R.id.navHistory -> showHistoryPage()
+
+                    R.id.navSettings -> showSettingsPage()
+
+                    else -> return@setOnItemSelectedListener false
+
+                }
+
+            } finally {
+
+                isHandlingBottomNavSelection = false
+
+            }
+
+            true
+
+        }
+
+        binding.btnStartGalleryRecognition.setOnClickListener {
+
+            startGalleryLatestRecognition()
+
+        }
+
+        setupGalleryPullRefresh()
+
+        setupVideoPullRefresh()
+
+        binding.btnStartVideoRecognition.setOnClickListener {
+
+            startVideoRecognition()
+
+        }
+
+        binding.btnPickVideo.setOnClickListener {
+
+            launchVideoPicker()
+
+        }
+
+        binding.btnPickGalleryImage.setOnClickListener {
+
+            launchImagePicker()
+
+        }
+
+        binding.btnCopyDiagnostics.setOnClickListener {
+
+            copyDiagnosticsToClipboard()
+
+        }
+
+        binding.btnClearFailedHistory.setOnClickListener {
+
+            clearFailedHistoryRecords()
+
+        }
+
+    }
+
+    private var isActivityResumed = false
+
+    override fun onResume() {
+
+        super.onResume()
+
+        isActivityResumed = true
+
+        recordDiagnostic("Activity 状态变更为: RESUMED")
+
+    }
+
+    override fun onPause() {
+
+        super.onPause()
+
+        isActivityResumed = false
+
+        recordDiagnostic("Activity 状态变更为: PAUSED")
+
+    }
+
+    @Deprecated("Use OnBackPressedDispatcher when the project adopts AndroidX activity callbacks.")
+
+    override fun onBackPressed() {
+
+        if (binding.settingsPage.visibility == View.VISIBLE ||
+
+            binding.historyPage.visibility == View.VISIBLE ||
+
+            binding.galleryPage.visibility == View.VISIBLE ||
+
+            binding.videoPage.visibility == View.VISIBLE
+
+        ) {
+
+            showMainPage()
+
+        } else {
+
+            super.onBackPressed()
+
+        }
+
+    }
+
+    private fun showSettingsPage() {
+
+        try {
+
+            binding.mainPage.visibility = View.GONE
+
+            binding.galleryPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_SETTINGS)
+
+            recordDiagnostic("切换到设置与诊断页面")
+
+        } catch (e: Exception) {
+
+            handlePageSwitchFailure("设置与诊断", e)
+
+        }
+
+    }
+
+    private fun showGalleryPage() {
+
+        try {
+
+            binding.mainPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.GONE
+
+            binding.galleryPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_GALLERY)
+
+            ensureGalleryPreviewLoaded()
+
+            recordDiagnostic("切换到图库识别页面")
+
+        } catch (e: Exception) {
+
+            handlePageSwitchFailure("图库识别", e)
+
+        }
+
+    }
+
+    private fun showVideoPage() {
+
+        try {
+
+            binding.mainPage.visibility = View.GONE
+
+            binding.galleryPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_VIDEO)
+
+            ensureVideoPreviewLoaded()
+
+            recordDiagnostic("切换到视频识别页面")
+
+        } catch (e: Exception) {
+
+            handlePageSwitchFailure("视频识别", e)
+
+        }
+
+    }
+
+    private fun showHistoryPage() {
+
+        try {
+
+            cleanupExpiredRecognitionRecords()
+
+            renderHistoryList()
+
+            binding.mainPage.visibility = View.GONE
+
+            binding.galleryPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_HISTORY)
+
+            recordDiagnostic("切换到识别记录页面")
+
+        } catch (e: Exception) {
+
+            handlePageSwitchFailure("识别记录", e)
+
+        }
+
+    }
+
+    private fun showMainPage() {
+
+        try {
+
+            binding.galleryPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.GONE
+
+            binding.mainPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_CAPTURE)
+
+            recordDiagnostic("返回识别主页面")
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("返回识别主页面异常", e)
+
+        }
+
+    }
+
+    private fun updateBottomNavSelection(page: String) {
+
+        val itemId = when (page) {
+
+            PAGE_GALLERY -> R.id.navGallery
+
+            PAGE_VIDEO -> R.id.navVideo
+
+            PAGE_HISTORY -> R.id.navHistory
+
+            PAGE_SETTINGS -> R.id.navSettings
+
+            else -> R.id.navCapture
+
+        }
+
+        if (isHandlingBottomNavSelection || isUpdatingBottomNavSelection) {
+
+            return
+
+        }
+
+        if (binding.bottomNav.selectedItemId != itemId) {
+
+            isUpdatingBottomNavSelection = true
+
+            try {
+
+                binding.bottomNav.selectedItemId = itemId
+
+            } finally {
+
+                isUpdatingBottomNavSelection = false
+
+            }
+
+        }
+
+    }
+
+    private fun handlePageSwitchFailure(pageName: String, throwable: Throwable) {
+
+        recordDiagnostic("切换${pageName}页面异常", throwable)
+
+        try {
+
+            binding.galleryPage.visibility = View.GONE
+
+            binding.videoPage.visibility = View.GONE
+
+            binding.settingsPage.visibility = View.GONE
+
+            binding.historyPage.visibility = View.GONE
+
+            binding.mainPage.visibility = View.VISIBLE
+
+            updateBottomNavSelection(PAGE_CAPTURE)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("页面异常恢复失败", e)
+
+        }
+
+        Toast.makeText(this, "${pageName}页面打开失败，已记录诊断日志", Toast.LENGTH_SHORT).show()
+
+    }
+
+    private fun setupCaptureParamControls() {
+
+        setCaptureParamFields(glassCaptureWidth, glassCaptureHeight, glassCaptureQuality)
+
+        binding.btnPresetCaptureBalanced.setOnClickListener {
+
+            applyCapturePreset(1920, 1080, 92, "稳定")
+
+        }
+
+        binding.btnPresetCaptureSharp.setOnClickListener {
+
+            applyCapturePreset(2560, 1440, 92, "接近官方")
+
+        }
+
+        binding.btnPresetCaptureHigh.setOnClickListener {
+
+            applyCapturePreset(3024, 4032, 90, "官方尺寸探测")
+
+        }
+
+        binding.btnSaveCaptureParams.setOnClickListener {
+
+            saveCaptureParamsFromFields(showToast = true)
+
+        }
+
+    }
+
+    private fun loadSoundSettings() {
+
+        soundPromptEnabled = getSharedPreferences(SOUND_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .getBoolean(SOUND_PREF_ENABLED, true)
+
+    }
+
+    private fun setupSoundSettingsControls() {
+
+        binding.switchSoundPrompt.isChecked = soundPromptEnabled
+
+        binding.switchSoundPrompt.setOnCheckedChangeListener { _, isChecked ->
+
+            soundPromptEnabled = isChecked
+
+            getSharedPreferences(SOUND_PREFS_NAME, Context.MODE_PRIVATE)
+
+                .edit()
+
+                .putBoolean(SOUND_PREF_ENABLED, isChecked)
+
+                .apply()
+
+            if (!isChecked) {
+
+                tts?.stop()
+
+            }
+
+            val text = if (isChecked) "声音提示已开启" else "声音提示已关闭"
+
+            Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("声音提示开关已变更: enabled=$isChecked")
+
+        }
+
+    }
+
+    private fun loadCaptureParams() {
+
+        val prefs = getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+
+        val savedWidth = prefs.getInt(CAPTURE_PREF_WIDTH, DEFAULT_GLASS_CAPTURE_WIDTH)
+
+        val savedHeight = prefs.getInt(CAPTURE_PREF_HEIGHT, DEFAULT_GLASS_CAPTURE_HEIGHT)
+
+        val savedQuality = prefs.getInt(CAPTURE_PREF_QUALITY, DEFAULT_GLASS_CAPTURE_QUALITY)
+
+        if (isValidCaptureParams(savedWidth, savedHeight, savedQuality)) {
+
+            glassCaptureWidth = savedWidth
+
+            glassCaptureHeight = savedHeight
+
+            glassCaptureQuality = savedQuality
+
+            return
+
+        }
+
+        glassCaptureWidth = DEFAULT_GLASS_CAPTURE_WIDTH
+
+        glassCaptureHeight = DEFAULT_GLASS_CAPTURE_HEIGHT
+
+        glassCaptureQuality = DEFAULT_GLASS_CAPTURE_QUALITY
+
+        prefs.edit()
+
+            .putInt(CAPTURE_PREF_WIDTH, glassCaptureWidth)
+
+            .putInt(CAPTURE_PREF_HEIGHT, glassCaptureHeight)
+
+            .putInt(CAPTURE_PREF_QUALITY, glassCaptureQuality)
+
+            .apply()
+
+        recordDiagnostic(
+
+            "已重置不稳定眼镜拍照参数: saved=${savedWidth}x$savedHeight q=$savedQuality, current=${captureParamsBrief()}"
+
+        )
+
+    }
+
+    private fun setCaptureParamFields(width: Int, height: Int, quality: Int) {
+
+        binding.etCaptureWidth.setText(width.toString())
+
+        binding.etCaptureHeight.setText(height.toString())
+
+        binding.etCaptureQuality.setText(quality.toString())
+
+    }
+
+    private fun applyCapturePreset(width: Int, height: Int, quality: Int, label: String) {
+
+        setCaptureParamFields(width, height, quality)
+
+        if (saveCaptureParamsFromFields(showToast = false)) {
+
+            Toast.makeText(this, "已应用$label: ${captureParamsBrief()}", Toast.LENGTH_SHORT).show()
+
+        }
+
+    }
+
+    private fun saveCaptureParamsFromFields(showToast: Boolean): Boolean {
+
+        val width = binding.etCaptureWidth.text.toString().trim().toIntOrNull()
+
+        val height = binding.etCaptureHeight.text.toString().trim().toIntOrNull()
+
+        val quality = binding.etCaptureQuality.text.toString().trim().toIntOrNull()
+
+        if (width == null || height == null || quality == null) {
+
+            Toast.makeText(this, "请完整填写宽、高、质量", Toast.LENGTH_SHORT).show()
+
+            return false
+
+        }
+
+        if (!isValidCaptureParams(width, height, quality)) {
+
+            Toast.makeText(
+
+                this,
+
+                "参数范围: 宽高 $CAPTURE_MIN_SIZE-$CAPTURE_MAX_SIZE，质量 $CAPTURE_MIN_QUALITY-$CAPTURE_MAX_QUALITY；4032x3024 q90 实测易超时",
+
+                Toast.LENGTH_SHORT
+
+            ).show()
+
+            return false
+
+        }
+
+        glassCaptureWidth = width
+
+        glassCaptureHeight = height
+
+        glassCaptureQuality = quality
+
+        getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .edit()
+
+            .putInt(CAPTURE_PREF_WIDTH, width)
+
+            .putInt(CAPTURE_PREF_HEIGHT, height)
+
+            .putInt(CAPTURE_PREF_QUALITY, quality)
+
+            .apply()
+
+        recordDiagnostic("眼镜拍照参数已应用: ${captureParamsBrief()}")
+
+        if (quality > DEFAULT_GLASS_CAPTURE_QUALITY) {
+
+            recordDiagnostic("高质量拍照参数测试: q=$quality，实测 q95 可能导致 CXR-L 无图片回调")
+
+        }
+
+        if (showToast) {
+
+            val message = if (quality > DEFAULT_GLASS_CAPTURE_QUALITY) {
+
+                "拍照参数已应用: ${captureParamsBrief()}，高质量档仅建议测试"
+
+            } else {
+
+                "拍照参数已应用: ${captureParamsBrief()}"
+
+            }
+
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+        }
+
+        return true
+
+    }
+
+    private fun isValidCaptureParams(width: Int, height: Int, quality: Int): Boolean {
+
+        return width in CAPTURE_MIN_SIZE..CAPTURE_MAX_SIZE &&
+
+            height in CAPTURE_MIN_SIZE..CAPTURE_MAX_SIZE &&
+
+            quality in CAPTURE_MIN_QUALITY..CAPTURE_MAX_QUALITY &&
+
+            !isKnownUnstableCaptureParams(width, height, quality)
+
+    }
+
+    private fun isKnownUnstableCaptureParams(width: Int, height: Int, quality: Int): Boolean {
+
+        return width == 4032 && height == 3024 && quality >= 90
+
+    }
+
+    private fun captureParamsBrief(): String {
+
+        return "${glassCaptureWidth}x$glassCaptureHeight q=$glassCaptureQuality"
+
+    }
+
+    private fun startGalleryLatestRecognition() {
+
+        if (!galleryImagePermissionsGranted()) {
+
+            recordDiagnostic("图库权限未满足，开始请求: ${galleryPermissionStatus()}")
+
+            ActivityCompat.requestPermissions(
+
+                this,
+
+                galleryImagePermissions(),
+
+                REQUEST_CODE_GALLERY_IMAGES
+
+            )
+
+            return
+
+        }
+
+        if (galleryPreviewPhotos.isEmpty()) {
+
+            loadGalleryPreview(force = true)
+
+            Toast.makeText(this, "正在加载图库预览，请确认勾选后再开始识别", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        val selectedKeys = synchronized(selectedGalleryPhotoKeys) { selectedGalleryPhotoKeys.toSet() }
+
+        val selectedPhotos = galleryPreviewPhotos.filter { galleryPhotoKey(it) in selectedKeys }
+
+        if (selectedPhotos.isEmpty()) {
+
+            updateGalleryStatus("请至少勾选 1 张照片后再开始识别")
+
+            Toast.makeText(this, "请先勾选要识别的照片", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        updateGalleryStatus("已开始 ${selectedPhotos.size} 张照片并行识别，可在记录页查看结果")
+
+        val batchId = startGalleryBatchProgress(selectedPhotos.size)
+
+        isGalleryBatchRunning = true
+
+        recordDiagnostic("用户启动图库照片识别: selected=${selectedPhotos.size}, loaded=${galleryPreviewPhotos.size}, permission=${galleryPermissionStatus()}")
+
+        selectedPhotos.forEachIndexed { index, photo ->
+
+            executeWorker("处理图库照片 ${index + 1}/${selectedPhotos.size}") {
+
+                processGalleryPhoto(index + 1, selectedPhotos.size, photo, batchId)
+
+            }
+
+        }
+
+    }
+
+    private fun startGalleryBatchProgress(total: Int): Long {
+
+        val batchId = System.currentTimeMillis()
+
+        synchronized(galleryBatchLock) {
+
+            activeGalleryBatchId = batchId
+
+            activeGalleryBatchTotal = total
+
+            activeGalleryBatchRecordIds.clear()
+
+            completedGalleryBatchRecordIds.clear()
+
+            galleryBatchFaceCount = 0
+
+            galleryBatchExpertCount = 0
+
+        }
+
+        updateGalleryBatchProgressUi(batchId, completed = 0, total = total, finished = false)
+
+        recordDiagnostic("图库批量识别进度开始: batchId=$batchId, total=$total")
+
+        return batchId
+
+    }
+
+    private fun registerGalleryBatchRecord(batchId: Long, recordId: String) {
+
+        var completed = 0
+
+        var total = 0
+
+        var accepted = false
+
+        synchronized(galleryBatchLock) {
+
+            if (activeGalleryBatchId == batchId) {
+
+                activeGalleryBatchRecordIds.add(recordId)
+
+                completed = completedGalleryBatchRecordIds.size
+
+                total = activeGalleryBatchTotal
+
+                accepted = true
+
+            }
+
+        }
+
+        if (accepted) {
+
+            updateGalleryBatchProgressUi(batchId, completed, total, finished = false)
+
+            recordDiagnostic("图库批量记录加入进度: batchId=$batchId, recordId=$recordId")
+
+        }
+
+    }
+
+    private fun updateGalleryBatchProgressForRecord(recordId: String, status: String) {
+
+        if (!isTerminalRecognitionStatus(status)) {
+
+            return
+
+        }
+
+        var batchId = 0L
+
+        var completed = 0
+
+        var total = 0
+
+        var shouldUpdate = false
+
+        var finished = false
+
+        synchronized(galleryBatchLock) {
+
+            if (recordId in activeGalleryBatchRecordIds && recordId !in completedGalleryBatchRecordIds) {
+
+                completedGalleryBatchRecordIds.add(recordId)
+
+                batchId = activeGalleryBatchId
+
+                completed = completedGalleryBatchRecordIds.size
+
+                total = activeGalleryBatchTotal
+
+                finished = total > 0 && completed >= total
+
+                shouldUpdate = true
+
+            }
+
+        }
+
+        if (shouldUpdate) {
+
+            updateGalleryBatchProgressUi(batchId, completed, total, finished)
+
+            recordDiagnostic(
+
+                "图库批量识别进度更新: batchId=$batchId, recordId=$recordId, " +
+
+                    "status=$status, completed=$completed/$total"
+
+            )
+
+        }
+
+    }
+
+        private fun updateGalleryBatchProgressUi(batchId: Long, completed: Int, total: Int, finished: Boolean) {
+        runOnUiThread {
+            synchronized(galleryBatchLock) {
+                if (activeGalleryBatchId != batchId) {
+                    return@runOnUiThread
+                }
+            }
+            binding.galleryProgressPanel.visibility = View.VISIBLE
+            binding.galleryBatchProgress.max = total.coerceAtLeast(1)
+            binding.galleryBatchProgress.progress = completed.coerceAtMost(total.coerceAtLeast(1))
+            
+            val resultText = if (finished) {
+                val outcome = when {
+                    galleryBatchFaceCount == 0 -> "未识别到人脸"
+                    galleryBatchExpertCount == 0 -> "未匹配到专家"
+                    else -> "发现专家 ${galleryBatchExpertCount} 人"
+                }
+                "识别完成: $outcome ($completed/$total)"
+            } else {
+                "正在识别 $completed/$total"
+            }
+            binding.tvGalleryProgress.text = resultText
+
+            if (finished) {
+                isGalleryBatchRunning = false
+                renderGalleryPreview(galleryPreviewPhotos)
+                updateGallerySelectionStatus()
+
+                val outcome = when {
+                    galleryBatchFaceCount == 0 -> "未识别到人脸"
+                    galleryBatchExpertCount == 0 -> "未匹配到专家"
+                    else -> "发现专家 ${galleryBatchExpertCount} 人"
+                }
+                updateGalleryStatus("批量识别完成: $outcome")
+                Toast.makeText(this@MainActivity, "图库识别完成: $outcome", Toast.LENGTH_SHORT).show()
+
+                if (galleryBatchExpertCount > 0) {
+                    playResultBeep(success = true)
+                    speakOut("图库识别完成，发现${galleryBatchExpertCount}名专家")
+                } else {
+                    playResultBeep(success = false)
+                    speakOut("图库识别完成，$outcome")
+                }
+
+                mainHandler.postDelayed({
+                    synchronized(galleryBatchLock) {
+                        if (activeGalleryBatchId != batchId ||
+                            completedGalleryBatchRecordIds.size < activeGalleryBatchTotal
+                        ) {
+                            return@postDelayed
+                        }
+                    }
+                    binding.galleryProgressPanel.visibility = View.GONE
+                    recordDiagnostic("图库批量识别进度隐藏: batchId=$batchId")
+                }, GALLERY_PROGRESS_HIDE_DELAY_MS)
+            }
+        }
+    }
+
+    private fun isTerminalRecognitionStatus(status: String): Boolean {
+
+        return status == STATUS_SUCCESS ||
+
+            status == STATUS_NO_FACE ||
+
+            status == STATUS_NO_MATCH ||
+
+            status == STATUS_FAILED ||
+
+            status == STATUS_INTERRUPTED
+
+    }
+
+    private fun setupGalleryPullRefresh() {
+
+        binding.galleryScroll.setOnTouchListener { _, event ->
+
+            if (isGalleryPreviewLoading || isGalleryRefreshing) {
+
+                return@setOnTouchListener false
+
+            }
+
+            when (event.actionMasked) {
+
+                MotionEvent.ACTION_DOWN -> {
+
+                    galleryPullStartY = event.y
+
+                    isGalleryPulling = binding.galleryScroll.scrollY == 0
+
+                    false
+
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+
+                    if (binding.galleryScroll.scrollY == 0 && event.y - galleryPullStartY > dp(GALLERY_PULL_HINT_DISTANCE_DP)) {
+
+                        isGalleryPulling = true
+
+                        showGalleryRefreshHint("松开刷新")
+
+                    }
+
+                    false
+
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+
+                    val pullDistance = event.y - galleryPullStartY
+
+                    if (isGalleryPulling && binding.galleryScroll.scrollY == 0 && pullDistance > dp(GALLERY_PULL_REFRESH_DISTANCE_DP)) {
+
+                        setGalleryRefreshing(true)
+
+                        recordDiagnostic("用户下拉刷新图库: pullDistance=${pullDistance.roundToInt()}")
+
+                        loadGalleryPreview(force = true)
+
+                    } else {
+
+                        hideGalleryRefreshHint()
+
+                    }
+
+                    isGalleryPulling = false
+
+                    false
+
+                }
+
+                else -> false
+
+            }
+
+        }
+
+    }
+
+    private fun showGalleryRefreshHint(text: String) {
+
+        binding.tvGalleryRefreshHint.text = text
+
+        binding.tvGalleryRefreshHint.visibility = View.VISIBLE
+
+    }
+
+    private fun hideGalleryRefreshHint() {
+
+        if (!isGalleryRefreshing) {
+
+            binding.tvGalleryRefreshHint.visibility = View.GONE
+
+        }
+
+    }
+
+    private fun setGalleryRefreshing(refreshing: Boolean) {
+
+        isGalleryRefreshing = refreshing
+
+        runOnUiThread {
+
+            if (refreshing) {
+
+                binding.tvGalleryRefreshHint.text = "正在刷新..."
+
+                binding.tvGalleryRefreshHint.visibility = View.VISIBLE
+
+            } else {
+
+                binding.tvGalleryRefreshHint.visibility = View.GONE
+
+            }
+
+        }
+
+    }
+
+    private fun ensureGalleryPreviewLoaded(force: Boolean = false) {
+
+        if (!galleryImagePermissionsGranted()) {
+
+            updateGalleryStatus("需要图库照片权限，点击“开始识别”后授权并加载预览")
+
+            return
+
+        }
+
+        if (!force && galleryPreviewPhotos.isNotEmpty()) {
+
+            updateGallerySelectionStatus()
+
+            return
+
+        }
+
+        loadGalleryPreview(force)
+
+    }
+
+    private fun loadGalleryPreview(force: Boolean = false) {
+
+        if (!galleryImagePermissionsGranted()) {
+
+            setGalleryRefreshing(false)
+
+            ActivityCompat.requestPermissions(
+
+                this,
+
+                galleryImagePermissions(),
+
+                REQUEST_CODE_GALLERY_IMAGES
+
+            )
+
+            return
+
+        }
+
+        if (isGalleryPreviewLoading) {
+
+            updateGalleryStatus("正在加载图库预览...")
+
+            return
+
+        }
+
+        if (!force && galleryPreviewPhotos.isNotEmpty()) {
+
+            setGalleryRefreshing(false)
+
+            updateGallerySelectionStatus()
+
+            return
+
+        }
+
+        val defaultSelectCount = galleryDefaultSelectCount()
+
+        isGalleryPreviewLoading = true
+
+        updateGalleryStatus("正在加载最近照片预览...")
+
+        binding.galleryQueueList.removeAllViews()
+
+        recordDiagnostic("开始加载图库预览: previewLimit=$GALLERY_PREVIEW_SIZE, defaultSelected=$defaultSelectCount")
+
+        executeWorker("读取最近图库照片") {
+
+            val photos = try {
+
+                queryLatestGalleryPhotos(GALLERY_PREVIEW_SIZE)
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("图库照片读取异常: previewLimit=$GALLERY_PREVIEW_SIZE", e)
+
+                runOnUiThread {
+
+                    isGalleryPreviewLoading = false
+
+                    setGalleryRefreshing(false)
+
+                    updateGalleryStatus("图库照片读取失败")
+
+                    Toast.makeText(this, "图库照片读取失败", Toast.LENGTH_SHORT).show()
+
+                }
+
+                return@executeWorker
+
+            }
+
+            if (photos.isEmpty()) {
+
+                recordDiagnostic("图库照片读取为空: previewLimit=$GALLERY_PREVIEW_SIZE")
+
+                runOnUiThread {
+
+                    isGalleryPreviewLoading = false
+
+                    setGalleryRefreshing(false)
+
+                    galleryPreviewPhotos = emptyList()
+
+                    synchronized(selectedGalleryPhotoKeys) { selectedGalleryPhotoKeys.clear() }
+
+                    binding.galleryQueueList.removeAllViews()
+
+                    updateGalleryStatus("未读取到可识别的图库照片")
+
+                    Toast.makeText(this, "未读取到图库照片", Toast.LENGTH_SHORT).show()
+
+                }
+
+                return@executeWorker
+
+            }
+
+            val processedKeys = synchronized(processedGalleryPhotoKeys) {
+
+                processedGalleryPhotoKeys.toSet()
+
+            }
+
+            val latestWindow = photos.take(defaultSelectCount)
+
+            val firstProcessedInWindow = latestWindow.indexOfFirst { galleryPhotoKey(it) in processedKeys }
+
+            val defaultSelectedPhotos = if (firstProcessedInWindow >= 0) {
+
+                latestWindow.take(firstProcessedInWindow)
+
+            } else {
+
+                latestWindow
+
+            }
+
+            val defaultSelectedKeys = defaultSelectedPhotos.map { galleryPhotoKey(it) }
+
+            runOnUiThread {
+
+                isGalleryPreviewLoading = false
+
+                setGalleryRefreshing(false)
+
+                galleryPreviewPhotos = photos
+
+                synchronized(selectedGalleryPhotoKeys) {
+
+                    selectedGalleryPhotoKeys.clear()
+
+                    selectedGalleryPhotoKeys.addAll(defaultSelectedKeys)
+
+                }
+
+                renderGalleryPreview(photos)
+
+                updateGallerySelectionStatus()
+
+            }
+
+            recordDiagnostic(
+
+                "图库预览加载完成: count=${photos.size}, processedKnown=${processedKeys.size}, " +
+
+                    "latestWindow=${latestWindow.size}, firstProcessedInWindow=$firstProcessedInWindow, " +
+
+                    "defaultSelected=${defaultSelectedKeys.size}"
+
+            )
+
+        }
+
+    }
+
+    private fun processGalleryPhoto(index: Int, total: Int, photo: GalleryPhoto, batchId: Long) {
+
+        val record = createRecognitionRecord(
+
+            status = STATUS_LOCAL_PROCESSING,
+
+            statusText = "正在读取图库照片"
+
+        )
+
+        registerGalleryBatchRecord(batchId, record.id)
+
+        try {
+
+            val bytes = contentResolver.openInputStream(photo.uri)?.use { input ->
+
+                input.readBytes()
+
+            }
+
+            if (bytes == null || bytes.isEmpty()) {
+
+                updateRecognitionRecord(record.id) {
+
+                    it.status = STATUS_FAILED
+
+                    it.statusText = "图库照片读取失败"
+
+                    it.errorMessage = "无法读取图片字节"
+
+                }
+
+                recordDiagnostic("图库照片读取失败: index=$index/$total, uri=${photo.uri}, name=${photo.displayName}")
+
+                return
+
+            }
+
+            updateRecognitionRecord(record.id) {
+
+                it.status = STATUS_LOCAL_PROCESSING
+
+                it.statusText = "正在本地检测图库照片"
+
+                it.errorMessage = null
+
+            }
+
+            recordDiagnostic(
+
+                "图库照片读取成功: index=$index/$total, name=${photo.displayName}, " +
+
+                    "bytes=${bytes.size}, size=${photo.width}x${photo.height}, dateTaken=${photo.dateTaken}"
+
+            )
+
+            markGalleryPhotoProcessed(photo)
+
+            processCapturedFrameForMatch(record.id, bytes, "图库照片", processInline = true)
+
+        } catch (e: Exception) {
+
+            updateRecognitionRecord(record.id) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "图库照片读取异常"
+
+                it.errorMessage = e.message
+
+            }
+
+            recordDiagnostic("图库照片处理异常: index=$index/$total, uri=${photo.uri}", e)
+
+        }
+
+    }
+
+    private fun queryLatestGalleryPhotos(limit: Int): List<GalleryPhoto> {
+
+        val projection = arrayOf(
+
+            MediaStore.Images.Media._ID,
+
+            MediaStore.Images.Media.DISPLAY_NAME,
+
+            MediaStore.Images.Media.DATE_TAKEN,
+
+            MediaStore.Images.Media.DATE_ADDED,
+
+            MediaStore.Images.Media.SIZE,
+
+            MediaStore.Images.Media.WIDTH,
+
+            MediaStore.Images.Media.HEIGHT
+
+        )
+
+        val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+        val photos = mutableListOf<GalleryPhoto>()
+
+        contentResolver.query(
+
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+
+            projection,
+
+            null,
+
+            null,
+
+            sortOrder
+
+        )?.use { cursor ->
+
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+
+            val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+
+            val dateTakenColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
+
+            val dateAddedColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+
+            val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+
+            val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+
+            val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+
+            while (cursor.moveToNext() && photos.size < limit) {
+
+                val id = cursor.getLong(idColumn)
+
+                val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+
+                val dateTaken = cursor.getLong(dateTakenColumn).takeIf { it > 0L }
+
+                    ?: cursor.getLong(dateAddedColumn) * 1000L
+
+                photos.add(
+
+                    GalleryPhoto(
+
+                        uri = uri,
+
+                        displayName = cursor.getString(nameColumn) ?: "photo_$id",
+
+                        dateTaken = dateTaken,
+
+                        sizeBytes = cursor.getLong(sizeColumn),
+
+                        width = cursor.getInt(widthColumn),
+
+                        height = cursor.getInt(heightColumn)
+
+                    )
+
+                )
+
+            }
+
+        }
+
+        return photos
+
+    }
+
+    private fun renderGalleryPreview(photos: List<GalleryPhoto>) {
+
+        binding.galleryQueueList.removeAllViews()
+
+        val columns = GALLERY_GRID_COLUMNS
+
+        val gap = dp(3)
+
+        val itemSize = ((resources.displayMetrics.widthPixels - dp(32) - gap * (columns - 1)) / columns)
+
+            .coerceAtLeast(dp(92))
+
+        photos.chunked(columns).forEach { rowPhotos ->
+
+            val row = LinearLayout(this).apply {
+
+                orientation = LinearLayout.HORIZONTAL
+
+            }
+
+            rowPhotos.forEachIndexed { columnIndex, photo ->
+
+                val key = galleryPhotoKey(photo)
+
+                val checked = synchronized(selectedGalleryPhotoKeys) { selectedGalleryPhotoKeys.contains(key) }
+
+                val processed = isGalleryPhotoProcessed(photo)
+
+                val tile = FrameLayout(this).apply {
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+                    contentDescription = photo.displayName
+
+                }
+
+                val tileParams = LinearLayout.LayoutParams(0, itemSize, 1f).apply {
+
+                    if (columnIndex < columns - 1) {
+
+                        marginEnd = gap
+
+                    }
+
+                }
+
+                row.addView(tile, tileParams)
+
+                val thumb = ImageView(this).apply {
+
+                    layoutParams = FrameLayout.LayoutParams(
+
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+
+                        FrameLayout.LayoutParams.MATCH_PARENT
+
+                    )
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+
+                    tag = key
+
+                }
+
+                tile.addView(thumb)
+
+                loadGalleryThumbnailAsync(photo, thumb, key, itemSize)
+
+                val selectedOverlay = View(this).apply {
+
+                    setBackgroundColor(Color.argb(72, 15, 159, 122))
+
+                    visibility = if (checked) View.VISIBLE else View.GONE
+
+                }
+
+                tile.addView(
+
+                    selectedOverlay,
+
+                    FrameLayout.LayoutParams(
+
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+
+                        FrameLayout.LayoutParams.MATCH_PARENT
+
+                    )
+
+                )
+
+                val checkMark = TextView(this).apply {
+
+                    text = "✓"
+
+                    gravity = android.view.Gravity.CENTER
+
+                    setTextColor(Color.WHITE)
+
+                    textSize = 16f
+
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_gallery_selected_badge)
+
+                    visibility = if (checked) View.VISIBLE else View.GONE
+
+                }
+
+                val checkParams = FrameLayout.LayoutParams(dp(26), dp(26), android.view.Gravity.TOP or android.view.Gravity.END).apply {
+
+                    setMargins(0, dp(6), dp(6), 0)
+
+                }
+
+                tile.addView(checkMark, checkParams)
+
+                if (processed) {
+
+                    val processedDot = View(this).apply {
+
+                        background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_gallery_processed_dot)
+
+                    }
+
+                    val dotParams = FrameLayout.LayoutParams(dp(9), dp(9), android.view.Gravity.BOTTOM or android.view.Gravity.START).apply {
+
+                        setMargins(dp(7), 0, 0, dp(7))
+
+                    }
+
+                    tile.addView(processedDot, dotParams)
+
+                }
+
+                tile.setOnClickListener {
+
+                    val nowChecked = synchronized(selectedGalleryPhotoKeys) {
+
+                        if (selectedGalleryPhotoKeys.contains(key)) {
+
+                            selectedGalleryPhotoKeys.remove(key)
+
+                            false
+
+                        } else {
+
+                            selectedGalleryPhotoKeys.add(key)
+
+                            true
+
+                        }
+
+                    }
+
+                    selectedOverlay.visibility = if (nowChecked) View.VISIBLE else View.GONE
+
+                    checkMark.visibility = if (nowChecked) View.VISIBLE else View.GONE
+
+                    updateGallerySelectionStatus()
+
+                }
+
+            }
+
+            if (rowPhotos.size < columns) {
+
+                repeat(columns - rowPhotos.size) { placeholderIndex ->
+
+                    val placeholderParams = LinearLayout.LayoutParams(0, itemSize, 1f).apply {
+
+                        if (rowPhotos.size + placeholderIndex < columns - 1) {
+
+                            marginEnd = gap
+
+                        }
+
+                    }
+
+                    row.addView(View(this), placeholderParams)
+
+                }
+
+            }
+
+            val params = LinearLayout.LayoutParams(
+
+                LinearLayout.LayoutParams.MATCH_PARENT,
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            ).apply {
+
+                bottomMargin = gap
+
+            }
+
+            binding.galleryQueueList.addView(row, params)
+
+        }
+
+    }
+
+    private fun galleryDefaultSelectCount(): Int {
+
+        return DEFAULT_GALLERY_BATCH_SIZE
+
+    }
+
+    private fun loadGalleryThumbnailAsync(
+
+        photo: GalleryPhoto,
+
+        target: ImageView,
+
+        expectedKey: String,
+
+        maxSide: Int = dp(160)
+
+    ) {
+
+        executeThumbnailWorker("加载图库缩略图") {
+
+            val bitmap = try {
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+
+                    contentResolver.loadThumbnail(photo.uri, Size(maxSide, maxSide), null)
+
+                } else {
+
+                    decodeScaledBitmapFromUri(photo.uri, maxSide)
+
+                }
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("图库缩略图加载失败: name=${photo.displayName}, uri=${photo.uri}", e)
+
+                null
+
+            }
+
+            if (bitmap != null) {
+
+                runOnUiThread {
+
+                    if (target.tag == expectedKey) {
+
+                        target.setImageBitmap(bitmap)
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun decodeScaledBitmapFromUri(uri: Uri, maxSide: Int): Bitmap? {
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+
+        contentResolver.openInputStream(uri)?.use {
+
+            BitmapFactory.decodeStream(it, null, bounds)
+
+        }
+
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+
+            return null
+
+        }
+
+        val options = BitmapFactory.Options().apply {
+
+            inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
+
+        }
+
+        return contentResolver.openInputStream(uri)?.use {
+
+            BitmapFactory.decodeStream(it, null, options)
+
+        }
+
+    }
+
+    private fun galleryPhotoKey(photo: GalleryPhoto): String {
+
+        return "${photo.uri}|${photo.dateTaken}|${photo.sizeBytes}"
+
+    }
+
+    private fun loadProcessedGalleryPhotoKeys() {
+
+        val keys = getSharedPreferences(GALLERY_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .getStringSet(GALLERY_PREF_PROCESSED_KEYS, emptySet())
+
+            ?: emptySet()
+
+        synchronized(processedGalleryPhotoKeys) {
+
+            processedGalleryPhotoKeys.clear()
+
+            processedGalleryPhotoKeys.addAll(keys)
+
+        }
+
+        recordDiagnostic("已加载图库已检测标记: count=${keys.size}")
+
+    }
+
+    private fun saveProcessedGalleryPhotoKeys() {
+
+        val snapshot = synchronized(processedGalleryPhotoKeys) {
+
+            processedGalleryPhotoKeys.toList().takeLast(PROCESSED_GALLERY_KEY_LIMIT).toSet()
+
+        }
+
+        getSharedPreferences(GALLERY_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .edit()
+
+            .putStringSet(GALLERY_PREF_PROCESSED_KEYS, snapshot)
+
+            .apply()
+
+    }
+
+    private fun markGalleryPhotoProcessed(photo: GalleryPhoto) {
+
+        val key = galleryPhotoKey(photo)
+
+        val changed = synchronized(processedGalleryPhotoKeys) {
+
+            processedGalleryPhotoKeys.add(key)
+
+        }
+
+        if (changed) {
+
+            saveProcessedGalleryPhotoKeys()
+
+            recordDiagnostic("图库照片标记为已检测: name=${photo.displayName}, key=$key")
+
+            runOnUiThread {
+
+                if (binding.galleryPage.visibility == View.VISIBLE && !isGalleryBatchRunning) {
+
+                    renderGalleryPreview(galleryPreviewPhotos)
+
+                    updateGallerySelectionStatus()
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun isGalleryPhotoProcessed(photo: GalleryPhoto): Boolean {
+
+        val key = galleryPhotoKey(photo)
+
+        return synchronized(processedGalleryPhotoKeys) {
+
+            processedGalleryPhotoKeys.contains(key)
+
+        }
+
+    }
+
+    private fun updateGallerySelectionStatus() {
+
+        val selectedCount = synchronized(selectedGalleryPhotoKeys) { selectedGalleryPhotoKeys.size }
+
+        val processedVisibleCount = galleryPreviewPhotos.count { isGalleryPhotoProcessed(it) }
+
+        binding.btnStartGalleryRecognition.contentDescription =
+
+            "识别所选，已勾选 $selectedCount 张，已检测 $processedVisibleCount 张"
+
+        updateGalleryStatus("已加载 ${galleryPreviewPhotos.size} 张最近照片，已勾选 $selectedCount 张，已检测 $processedVisibleCount 张")
+
+    }
+
+    private fun updateGalleryStatus(text: String) {
+
+        Log.d(TAG, "Gallery status: $text")
+
+    }
+
+    private fun startVideoRecognition() {
+
+        if (isVideoRecognitionRunning) {
+
+            Toast.makeText(this, "视频识别正在进行，请稍候", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        if (videoPreviewItems.isEmpty()) {
+
+            if (!galleryVideoPermissionsGranted()) {
+
+                requestGalleryVideoPermission("startVideoRecognition")
+
+                Toast.makeText(this, "也可以点击“选择视频”直接指定一个视频", Toast.LENGTH_SHORT).show()
+
+                return
+
+            }
+
+            if (!fullVideoLibraryPermissionGranted()) {
+
+                requestGalleryVideoPermission("startVideoRecognition-empty-preview-limited-access")
+
+                Toast.makeText(this, "需要允许读取视频，或点击“选择视频”直接指定一个视频", Toast.LENGTH_SHORT).show()
+
+                return
+
+            }
+
+            loadVideoPreview(force = true)
+
+            Toast.makeText(this, "正在加载视频预览，请选择后再识别", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        val selectedKeys = synchronized(selectedVideoKeys) { selectedVideoKeys.toSet() }
+
+        val selectedVideo = videoPreviewItems.firstOrNull { videoKey(it) in selectedKeys }
+
+        if (selectedVideo == null) {
+
+            updateVideoStatus("请先选择 1 个视频")
+
+            Toast.makeText(this, "请先选择要识别的视频", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        val batchId = System.currentTimeMillis()
+
+        activeVideoBatchId = batchId
+
+        isVideoRecognitionRunning = true
+
+        updateVideoProgress(batchId, "正在分析视频...", 0, 1, finished = false)
+
+        recordDiagnostic(
+
+            "用户启动视频识别: name=${selectedVideo.displayName}, duration=${selectedVideo.durationMs}, " +
+
+                "size=${selectedVideo.width}x${selectedVideo.height}, bytes=${selectedVideo.sizeBytes}, " +
+
+                "permission=${videoPermissionStatus()}"
+
+        )
+
+        executeWorker("处理视频识别") {
+
+            processVideoForExperts(selectedVideo, batchId)
+
+        }
+
+    }
+
+    private fun ensureVideoPreviewLoaded(force: Boolean = false) {
+
+        if (!galleryVideoPermissionsGranted()) {
+
+            updateVideoStatus("需要图库视频权限，点击识别后授权并加载预览")
+
+            return
+
+        }
+
+        if (videoPreviewItems.isEmpty() && !fullVideoLibraryPermissionGranted()) {
+
+            requestGalleryVideoPermission("ensureVideoPreviewLoaded-limited-access")
+
+            updateVideoStatus("当前只有部分媒体权限，正在请求完整视频权限")
+
+            return
+
+        }
+
+        if (!force && videoPreviewItems.isNotEmpty()) {
+
+            updateVideoSelectionStatus()
+
+            return
+
+        }
+
+        loadVideoPreview(force)
+
+    }
+
+    private fun loadVideoPreview(force: Boolean = false) {
+
+        if (!galleryVideoPermissionsGranted()) {
+
+            setVideoRefreshing(false)
+
+            requestGalleryVideoPermission("loadVideoPreview")
+
+            return
+
+        }
+
+        if (isVideoPreviewLoading) {
+
+            updateVideoStatus("正在加载视频预览...")
+
+            return
+
+        }
+
+        if (!force && videoPreviewItems.isNotEmpty()) {
+
+            setVideoRefreshing(false)
+
+            updateVideoSelectionStatus()
+
+            return
+
+        }
+
+        isVideoPreviewLoading = true
+
+        binding.videoQueueList.removeAllViews()
+
+        updateVideoStatus("正在加载最近视频预览...")
+
+        recordDiagnostic(
+
+            "开始加载视频预览: previewLimit=$VIDEO_PREVIEW_SIZE, " +
+
+                "fullVideoPermission=${fullVideoLibraryPermissionGranted()}, limitedVisual=${limitedMediaSelectionGranted()}"
+
+        )
+
+        executeWorker("读取最近图库视频") {
+
+            val videos = try {
+
+                queryLatestGalleryVideos(VIDEO_PREVIEW_SIZE)
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("视频读取异常: previewLimit=$VIDEO_PREVIEW_SIZE", e)
+
+                runOnUiThread {
+
+                    isVideoPreviewLoading = false
+
+                    setVideoRefreshing(false)
+
+                    updateVideoStatus("视频读取失败")
+
+                    Toast.makeText(this, "视频读取失败", Toast.LENGTH_SHORT).show()
+
+                }
+
+                return@executeWorker
+
+            }
+
+            runOnUiThread {
+
+                isVideoPreviewLoading = false
+
+                setVideoRefreshing(false)
+
+                videoPreviewItems = videos
+
+                synchronized(selectedVideoKeys) {
+
+                    selectedVideoKeys.clear()
+
+                    videos.firstOrNull()?.let { selectedVideoKeys.add(videoKey(it)) }
+
+                }
+
+                renderVideoPreview(videos)
+
+                updateVideoSelectionStatus()
+
+                if (videos.isEmpty()) {
+
+                    val message = if (!fullVideoLibraryPermissionGranted() && limitedMediaSelectionGranted()) {
+
+                        "未读取到已授权视频，请允许读取所有视频或在授权中选择视频"
+
+                    } else {
+
+                        "未读取到图库视频"
+
+                    }
+
+                    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+                }
+
+            }
+
+            recordDiagnostic(
+
+                "视频预览加载完成: count=${videos.size}, defaultSelected=${if (videos.isEmpty()) 0 else 1}, " +
+
+                    "fullVideoPermission=${fullVideoLibraryPermissionGranted()}, limitedVisual=${limitedMediaSelectionGranted()}"
+
+            )
+
+        }
+
+    }
+
+    private fun setupVideoPullRefresh() {
+
+        binding.videoScroll.setOnTouchListener { _, event ->
+
+            if (isVideoPreviewLoading || isVideoRefreshing || isVideoRecognitionRunning) {
+
+                return@setOnTouchListener false
+
+            }
+
+            when (event.actionMasked) {
+
+                MotionEvent.ACTION_DOWN -> {
+
+                    videoPullStartY = event.y
+
+                    isVideoPulling = binding.videoScroll.scrollY == 0
+
+                    false
+
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+
+                    if (binding.videoScroll.scrollY == 0 && event.y - videoPullStartY > dp(VIDEO_PULL_HINT_DISTANCE_DP)) {
+
+                        isVideoPulling = true
+
+                        showVideoRefreshHint("松开刷新")
+
+                    }
+
+                    false
+
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+
+                    val pullDistance = event.y - videoPullStartY
+
+                    if (isVideoPulling && binding.videoScroll.scrollY == 0 && pullDistance > dp(VIDEO_PULL_REFRESH_DISTANCE_DP)) {
+
+                        setVideoRefreshing(true)
+
+                        recordDiagnostic("用户下拉刷新视频: pullDistance=${pullDistance.roundToInt()}")
+
+                        loadVideoPreview(force = true)
+
+                    } else {
+
+                        hideVideoRefreshHint()
+
+                    }
+
+                    isVideoPulling = false
+
+                    false
+
+                }
+
+                else -> false
+
+            }
+
+        }
+
+    }
+
+    private fun showVideoRefreshHint(text: String) {
+
+        binding.tvVideoRefreshHint.text = text
+
+        binding.tvVideoRefreshHint.visibility = View.VISIBLE
+
+    }
+
+    private fun hideVideoRefreshHint() {
+
+        if (!isVideoRefreshing) {
+
+            binding.tvVideoRefreshHint.visibility = View.GONE
+
+        }
+
+    }
+
+    private fun setVideoRefreshing(refreshing: Boolean) {
+
+        isVideoRefreshing = refreshing
+
+        runOnUiThread {
+
+            if (refreshing) {
+
+                binding.tvVideoRefreshHint.text = "正在刷新..."
+
+                binding.tvVideoRefreshHint.visibility = View.VISIBLE
+
+            } else {
+
+                binding.tvVideoRefreshHint.visibility = View.GONE
+
+            }
+
+        }
+
+    }
+
+    private fun requestGalleryVideoPermission(reason: String) {
+
+        recordDiagnostic("请求图库视频权限: reason=$reason, status=${videoPermissionStatus()}")
+
+        ActivityCompat.requestPermissions(
+
+            this,
+
+            galleryVideoPermissions(),
+
+            REQUEST_CODE_GALLERY_VIDEOS
+
+        )
+
+    }
+
+    private fun launchImagePicker() {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                type = "image/*"
+            }
+        } else {
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "image/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            }
+        }
+        try {
+            recordDiagnostic("打开系统图片选择器: sdk=${Build.VERSION.SDK_INT}")
+            startActivityForResult(intent, REQUEST_CODE_PICK_IMAGE)
+        } catch (e: Exception) {
+            recordDiagnostic("打开系统图片选择器失败", e)
+            Toast.makeText(this, "无法打开系统图片选择器", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun handlePickedImage(data: Intent?) {
+        val uri = data?.data
+        if (uri == null) {
+            recordDiagnostic("系统图片选择器返回为空")
+            Toast.makeText(this, "未选择图片", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val flags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    contentResolver.takePersistableUriPermission(uri, flags)
+                } catch (e: Exception) {
+                    recordDiagnostic("图片 URI 持久授权失败，可继续临时识别: uri=$uri", e)
+                }
+            }
+            val photo = buildPickedGalleryPhoto(uri)
+            val key = galleryPhotoKey(photo)
+            
+            synchronized(galleryPreviewPhotos) {
+                val mutable = galleryPreviewPhotos.toMutableList()
+                mutable.removeAll { it.uri == photo.uri }
+                mutable.add(0, photo)
+                galleryPreviewPhotos = mutable
+            }
+            
+            synchronized(selectedGalleryPhotoKeys) {
+                selectedGalleryPhotoKeys.clear()
+                selectedGalleryPhotoKeys.add(key)
+            }
+            
+            renderGalleryPreview(galleryPreviewPhotos)
+            updateGallerySelectionStatus()
+            
+            recordDiagnostic(
+                "系统选择图片完成: name=${photo.displayName}, " +
+                    "size=${photo.width}x${photo.height}, bytes=${photo.sizeBytes}, uri=$uri"
+            )
+        } catch (e: Exception) {
+            recordDiagnostic("处理系统选择图片异常: uri=$uri", e)
+            Toast.makeText(this, "读取所选图片失败，已记录日志", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun buildPickedGalleryPhoto(uri: Uri): GalleryPhoto {
+        val size = readImageMetadata(uri)
+        val openable = readOpenableMetadata(uri)
+        return GalleryPhoto(
+            uri = uri,
+            displayName = openable.first ?: "selected_image",
+            dateTaken = System.currentTimeMillis(),
+            sizeBytes = openable.second ?: 0L,
+            width = size.first,
+            height = size.second
+        )
+    }
+
+    private fun readImageMetadata(uri: Uri): Pair<Int, Int> {
+        return try {
+            contentResolver.openInputStream(uri)?.use { stream ->
+                val options = BitmapFactory.Options().apply {
+                    inJustDecodeBounds = true
+                }
+                BitmapFactory.decodeStream(stream, null, options)
+                options.outWidth to options.outHeight
+            } ?: (0 to 0)
+        } catch (e: Exception) {
+            recordDiagnostic("读取图片元数据失败: uri=$uri", e)
+            0 to 0
+        }
+    }
+
+    private fun launchVideoPicker() {
+
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+
+                type = "video/*"
+
+            }
+
+        } else {
+
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+
+                addCategory(Intent.CATEGORY_OPENABLE)
+
+                type = "video/*"
+
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+                addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            }
+
+        }
+
+        try {
+
+            recordDiagnostic("打开系统视频选择器: sdk=${Build.VERSION.SDK_INT}, permission=${videoPermissionStatus()}")
+
+            startActivityForResult(intent, REQUEST_CODE_PICK_VIDEO)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("打开系统视频选择器失败", e)
+
+            Toast.makeText(this, "无法打开系统视频选择器", Toast.LENGTH_SHORT).show()
+
+        }
+
+    }
+
+    private fun handlePickedVideo(data: Intent?) {
+
+        val uri = data?.data
+
+        if (uri == null) {
+
+            recordDiagnostic("系统视频选择器返回为空")
+
+            Toast.makeText(this, "未选择视频", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        try {
+
+            val flags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+
+                try {
+
+                    contentResolver.takePersistableUriPermission(uri, flags)
+
+                } catch (e: Exception) {
+
+                    recordDiagnostic("视频 URI 持久授权失败，可继续临时识别: uri=$uri", e)
+
+                }
+
+            }
+
+            val video = buildPickedGalleryVideo(uri)
+
+            videoPreviewItems = listOf(video)
+
+            synchronized(selectedVideoKeys) {
+
+                selectedVideoKeys.clear()
+
+                selectedVideoKeys.add(videoKey(video))
+
+            }
+
+            renderVideoPreview(videoPreviewItems)
+
+            updateVideoSelectionStatus()
+
+            binding.videoProgressPanel.visibility = View.GONE
+
+            recordDiagnostic(
+
+                "系统选择视频完成: name=${video.displayName}, duration=${video.durationMs}, " +
+
+                    "size=${video.width}x${video.height}, bytes=${video.sizeBytes}, uri=$uri"
+
+            )
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("处理系统选择视频异常: uri=$uri", e)
+
+            Toast.makeText(this, "读取所选视频失败，已记录日志", Toast.LENGTH_SHORT).show()
+
+        }
+
+    }
+
+    private fun buildPickedGalleryVideo(uri: Uri): GalleryVideo {
+
+        val metadata = readVideoMetadata(uri)
+
+        val openable = readOpenableMetadata(uri)
+
+        return GalleryVideo(
+
+            uri = uri,
+
+            displayName = openable.first ?: "selected_video",
+
+            dateTaken = System.currentTimeMillis(),
+
+            sizeBytes = openable.second ?: 0L,
+
+            width = metadata.width,
+
+            height = metadata.height,
+
+            durationMs = metadata.durationMs
+
+        )
+
+    }
+
+    private fun readVideoMetadata(uri: Uri): VideoMetadata {
+
+        val retriever = MediaMetadataRetriever()
+
+        return try {
+
+            retriever.setDataSource(this, uri)
+
+            VideoMetadata(
+
+                width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0,
+
+                height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0,
+
+                durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+
+            )
+
+        } finally {
+
+            try {
+
+                retriever.release()
+
+            } catch (e: Exception) {
+
+                // ignore
+
+            }
+
+        }
+
+    }
+
+    private fun readOpenableMetadata(uri: Uri): Pair<String?, Long?> {
+
+        return try {
+
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
+
+                ?.use { cursor ->
+
+                    if (cursor.moveToFirst()) {
+
+                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+
+                        val name = if (nameIndex >= 0) cursor.getString(nameIndex) else null
+
+                        val size = if (sizeIndex >= 0) cursor.getLong(sizeIndex) else null
+
+                        name to size
+
+                    } else {
+
+                        null to null
+
+                    }
+
+                } ?: (null to null)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("读取视频 Openable 元数据失败: uri=$uri", e)
+
+            null to null
+
+        }
+
+    }
+
+    private fun queryLatestGalleryVideos(limit: Int): List<GalleryVideo> {
+
+        val projection = arrayOf(
+
+            MediaStore.Video.Media._ID,
+
+            MediaStore.Video.Media.DISPLAY_NAME,
+
+            MediaStore.Video.Media.DATE_TAKEN,
+
+            MediaStore.Video.Media.DATE_ADDED,
+
+            MediaStore.Video.Media.SIZE,
+
+            MediaStore.Video.Media.WIDTH,
+
+            MediaStore.Video.Media.HEIGHT,
+
+            MediaStore.Video.Media.DURATION
+
+        )
+
+        val sortOrder = "${MediaStore.Video.Media.DATE_TAKEN} DESC, ${MediaStore.Video.Media.DATE_ADDED} DESC"
+
+        val videos = mutableListOf<GalleryVideo>()
+
+        contentResolver.query(
+
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+
+            projection,
+
+            null,
+
+            null,
+
+            sortOrder
+
+        )?.use { cursor ->
+
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+
+            val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+
+            val dateTakenColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_TAKEN)
+
+            val dateAddedColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+
+            val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+
+            val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
+
+            val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
+
+            val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+
+            while (cursor.moveToNext() && videos.size < limit) {
+
+                val id = cursor.getLong(idColumn)
+
+                val uri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+
+                val dateTaken = cursor.getLong(dateTakenColumn).takeIf { it > 0L }
+
+                    ?: cursor.getLong(dateAddedColumn) * 1000L
+
+                videos.add(
+
+                    GalleryVideo(
+
+                        uri = uri,
+
+                        displayName = cursor.getString(nameColumn) ?: "video_$id",
+
+                        dateTaken = dateTaken,
+
+                        sizeBytes = cursor.getLong(sizeColumn),
+
+                        width = cursor.getInt(widthColumn),
+
+                        height = cursor.getInt(heightColumn),
+
+                        durationMs = cursor.getLong(durationColumn)
+
+                    )
+
+                )
+
+            }
+
+        }
+
+        return videos
+
+    }
+
+    private fun renderVideoPreview(videos: List<GalleryVideo>) {
+
+        binding.videoQueueList.removeAllViews()
+
+        val columns = VIDEO_GRID_COLUMNS
+
+        val gap = dp(3)
+
+        val itemSize = ((resources.displayMetrics.widthPixels - dp(32) - gap * (columns - 1)) / columns)
+
+            .coerceAtLeast(dp(120))
+
+        videos.chunked(columns).forEach { rowVideos ->
+
+            val row = LinearLayout(this).apply {
+
+                orientation = LinearLayout.HORIZONTAL
+
+            }
+
+            rowVideos.forEachIndexed { columnIndex, video ->
+
+                val key = videoKey(video)
+
+                val checked = synchronized(selectedVideoKeys) { selectedVideoKeys.contains(key) }
+
+                val tile = FrameLayout(this).apply {
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+                    contentDescription = video.displayName
+
+                }
+
+                val tileParams = LinearLayout.LayoutParams(0, itemSize, 1f).apply {
+
+                    if (columnIndex < columns - 1) {
+
+                        marginEnd = gap
+
+                    }
+
+                }
+
+                row.addView(tile, tileParams)
+
+                val thumb = ImageView(this).apply {
+
+                    layoutParams = FrameLayout.LayoutParams(
+
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+
+                        FrameLayout.LayoutParams.MATCH_PARENT
+
+                    )
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+
+                    tag = key
+
+                }
+
+                tile.addView(thumb)
+
+                loadVideoThumbnailAsync(video, thumb, key, itemSize)
+
+                val selectedOverlay = View(this).apply {
+
+                    setBackgroundColor(Color.argb(76, 15, 159, 122))
+
+                    visibility = if (checked) View.VISIBLE else View.GONE
+
+                }
+
+                tile.addView(
+
+                    selectedOverlay,
+
+                    FrameLayout.LayoutParams(
+
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+
+                        FrameLayout.LayoutParams.MATCH_PARENT
+
+                    )
+
+                )
+
+                val playMark = TextView(this).apply {
+
+                    text = "▶"
+
+                    gravity = android.view.Gravity.CENTER
+
+                    setTextColor(Color.WHITE)
+
+                    textSize = 16f
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_gallery_selected_badge)
+
+                }
+
+                val playParams = FrameLayout.LayoutParams(dp(28), dp(28), android.view.Gravity.CENTER)
+
+                tile.addView(playMark, playParams)
+
+                val durationLabel = TextView(this).apply {
+
+                    text = formatDurationMs(video.durationMs)
+
+                    setTextColor(Color.WHITE)
+
+                    textSize = 10f
+
+                    setPadding(dp(5), dp(2), dp(5), dp(2))
+
+                    setBackgroundColor(Color.argb(140, 0, 0, 0))
+
+                }
+
+                val durationParams = FrameLayout.LayoutParams(
+
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+
+                    android.view.Gravity.BOTTOM or android.view.Gravity.END
+
+                ).apply {
+
+                    setMargins(0, 0, dp(6), dp(6))
+
+                }
+
+                tile.addView(durationLabel, durationParams)
+
+                val checkMark = TextView(this).apply {
+
+                    text = "✓"
+
+                    gravity = android.view.Gravity.CENTER
+
+                    setTextColor(Color.WHITE)
+
+                    textSize = 16f
+
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+
+                    background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_gallery_selected_badge)
+
+                    visibility = if (checked) View.VISIBLE else View.GONE
+
+                }
+
+                val checkParams = FrameLayout.LayoutParams(dp(26), dp(26), android.view.Gravity.TOP or android.view.Gravity.END).apply {
+
+                    setMargins(0, dp(6), dp(6), 0)
+
+                }
+
+                tile.addView(checkMark, checkParams)
+
+                tile.setOnClickListener {
+
+                    synchronized(selectedVideoKeys) {
+
+                        selectedVideoKeys.clear()
+
+                        selectedVideoKeys.add(key)
+
+                    }
+
+                    renderVideoPreview(videoPreviewItems)
+
+                    updateVideoSelectionStatus()
+
+                }
+
+            }
+
+            if (rowVideos.size < columns) {
+
+                repeat(columns - rowVideos.size) { placeholderIndex ->
+
+                    val placeholderParams = LinearLayout.LayoutParams(0, itemSize, 1f).apply {
+
+                        if (rowVideos.size + placeholderIndex < columns - 1) {
+
+                            marginEnd = gap
+
+                        }
+
+                    }
+
+                    row.addView(View(this), placeholderParams)
+
+                }
+
+            }
+
+            val params = LinearLayout.LayoutParams(
+
+                LinearLayout.LayoutParams.MATCH_PARENT,
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            ).apply {
+
+                bottomMargin = gap
+
+            }
+
+            binding.videoQueueList.addView(row, params)
+
+        }
+
+    }
+
+    private fun videoKey(video: GalleryVideo): String {
+
+        return "${video.uri}|${video.dateTaken}|${video.sizeBytes}|${video.durationMs}"
+
+    }
+
+    private fun loadVideoThumbnailAsync(
+
+        video: GalleryVideo,
+
+        target: ImageView,
+
+        expectedKey: String,
+
+        maxSide: Int = dp(180)
+
+    ) {
+
+        executeWorker("加载视频缩略图") {
+
+            val bitmap = try {
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+
+                    contentResolver.loadThumbnail(video.uri, Size(maxSide, maxSide), null)
+
+                } else {
+
+                    decodeVideoThumbnail(video.uri, maxSide)
+
+                }
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("视频缩略图加载失败: name=${video.displayName}, uri=${video.uri}", e)
+
+                null
+
+            }
+
+            if (bitmap != null) {
+
+                runOnUiThread {
+
+                    if (target.tag == expectedKey) {
+
+                        target.setImageBitmap(bitmap)
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun decodeVideoThumbnail(uri: Uri, maxSide: Int): Bitmap? {
+
+        val retriever = MediaMetadataRetriever()
+
+        return try {
+
+            retriever.setDataSource(this, uri)
+
+            val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+
+            frame?.let { resizeBitmapToMaxSide(it, maxSide) }
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("视频缩略图解码失败: uri=$uri", e)
+
+            null
+
+        } finally {
+
+            try {
+
+                retriever.release()
+
+            } catch (e: Exception) {
+
+                // ignore
+
+            }
+
+        }
+
+    }
+
+    private fun updateVideoSelectionStatus() {
+
+        val selectedCount = synchronized(selectedVideoKeys) { selectedVideoKeys.size }
+
+        binding.btnStartVideoRecognition.contentDescription =
+
+            "识别视频，已选择 $selectedCount 个视频"
+
+        updateVideoStatus("已加载 ${videoPreviewItems.size} 个最近视频，已选择 $selectedCount 个")
+
+    }
+
+    private fun updateVideoStatus(text: String) {
+
+        Log.d(TAG, "Video status: $text")
+
+    }
+
+    private fun updateVideoProgress(
+
+        batchId: Long,
+
+        text: String,
+
+        progress: Int,
+
+        max: Int,
+
+        finished: Boolean
+
+    ) {
+
+        runOnUiThread {
+
+            if (activeVideoBatchId != batchId) {
+
+                return@runOnUiThread
+
+            }
+
+            binding.videoProgressPanel.visibility = View.VISIBLE
+
+            binding.tvVideoProgress.text = text
+
+            binding.videoBatchProgress.max = max.coerceAtLeast(1)
+
+            binding.videoBatchProgress.progress = progress.coerceIn(0, max.coerceAtLeast(1))
+
+            if (finished) {
+
+                mainHandler.postDelayed({
+
+                    if (activeVideoBatchId == batchId && !isVideoRecognitionRunning) {
+
+                        binding.videoProgressPanel.visibility = View.GONE
+
+                        recordDiagnostic("视频识别进度隐藏: batchId=$batchId")
+
+                    }
+
+                }, VIDEO_PROGRESS_HIDE_DELAY_MS)
+
+            }
+
+        }
+
+    }
+
+        private fun finishVideoRecognition(batchId: Long, message: String, foundCount: Int) {
+        isVideoRecognitionRunning = false
+        updateVideoProgress(batchId, message, 1, 1, finished = true)
+        runOnUiThread {
+            val outcome = when {
+                foundCount > 0 -> "发现专家 ${foundCount} 人"
+                message.contains("未检测到") || message.contains("未发现可识别") -> "未识别到人脸"
+                else -> "未匹配到专家"
+            }
+            if (foundCount > 0) {
+                playResultBeep(success = true)
+                speakOut("视频识别完成，发现${foundCount}名专家")
+                Toast.makeText(this, "视频识别完成，发现 ${foundCount} 名专家", Toast.LENGTH_SHORT).show()
+            } else {
+                playResultBeep(success = false)
+                speakOut("视频识别完成，${outcome}")
+                Toast.makeText(this, "视频识别完成，${outcome}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun processVideoForExperts(video: GalleryVideo, batchId: Long) {
+
+        val startedAt = System.currentTimeMillis()
+
+        val retriever = MediaMetadataRetriever()
+
+        try {
+
+            retriever.setDataSource(this, video.uri)
+
+            val durationMs = readVideoDurationMs(retriever, video.durationMs)
+
+            val quickSampleTimes = buildVideoQuickSampleTimes(durationMs)
+
+            val faceHitTimes = mutableListOf<Long>()
+
+            val candidates = mutableListOf<VideoFaceCandidate>()
+
+            
+
+            // 物理人脸轨迹信息，在粗扫阶段记录各 trackingId 对应的得分最高时刻
+
+            class TrackQuickInfo(val timeMs: Long, val score: Int)
+
+            val trackQuickBestMap = mutableMapOf<Int, TrackQuickInfo>()
+
+            recordDiagnostic(
+
+                "视频快速扫脸开始: name=${video.displayName}, durationMs=$durationMs, " +
+
+                    "quickSamples=${quickSampleTimes.size}, first=${quickSampleTimes.firstOrNull() ?: 0}, " +
+
+                    "last=${quickSampleTimes.lastOrNull() ?: 0}"
+
+            )
+
+            quickSampleTimes.forEachIndexed { index, timeMs ->
+
+                updateVideoProgress(
+
+                    batchId,
+
+                    "正在快速扫脸 ${index + 1}/${quickSampleTimes.size}",
+
+                    index,
+
+                    quickSampleTimes.size,
+
+                    finished = false
+
+                )
+
+                val frame = extractVideoFrame(retriever, timeMs, precise = false, maxSide = 640)
+
+                if (frame == null) {
+
+                    recordDiagnostic("视频快速抽帧失败: timeMs=$timeMs")
+
+                    return@forEachIndexed
+
+                }
+
+                try {
+
+                    val detectionBitmap = resizeBitmapToMaxSide(frame, VIDEO_QUICK_PROCESS_MAX_SIDE)
+
+                    val faces = Tasks.await(videoFaceDetector.process(InputImage.fromBitmap(detectionBitmap, 0)))
+
+                    if (faces.isNotEmpty()) {
+
+                        faceHitTimes.add(timeMs)
+
+                        
+
+                        // 遍历检测到的人脸，更新各追踪轨迹的最佳粗扫帧
+
+                        faces.forEach { face ->
+
+                            val trackingId = face.trackingId
+
+                            if (trackingId != null) {
+
+                                val faceRectOnDetection = clippedRect(face.boundingBox, detectionBitmap.width, detectionBitmap.height)
+
+                                if (faceRectOnDetection != null) {
+                                    val scaleX = frame.width.toFloat() / detectionBitmap.width.toFloat()
+                                    val scaleY = frame.height.toFloat() / detectionBitmap.height.toFloat()
+                                    val faceRectOnFrame = Rect(
+                                        (faceRectOnDetection.left * scaleX).roundToInt().coerceIn(0, frame.width),
+                                        (faceRectOnDetection.top * scaleY).roundToInt().coerceIn(0, frame.height),
+                                        (faceRectOnDetection.right * scaleX).roundToInt().coerceIn(0, frame.width),
+                                        (faceRectOnDetection.bottom * scaleY).roundToInt().coerceIn(0, frame.height)
+                                    )
+                                    val score = scoreVideoFaceCandidate(frame, face, faceRectOnFrame)
+
+                                    val existing = trackQuickBestMap[trackingId]
+
+                                    if (existing == null || score > existing.score) {
+
+                                        trackQuickBestMap[trackingId] = TrackQuickInfo(timeMs, score)
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                        recordDiagnostic(
+
+                            "视频快速扫脸命中: timeMs=$timeMs, faces=${faces.size}, " +
+
+                                "frame=${frame.width}x${frame.height}, detection=${detectionBitmap.width}x${detectionBitmap.height}"
+
+                        )
+
+                    }
+
+                    if (detectionBitmap !== frame) {
+
+                        detectionBitmap.recycle()
+
+                    }
+
+                } finally {
+
+                    frame.recycle()
+
+                }
+
+            }
+
+            if (faceHitTimes.isEmpty()) {
+
+                recordDiagnostic(
+
+                    "视频快速扫脸未命中: quickSamples=${quickSampleTimes.size}, " +
+
+                        "costMs=${System.currentTimeMillis() - startedAt}"
+
+                )
+
+                finishVideoRecognition(batchId, "视频中未检测到可识别人脸", 0)
+
+                return
+
+            }
+
+            // 智能剪枝精细抽帧窗口：优先针对每个 Track 的黄金时刻前后极窄区间采样，如果 TrackingID 映射为空则退回老方法
+
+            val fineSampleTimes = if (trackQuickBestMap.isNotEmpty()) {
+
+                val times = TreeSet<Long>()
+
+                trackQuickBestMap.forEach { (trackingId, bestInfo) ->
+
+                    val hitTime = bestInfo.timeMs
+
+                    val start = (hitTime - VIDEO_FINE_WINDOW_BEFORE_MS).coerceAtLeast(0L)
+
+                    val end = (hitTime + VIDEO_FINE_WINDOW_AFTER_MS).coerceAtMost(durationMs.coerceAtLeast(0L))
+
+                    var timeMs = start
+
+                    while (timeMs <= end) {
+
+                        times.add(timeMs)
+
+                        timeMs += VIDEO_FINE_SAMPLE_INTERVAL_MS
+
+                    }
+
+                    times.add(hitTime.coerceIn(0L, durationMs.coerceAtLeast(0L)))
+
+                    recordDiagnostic("视频Track黄金窗口剪枝: trackingId=$trackingId, bestQuickTimeMs=$hitTime, window=[$start, $end]")
+
+                }
+
+                
+
+                if (times.size <= VIDEO_MAX_FINE_SAMPLE_FRAMES) {
+
+                    times.toList()
+
+                } else {
+
+                    val sorted = times.toList()
+
+                    val sampled = mutableListOf<Long>()
+
+                    for (i in 0 until VIDEO_MAX_FINE_SAMPLE_FRAMES) {
+
+                        val sourceIndex = if (VIDEO_MAX_FINE_SAMPLE_FRAMES == 1) 0 else (i * (sorted.size - 1).toFloat() / (VIDEO_MAX_FINE_SAMPLE_FRAMES - 1).toFloat()).roundToInt()
+
+                        sampled.add(sorted[sourceIndex.coerceIn(0, sorted.lastIndex)])
+
+                    }
+
+                    sampled.distinct()
+
+                }
+
+            } else {
+
+                recordDiagnostic("视频未追踪到有效ID，退回全局命中点精扫")
+
+                buildVideoFocusedSampleTimes(faceHitTimes, durationMs)
+
+            }
+
+            recordDiagnostic(
+
+                "视频加密抽帧开始: hitTimes=${faceHitTimes.size}, fineSamples=${fineSampleTimes.size}, " +
+
+                    "first=${fineSampleTimes.firstOrNull() ?: 0}, last=${fineSampleTimes.lastOrNull() ?: 0}"
+
+            )
+
+            fineSampleTimes.forEachIndexed { index, timeMs ->
+
+                updateVideoProgress(
+
+                    batchId,
+
+                    "正在精选清晰人脸 ${index + 1}/${fineSampleTimes.size}",
+
+                    index,
+
+                    fineSampleTimes.size,
+
+                    finished = false
+
+                )
+
+                val frame = extractVideoFrame(retriever, timeMs, precise = true, maxSide = 960)
+
+                if (frame == null) {
+
+                    recordDiagnostic("视频加密抽帧失败: timeMs=$timeMs")
+
+                    return@forEachIndexed
+
+                }
+
+                try {
+
+                    val detectionBitmap = resizeBitmapToMaxSide(frame, VIDEO_FINE_PROCESS_MAX_SIDE)
+
+                    val faces = Tasks.await(videoFaceDetector.process(InputImage.fromBitmap(detectionBitmap, 0)))
+
+                    if (faces.isNotEmpty()) {
+
+                        recordDiagnostic(
+
+                            "视频加密帧本地检测: timeMs=$timeMs, faces=${faces.size}, " +
+
+                                "frame=${frame.width}x${frame.height}, detection=${detectionBitmap.width}x${detectionBitmap.height}"
+
+                        )
+
+                    }
+
+                    faces.forEach { face ->
+
+                        val candidate = buildVideoFaceCandidate(video, frame, detectionBitmap, face, timeMs)
+
+                        if (candidate != null) {
+
+                            candidates.add(candidate)
+
+                        }
+
+                    }
+
+                    if (detectionBitmap !== frame) {
+
+                        detectionBitmap.recycle()
+
+                    }
+
+                } finally {
+
+                    frame.recycle()
+
+                }
+
+            }
+
+            // 全局优选物理去重流程：
+
+            val finalCandidates = mutableListOf<VideoFaceCandidate>()
+
+            
+
+            // 1. 优先按 trackingId 分组，同一 trackingId 轨迹仅保留质量分最高的一个
+
+            val withTrackId = candidates.filter { it.trackingId != null }
+
+            val groupedByTrack = withTrackId.groupBy { it.trackingId!! }
+
+            groupedByTrack.forEach { (trackingId, trackCandidates) ->
+
+                val bestOfTrack = trackCandidates.maxByOrNull { it.qualityScore }
+
+                if (bestOfTrack != null) {
+
+                    finalCandidates.add(bestOfTrack)
+
+                    recordDiagnostic(
+
+                        "视频Track物理优选: trackingId=$trackingId, 候选数=${trackCandidates.size}, " +
+
+                            "选中时刻=${bestOfTrack.frameTimeMs}ms, 选中分数=${bestOfTrack.qualityScore}"
+
+                    )
+
+                }
+
+            }
+
+            
+
+            // 2. 无 trackingId 人脸按 aHash 汉明距离去重兜底
+
+            val withoutTrackId = candidates.filter { it.trackingId == null }.sortedByDescending { it.qualityScore }
+
+            withoutTrackId.forEach { candidate ->
+
+                val duplicate = finalCandidates.any {
+
+                    hammingDistance(it.faceHash, candidate.faceHash) <= VIDEO_FACE_HASH_DUP_DISTANCE
+
+                }
+
+                if (!duplicate) {
+
+                    finalCandidates.add(candidate)
+
+                    recordDiagnostic("视频无TrackID人脸采用 (aHash去重): timeMs=${candidate.frameTimeMs}ms, score=${candidate.qualityScore}")
+
+                } else {
+
+                    recordDiagnostic("视频无TrackID人脸舍弃 (aHash重复): timeMs=${candidate.frameTimeMs}ms, score=${candidate.qualityScore}")
+
+                }
+
+            }
+
+            
+
+            // 3. 跨 Track 再次通过 aHash 去重做安全校验，防止同一个人由于转头导致 ID 突变而上传两次
+
+            val sortedFinal = finalCandidates.sortedByDescending { it.qualityScore }
+
+            val uploadCandidatesTemp = mutableListOf<VideoFaceCandidate>()
+
+            sortedFinal.forEach { candidate ->
+
+                val duplicate = uploadCandidatesTemp.any {
+
+                    hammingDistance(it.faceHash, candidate.faceHash) <= VIDEO_CROSS_TRACK_HASH_DUP_DISTANCE
+
+                }
+
+                if (!duplicate) {
+
+                    uploadCandidatesTemp.add(candidate)
+
+                } else {
+
+                    recordDiagnostic(
+
+                        "视频跨Track二级去重拦截: 舍弃时刻=${candidate.frameTimeMs}ms, 舍弃ID=${candidate.trackingId}, 舍弃分数=${candidate.qualityScore}, 保留了更优的相似轨迹"
+
+                    )
+
+                }
+
+            }
+
+            
+
+            // 只保留质量得分在 150 及其以上的人脸，过滤极端模糊或因角度偏侧严重扣分的无效人脸，最多上传最大限制数
+
+            val uploadCandidates = uploadCandidatesTemp.filter { it.qualityScore >= 10 }.take(VIDEO_MAX_CLOUD_UPLOADS)
+
+            recordDiagnostic(
+
+                "视频本地候选完成: quickHits=${faceHitTimes.size}, fineSamples=${fineSampleTimes.size}, " +
+
+                    "localCandidates=${candidates.size}, uploadCandidates=${uploadCandidates.size}, " +
+
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+
+            )
+
+            // 延迟编码：从 retriever 重新取帧编码为原始 JPEG，避免精扫阶段大量全帧 Bitmap 驻留内存
+            uploadCandidates.forEach { candidate ->
+                if (candidate.originalBytes == null) {
+                    try {
+                        val reFrame = extractVideoFrame(retriever, candidate.frameTimeMs)
+                        if (reFrame != null) {
+                            try {
+                                candidate.originalBytes = bitmapToJpegBytes(reFrame, VIDEO_FRAME_JPEG_QUALITY)
+                            } finally {
+                                reFrame.recycle()
+                            }
+                        } else {
+                            recordDiagnostic("延迟取帧失败(retriever返回null): timeMs=${candidate.frameTimeMs}")
+                        }
+                    } catch (e: Exception) {
+                        recordDiagnostic("延迟编码视频原始帧异常: timeMs=${candidate.frameTimeMs}", e)
+                    }
+                }
+            }
+
+            if (uploadCandidates.isEmpty()) {
+                finishVideoRecognition(batchId, "视频中未检测到可识别人脸", 0)
+                return
+            }
+
+            // 并行云端上传识别（最多 3 路并发），线程安全去重
+            val seenExperts = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+            val savedCountAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val totalUploads = uploadCandidates.size
+            val parallelism = 3.coerceAtMost(totalUploads)
+            val latch = java.util.concurrent.CountDownLatch(totalUploads)
+            val uploadPool = java.util.concurrent.Executors.newFixedThreadPool(parallelism)
+
+            updateVideoProgress(batchId, "正在云端识别 0/$totalUploads", 0, totalUploads, finished = false)
+
+            uploadCandidates.forEachIndexed { index, candidate ->
+                uploadPool.submit {
+                    try {
+                        if (savedCountAtomic.get() >= VIDEO_MAX_SAVED_EXPERTS) {
+                            return@submit
+                        }
+
+                        val base64Data = Base64.encodeToString(candidate.uploadBytes, Base64.NO_WRAP)
+
+                        val result = searchFaceOnCloudSync(
+                            "data:image/jpeg;base64,$base64Data",
+                            VIDEO_CLOUD_MAX_FACE_NUM,
+                            "视频帧 ${index + 1}/$totalUploads ${candidate.frameTimeMs}ms"
+                        )
+
+                        if (result.experts.isNotEmpty()) {
+                            synchronized(this@MainActivity) {
+                                val added = saveVideoExpertRecords(video, candidate, result.experts, seenExperts)
+                                savedCountAtomic.addAndGet(added)
+
+                                recordDiagnostic(
+                                    "视频候选云端命中: timeMs=${candidate.frameTimeMs}, experts=${result.experts.size}, " +
+                                        "newRecords=$added, totalSaved=${savedCountAtomic.get()}"
+                                )
+
+                                if (savedCountAtomic.get() >= VIDEO_MAX_SAVED_EXPERTS) {
+                                    recordDiagnostic("视频识别达到保存上限: max=$VIDEO_MAX_SAVED_EXPERTS")
+                                }
+                            }
+                        } else {
+                            recordDiagnostic(
+                                "视频候选云端未命中: timeMs=${candidate.frameTimeMs}, " +
+                                    "message=${result.message}"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        recordDiagnostic("视频云端并行上传异常: timeMs=${candidate.frameTimeMs}", e)
+                    } finally {
+                        val done = completedCount.incrementAndGet()
+                        updateVideoProgress(batchId, "正在云端识别 $done/$totalUploads", done, totalUploads, finished = false)
+                        latch.countDown()
+                    }
+                }
+            }
+
+            try {
+                latch.await(120, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                recordDiagnostic("视频云端并行上传等待超时")
+            }
+            uploadPool.shutdown()
+
+            val savedCount = savedCountAtomic.get()
+            val message = if (savedCount > 0) {
+                "视频识别完成，发现 $savedCount 名专家"
+            } else {
+                "视频识别完成，未发现匹配专家"
+            }
+
+            finishVideoRecognition(batchId, message, savedCount)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("视频识别异常: name=${video.displayName}", e)
+
+            finishVideoRecognition(batchId, "视频识别异常，已记录日志", 0)
+
+        } finally {
+
+            try {
+
+                retriever.release()
+
+            } catch (e: Exception) {
+
+                // ignore
+
+            }
+
+        }
+
+    }
+
+    private fun readVideoDurationMs(retriever: MediaMetadataRetriever, fallbackMs: Long): Long {
+
+        val metaDuration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+
+            ?.toLongOrNull()
+
+        return (metaDuration ?: fallbackMs).coerceAtLeast(0L)
+
+    }
+
+    private fun buildVideoQuickSampleTimes(durationMs: Long): List<Long> {
+
+        if (durationMs <= 0L) {
+
+            return listOf(0L)
+
+        }
+
+        val intervalMs = if (durationMs <= VIDEO_QUICK_SHORT_DURATION_MS) {
+
+            VIDEO_QUICK_SHORT_INTERVAL_MS
+
+        } else if (durationMs <= VIDEO_QUICK_DENSE_DURATION_MS) {
+
+            VIDEO_QUICK_SAMPLE_INTERVAL_MS
+
+        } else {
+
+            maxOf(
+
+                VIDEO_QUICK_SAMPLE_INTERVAL_MS,
+
+                durationMs / (VIDEO_MAX_QUICK_SAMPLE_FRAMES - 1).coerceAtLeast(1)
+
+            )
+
+        }
+
+        val times = mutableListOf<Long>()
+
+        var timeMs = 0L
+
+        while (timeMs <= durationMs && times.size < VIDEO_MAX_QUICK_SAMPLE_FRAMES) {
+
+            times.add(timeMs)
+
+            timeMs += intervalMs
+
+        }
+
+        if (times.lastOrNull() != durationMs && times.size < VIDEO_MAX_QUICK_SAMPLE_FRAMES) {
+
+            times.add(durationMs.coerceAtLeast(0L))
+
+        }
+
+        return times.distinct()
+
+    }
+
+    private fun buildVideoFocusedSampleTimes(hitTimes: List<Long>, durationMs: Long): List<Long> {
+
+        if (hitTimes.isEmpty()) {
+
+            return emptyList()
+
+        }
+
+        val times = TreeSet<Long>()
+
+        hitTimes.forEach { hitTime ->
+
+            val start = (hitTime - VIDEO_FINE_WINDOW_BEFORE_MS).coerceAtLeast(0L)
+
+            val end = (hitTime + VIDEO_FINE_WINDOW_AFTER_MS).coerceAtMost(durationMs.coerceAtLeast(0L))
+
+            var timeMs = start
+
+            while (timeMs <= end) {
+
+                times.add(timeMs)
+
+                timeMs += VIDEO_FINE_SAMPLE_INTERVAL_MS
+
+            }
+
+            times.add(hitTime.coerceIn(0L, durationMs.coerceAtLeast(0L)))
+
+        }
+
+        if (times.size <= VIDEO_MAX_FINE_SAMPLE_FRAMES) {
+
+            return times.toList()
+
+        }
+
+        val sorted = times.toList()
+
+        val sampled = mutableListOf<Long>()
+
+        for (i in 0 until VIDEO_MAX_FINE_SAMPLE_FRAMES) {
+
+            val sourceIndex = if (VIDEO_MAX_FINE_SAMPLE_FRAMES == 1) {
+
+                0
+
+            } else {
+
+                (i * (sorted.size - 1).toFloat() / (VIDEO_MAX_FINE_SAMPLE_FRAMES - 1).toFloat()).roundToInt()
+
+            }
+
+            sampled.add(sorted[sourceIndex.coerceIn(0, sorted.lastIndex)])
+
+        }
+
+        return sampled.distinct()
+
+    }
+
+    private fun extractVideoFrame(
+        retriever: MediaMetadataRetriever,
+        timeMs: Long,
+        precise: Boolean = true,
+        maxSide: Int = -1
+    ): Bitmap? {
+
+        val option = if (precise) {
+            MediaMetadataRetriever.OPTION_CLOSEST
+        } else {
+            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+        }
+
+        return try {
+            if (maxSide > 0) {
+                val widthStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                val heightStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                val w = widthStr?.toIntOrNull() ?: -1
+                val h = heightStr?.toIntOrNull() ?: -1
+                if (w > 0 && h > 0) {
+                    val currentMax = maxOf(w, h)
+                    val scale = maxSide.toFloat() / currentMax.toFloat()
+                    if (scale < 1.0f) {
+                        val dstW = Math.max(1, (w * scale).toInt())
+                        val dstH = Math.max(1, (h * scale).toInt())
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                            return retriever.getScaledFrameAtTime(timeMs * 1000L, option, dstW, dstH)
+                        }
+                    }
+                }
+            }
+            retriever.getFrameAtTime(timeMs * 1000L, option)
+        } catch (e: Exception) {
+            recordDiagnostic("视频取帧异常: timeMs=$timeMs, precise=$precise, maxSide=$maxSide", e)
+            null
+        }
+    }
+
+    private fun buildVideoFaceCandidate(
+
+        video: GalleryVideo,
+
+        frame: Bitmap,
+
+        detectionBitmap: Bitmap,
+
+        face: Face,
+
+        frameTimeMs: Long
+
+    ): VideoFaceCandidate? {
+
+        val faceRectOnDetection = clippedRect(face.boundingBox, detectionBitmap.width, detectionBitmap.height)
+
+        if (faceRectOnDetection == null) {
+
+            recordDiagnostic("视频候选被拒: clippedRect为null, trackingId=${face.trackingId}")
+
+            return null
+
+        }
+
+            
+
+        // 过滤在检测分辨率（最大边 960）下宽度或高度小于 100 像素的人脸，防止超小模糊脸干扰打分并上传云端
+
+        if (faceRectOnDetection.width() < 35 || faceRectOnDetection.height() < 35) {
+
+            recordDiagnostic("视频候选被拒: 尺寸过小 (${faceRectOnDetection.width()}x${faceRectOnDetection.height()}), trackingId=${face.trackingId}")
+
+            return null
+
+        }
+
+        // 过滤大角度侧脸（Yaw 偏角 > 25度 或 Pitch 偏角 > 20度），以防发送无效的云端核验导致人脸检测报错
+
+        if (abs(face.headEulerAngleY) > 40f || abs(face.headEulerAngleX) > 35f) {
+
+            recordDiagnostic("视频候选被拒: 姿态角过大 (yaw=${face.headEulerAngleY}, pitch=${face.headEulerAngleX}), trackingId=${face.trackingId}")
+
+            return null
+
+        }
+
+        val faceAreaRatio = faceRectOnDetection.width().toFloat() * faceRectOnDetection.height().toFloat() /
+
+            (detectionBitmap.width.toFloat() * detectionBitmap.height.toFloat()).coerceAtLeast(1f)
+
+        if (faceAreaRatio < VIDEO_MIN_FACE_AREA_RATIO) {
+
+            recordDiagnostic("视频候选被拒: 面积比例过小 (ratio=$faceAreaRatio < $VIDEO_MIN_FACE_AREA_RATIO), trackingId=${face.trackingId}")
+
+            return null
+
+        }
+
+        val scaleX = frame.width.toFloat() / detectionBitmap.width.toFloat()
+
+        val scaleY = frame.height.toFloat() / detectionBitmap.height.toFloat()
+
+        val faceRectOnFrame = Rect(
+
+            (faceRectOnDetection.left * scaleX).roundToInt().coerceIn(0, frame.width),
+
+            (faceRectOnDetection.top * scaleY).roundToInt().coerceIn(0, frame.height),
+
+            (faceRectOnDetection.right * scaleX).roundToInt().coerceIn(0, frame.width),
+
+            (faceRectOnDetection.bottom * scaleY).roundToInt().coerceIn(0, frame.height)
+
+        )
+
+        if (faceRectOnFrame.width() <= 0 || faceRectOnFrame.height() <= 0) {
+
+            recordDiagnostic("视频候选被拒: 映射到原图后的宽度或高度为0, trackingId=${face.trackingId}")
+
+            return null
+
+        }
+
+        val uploadImage = buildSingleFaceUploadImageFromRect(frame, faceRectOnFrame, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
+
+        val uploadBytes = bitmapToJpegBytes(uploadImage.bitmap, FACE_UPLOAD_JPEG_QUALITY)
+
+        val uploadWidth = uploadImage.bitmap.width
+
+        val uploadHeight = uploadImage.bitmap.height
+
+        val quality = scoreVideoFaceCandidate(frame, face, faceRectOnFrame)
+
+        val hash = averageFaceHash(frame, faceRectOnFrame)
+
+        val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
+
+            0f,
+
+            0f,
+
+            uploadWidth.toFloat(),
+
+            uploadHeight.toFloat()
+
+        )
+
+        recordDiagnostic(
+
+            "视频候选人脸: video=${video.displayName}, timeMs=$frameTimeMs, trackingId=${face.trackingId}, quality=$quality, " +
+
+                "areaRatio=$faceAreaRatio, yaw=${face.headEulerAngleY}, roll=${face.headEulerAngleZ}, " +
+
+                "upload=${uploadWidth}x${uploadHeight}, bytes=${uploadBytes.size}"
+
+        )
+
+        // 显式回收本地生成的上传用临时小图，避免内存累积
+
+        try {
+
+            uploadImage.bitmap.recycle()
+
+        } catch (e: Exception) {}
+
+        return VideoFaceCandidate(
+
+            frameTimeMs = frameTimeMs,
+
+            qualityScore = quality,
+
+            faceHash = hash,
+
+            originalBytes = null,
+
+            originalBitmap = null, // 延迟到去重筛选后再从 retriever 取帧编码，避免同时驻留大量全帧 Bitmap
+
+            originalWidth = video.width,
+            originalHeight = video.height,
+
+            uploadBytes = uploadBytes,
+
+            uploadWidth = uploadWidth,
+
+            uploadHeight = uploadHeight,
+
+            localFaceRect = localRect,
+
+            faceAreaRatio = faceAreaRatio,
+
+            yaw = face.headEulerAngleY,
+
+            roll = face.headEulerAngleZ,
+
+            trackingId = face.trackingId
+
+        )
+
+    }
+
+    private fun buildSingleFaceUploadImageFromRect(
+
+        sourceBitmap: Bitmap,
+
+        faceRect: Rect,
+
+        maxUploadSide: Int
+
+    ): FaceUploadImage {
+
+        val padX = (faceRect.width() * FACE_CROP_HORIZONTAL_PADDING).toInt()
+
+        val padTop = (faceRect.height() * FACE_CROP_TOP_PADDING).toInt()
+
+        val padBottom = (faceRect.height() * FACE_CROP_BOTTOM_PADDING).toInt()
+
+        val cropRect = expandRectToMinimumSide(
+
+            Rect(
+
+                (faceRect.left - padX).coerceAtLeast(0),
+
+                (faceRect.top - padTop).coerceAtLeast(0),
+
+                (faceRect.right + padX).coerceAtMost(sourceBitmap.width),
+
+                (faceRect.bottom + padBottom).coerceAtMost(sourceBitmap.height)
+
+            ),
+
+            sourceBitmap.width,
+
+            sourceBitmap.height,
+
+            0
+
+        )
+
+        val cropped = Bitmap.createBitmap(sourceBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
+
+        val uploadBitmap = resizeBitmapForUpload(cropped, maxUploadSide)
+
+        val scaleX = uploadBitmap.width.toFloat() / cropRect.width().toFloat()
+
+        val scaleY = uploadBitmap.height.toFloat() / cropRect.height().toFloat()
+
+        val localRect = mapLocalFaceToUploadRect(faceRect, cropRect, scaleX, scaleY, uploadBitmap.width, uploadBitmap.height)
+
+        return FaceUploadImage(uploadBitmap, cropRect, listOfNotNull(localRect))
+
+    }
+
+    private fun scoreVideoFaceCandidate(bitmap: Bitmap, face: Face, faceRect: Rect): Int {
+
+        // 1. 基础分为归一化后的五官核心区清晰度（范围 0 ~ 8000）
+
+        val sharpness = estimateFaceSharpness(bitmap, faceRect).coerceIn(0, 8000)
+
+        
+
+        // 2. 面积奖励分：鼓励人脸在画面中足够大（离镜头越近识别度越高），最高加 3000 分
+
+        val faceArea = faceRect.width().toLong() * faceRect.height().toLong()
+
+        val areaBonus = (faceArea * 3000L / (bitmap.width.toLong() * bitmap.height.toLong()).coerceAtLeast(1L)).toInt().coerceIn(0, 3000)
+
+        
+
+        // 3. 姿态角（Yaw, Roll, Pitch）非线性惩罚扣分：
+
+        // 只要偏角在合理范围内不扣分（Yaw在15度内，Roll在12度内，Pitch在12度内），超过该范围则线性惩罚扣分，防止因为正脸让模糊晃动脸胜出
+
+        val yawPenalty = if (abs(face.headEulerAngleY) > 15f) {
+
+            ((abs(face.headEulerAngleY) - 15f) * 30f).roundToInt()
+
+        } else 0
+
+        
+
+        val rollPenalty = if (abs(face.headEulerAngleZ) > 12f) {
+
+            ((abs(face.headEulerAngleZ) - 12f) * 20f).roundToInt()
+
+        } else 0
+
+        val pitchPenalty = if (abs(face.headEulerAngleX) > 12f) {
+
+            ((abs(face.headEulerAngleX) - 12f) * 30f).roundToInt()
+
+        } else 0
+
+        
+
+        // 4. 中心位置惩罚扣分：越靠近画面正中心（或微偏上）惩罚越小
+
+        val centerX = faceRect.centerX().toFloat() / bitmap.width.toFloat()
+
+        val centerY = faceRect.centerY().toFloat() / bitmap.height.toFloat()
+
+        val centerPenalty = ((abs(centerX - 0.5f) + abs(centerY - 0.48f)) * 400f).roundToInt()
+
+        
+
+        // 最终质量分 = 清晰度分 + 面积奖励 - 姿态角惩罚 - 中心位置惩罚
+
+        val score = sharpness + areaBonus - yawPenalty - rollPenalty - pitchPenalty - centerPenalty
+
+        return score.coerceAtLeast(0)
+
+    }
+
+    
+
+    private fun estimateFaceSharpness(bitmap: Bitmap, rect: Rect): Int {
+
+        val width = rect.width()
+
+        val height = rect.height()
+
+        if (width < 10 || height < 10) return 0
+
+        
+
+        // 1. 裁剪人脸核心五官区域（中心 60% 宽度和 60% 高度），避开额头头发、耳朵以及外部衣领/背景的高对比度纹理噪点
+
+        val coreLeft = rect.left + (width * 0.2f).toInt()
+
+        val coreTop = rect.top + (height * 0.2f).toInt()
+
+        val coreRight = rect.right - (width * 0.2f).toInt()
+
+        val coreBottom = rect.bottom - (height * 0.2f).toInt()
+
+        val coreRect = clippedRect(Rect(coreLeft, coreTop, coreRight, coreBottom), bitmap.width, bitmap.height) ?: return 0
+
+        
+
+        val crop = Bitmap.createBitmap(bitmap, coreRect.left, coreRect.top, coreRect.width(), coreRect.height())
+
+        
+
+        // 2. 限制五官核心区大图的最大边为 120 像素，避免过大分辨率或小分辨率带来的特征梯度失真，实现公平打分
+
+        val small = resizeBitmapToMaxSide(crop, 120)
+
+        val sWidth = small.width
+
+        val sHeight = small.height
+
+        if (sWidth < 3 || sHeight < 3) {
+
+            if (small !== crop) small.recycle()
+
+            crop.recycle()
+
+            return 0
+
+        }
+
+        
+
+        val pixels = IntArray(sWidth * sHeight)
+
+        small.getPixels(pixels, 0, sWidth, 0, 0, sWidth, sHeight)
+
+        var gradientSum = 0L
+
+        var count = 0
+
+        for (y in 1 until sHeight) {
+
+            for (x in 1 until sWidth) {
+
+                val current = luminance(pixels[y * sWidth + x])
+
+                val left = luminance(pixels[y * sWidth + x - 1])
+
+                val top = luminance(pixels[(y - 1) * sWidth + x])
+
+                gradientSum += abs(current - left) + abs(current - top)
+
+                count += 2
+
+            }
+
+        }
+
+        if (small !== crop) small.recycle()
+
+        crop.recycle()
+
+        
+
+        // 归一化平均差值，乘以 120 放大映射到 0~8000 区间，更保真地反映出五官对焦清晰度与防晃动程度
+
+        val avgGradient = if (count == 0) 0f else (gradientSum.toFloat() / count.toFloat())
+
+        return (avgGradient * 120f).roundToInt()
+
+    }
+
+    private fun averageFaceHash(bitmap: Bitmap, rect: Rect): Long {
+
+        val cropRect = expandRectToMinimumSide(
+
+            rect,
+
+            bitmap.width,
+
+            bitmap.height,
+
+            maxOf(rect.width(), rect.height()).coerceAtLeast(1)
+
+        )
+
+        val crop = Bitmap.createBitmap(bitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
+
+        val small = Bitmap.createScaledBitmap(crop, VIDEO_HASH_SIZE, VIDEO_HASH_SIZE, true)
+
+        val pixels = IntArray(VIDEO_HASH_SIZE * VIDEO_HASH_SIZE)
+
+        small.getPixels(pixels, 0, VIDEO_HASH_SIZE, 0, 0, VIDEO_HASH_SIZE, VIDEO_HASH_SIZE)
+
+        val values = pixels.map { luminance(it) }
+
+        val average = values.sum() / values.size.coerceAtLeast(1)
+
+        var hash = 0L
+
+        values.forEachIndexed { index, value ->
+
+            if (value >= average) {
+
+                hash = hash or (1L shl index)
+
+            }
+
+        }
+
+        small.recycle()
+
+        crop.recycle()
+
+        return hash
+
+    }
+
+    private fun luminance(color: Int): Int {
+
+        val r = Color.red(color)
+
+        val g = Color.green(color)
+
+        val b = Color.blue(color)
+
+        return (r * 299 + g * 587 + b * 114) / 1000
+
+    }
+
+    private fun addOrReplaceVideoCandidate(
+
+        candidates: MutableList<VideoFaceCandidate>,
+
+        candidate: VideoFaceCandidate
+
+    ) {
+
+        val duplicateIndex = candidates.indexOfFirst {
+
+            hammingDistance(it.faceHash, candidate.faceHash) <= VIDEO_FACE_HASH_DUP_DISTANCE
+
+        }
+
+        if (duplicateIndex >= 0) {
+
+            if (candidate.qualityScore > candidates[duplicateIndex].qualityScore) {
+
+                recordDiagnostic(
+
+                    "视频候选相似脸替换: oldQuality=${candidates[duplicateIndex].qualityScore}, " +
+
+                        "newQuality=${candidate.qualityScore}, distance=${hammingDistance(candidates[duplicateIndex].faceHash, candidate.faceHash)}"
+
+                )
+
+                candidates[duplicateIndex] = candidate
+
+            }
+
+        } else {
+
+            candidates.add(candidate)
+
+        }
+
+        candidates.sortByDescending { it.qualityScore }
+
+        while (candidates.size > VIDEO_MAX_LOCAL_CANDIDATES) {
+
+            candidates.removeAt(candidates.lastIndex)
+
+        }
+
+    }
+
+    private fun hammingDistance(left: Long, right: Long): Int {
+
+        return java.lang.Long.bitCount(left xor right)
+
+    }
+
+    private fun searchFaceOnCloudSync(
+
+        base64Image: String,
+
+        maxFaceNum: Int,
+
+        sourceLabel: String
+
+    ): CloudFaceSearchResult {
+
+        return try {
+
+            val requestUrl = "$serverBaseUrl/dlsgzs/api/face/search"
+
+            val requestMaxFaceNum = cloudMaxFaceNumFor(maxFaceNum)
+
+            val jsonPayload = JsonObject().apply {
+
+                addProperty("image", base64Image)
+
+                addProperty("max_face_num", requestMaxFaceNum)
+
+                addProperty("search_mode", "speed")
+
+            }
+
+            val requestBodyString = jsonPayload.toString()
+
+            val requestBody = requestBodyString
+
+                .toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+
+            val request = Request.Builder()
+
+                .url(requestUrl)
+
+                .post(requestBody)
+
+                .build()
+
+            recordDiagnostic(
+
+                "视频云端识别请求: source=$sourceLabel, url=$requestUrl, " +
+
+                    "imageChars=${base64Image.length}, maxFaceNum=$requestMaxFaceNum"
+
+            )
+
+            okHttpClient.newCall(request).execute().use { response ->
+
+                val bodyString = response.body?.string() ?: ""
+
+                recordDiagnostic(
+
+                    "视频云端识别响应: source=$sourceLabel, code=${response.code}, " +
+
+                        "success=${response.isSuccessful}, bodyChars=${bodyString.length}"
+
+                )
+
+                if (!response.isSuccessful || bodyString.isEmpty()) {
+
+                    return CloudFaceSearchResult(
+
+                        experts = emptyList(),
+
+                        message = cloudErrorMessage(response.code, bodyString)
+
+                    )
+
+                }
+
+                val resultObj = Gson().fromJson(bodyString, JsonObject::class.java)
+
+                val success = resultObj.get("success")?.asBoolean ?: false
+
+                if (!success) {
+
+                    return CloudFaceSearchResult(
+
+                        experts = emptyList(),
+
+                        message = resultObj.get("error")?.asString ?: "未匹配到登记的专家档案"
+
+                    )
+
+                }
+
+                val resultsArray = resultObj.getAsJsonArray("results")
+
+                if (resultsArray == null || resultsArray.size() == 0) {
+
+                    return CloudFaceSearchResult(emptyList(), "云端未返回匹配结果")
+
+                }
+
+                val experts = mutableListOf<ExpertInfo>()
+
+                for (i in 0 until resultsArray.size()) {
+
+                    val matchItem = resultsArray.get(i).asJsonObject
+
+                    val expertObj = matchItem.get("expert")
+
+                        ?.takeIf { it.isJsonObject }
+
+                        ?.asJsonObject
+
+                        ?: continue
+
+                    val score = matchItem.get("score")?.asFloat ?: 0f
+
+                    val name = expertObj.get("name")?.asString ?: "-"
+
+                    val company = expertObj.get("company")?.asString ?: "无工作单位"
+
+                    val major = expertObj.get("major")?.asString ?: "未填写"
+
+                    val phone = expertObj.get("phone")?.asString ?: "-"
+
+                    val idCard = expertObj.get("id_card")?.asString ?: "-"
+
+                    val photoPath = expertObj.get("photo_path")?.asString ?: ""
+
+                    val faceRect = parseFaceRect(matchItem)
+
+                    experts.add(ExpertInfo(name, company, major, phone, idCard, score, photoPath, faceRect))
+
+                }
+
+                CloudFaceSearchResult(experts, if (experts.isEmpty()) "云端未返回专家数据" else "ok")
+
+            }
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("视频云端识别异常: source=$sourceLabel", e)
+
+            CloudFaceSearchResult(emptyList(), e.message ?: "视频云端识别异常")
+
+        }
+
+    }
+
+    private fun saveVideoExpertRecords(
+
+        video: GalleryVideo,
+
+        candidate: VideoFaceCandidate,
+
+        experts: List<ExpertInfo>,
+
+        seenExpertKeys: MutableSet<String>
+
+    ): Int {
+
+        var added = 0
+
+        experts.forEachIndexed { index, expert ->
+
+            val key = expertIdentityKey(expert)
+
+            if (!seenExpertKeys.add(key)) {
+
+                recordDiagnostic("视频专家重复跳过: key=$key, name=${expert.name}, timeMs=${candidate.frameTimeMs}")
+
+                return@forEachIndexed
+
+            }
+
+            val recordId = "${System.currentTimeMillis()}_${Random().nextInt(100000)}"
+
+            val expertWithRect = if (expert.faceRect != null) {
+
+                expert
+
+            } else {
+
+                recordDiagnostic(
+
+                    "视频云端未返回人脸框，使用本地上传图人脸框: name=${expert.name}, " +
+
+                        "rect=${candidate.localFaceRect.x},${candidate.localFaceRect.y}," +
+
+                        "${candidate.localFaceRect.width},${candidate.localFaceRect.height}"
+
+                )
+
+                expert.copy(faceRect = candidate.localFaceRect)
+
+            }
+
+            val record = RecognitionRecord(
+
+                id = recordId,
+
+                createdAt = System.currentTimeMillis() - index * 10L,
+
+                updatedAt = System.currentTimeMillis(),
+
+                status = STATUS_SUCCESS,
+
+                statusText = "视频识别成功"
+
+            )
+
+            candidate.originalBytes?.let {
+
+                record.originalImagePath = saveHistoryImage(recordId, "original", it)
+
+            }
+
+            record.uploadImagePath = saveHistoryImage(recordId, "upload", candidate.uploadBytes)
+
+            record.originalWidth = candidate.originalWidth
+
+            record.originalHeight = candidate.originalHeight
+
+            record.uploadWidth = candidate.uploadWidth
+
+            record.uploadHeight = candidate.uploadHeight
+
+            record.localFaceRects.add(candidate.localFaceRect)
+
+            record.experts.add(expertWithRect)
+
+            val cropRect = expertWithRect.faceRect
+
+            if (cropRect != null) {
+
+                val crop = cropAndSaveBestFaceImage(
+
+                    candidate.uploadBytes,
+
+                    candidate.originalBytes,
+
+                    cropRect,
+
+                    recordId
+
+                )
+
+                if (crop != null) {
+
+                    record.uploadImagePath = crop.path
+
+                    record.uploadWidth = crop.width
+
+                    record.uploadHeight = crop.height
+
+                }
+
+            }
+
+            synchronized(recognitionRecords) {
+
+                recognitionRecords.add(0, record)
+
+            }
+
+            added += 1
+
+            recordDiagnostic(
+
+                "视频识别结果已保存: video=${video.displayName}, recordId=$recordId, " +
+
+                    "name=${expert.name}, score=${expert.score}, timeMs=${candidate.frameTimeMs}"
+
+            )
+
+        }
+
+        if (added > 0) {
+
+            saveRecognitionRecords()
+
+            runOnUiThread {
+
+                renderHistoryListIfVisible()
+
+            }
+
+        }
+
+        return added
+
+    }
+
+    private fun expertIdentityKey(expert: ExpertInfo): String {
+
+        val idCard = expert.idCard?.trim().orEmpty()
+
+        if (idCard.isNotBlank() && idCard != "-") return "id:$idCard"
+
+        val phone = expert.phone.trim()
+
+        if (phone.isNotBlank() && phone != "-") return "phone:$phone"
+
+        return "name:${expert.name.trim()}|company:${expert.company.trim()}"
+
+    }
+
+    private fun clippedRect(rect: Rect, imageWidth: Int, imageHeight: Int): Rect? {
+
+        val left = rect.left.coerceIn(0, imageWidth)
+
+        val top = rect.top.coerceIn(0, imageHeight)
+
+        val right = rect.right.coerceIn(0, imageWidth)
+
+        val bottom = rect.bottom.coerceIn(0, imageHeight)
+
+        return if (right > left && bottom > top) {
+
+            Rect(left, top, right, bottom)
+
+        } else {
+
+            null
+
+        }
+
+    }
+
+    private fun resizeBitmapToMaxSide(bitmap: Bitmap, maxSide: Int): Bitmap {
+
+        if (maxSide <= 0) return bitmap
+
+        val currentMaxSide = maxOf(bitmap.width, bitmap.height)
+
+        if (currentMaxSide <= maxSide) {
+
+            return bitmap
+
+        }
+
+        val scale = maxSide.toFloat() / currentMaxSide.toFloat()
+
+        val targetWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
+
+        val targetHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)
+
+        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+
+    }
+
+    private fun formatDurationMs(durationMs: Long): String {
+
+        val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
+
+        val minutes = totalSeconds / 60L
+
+        val seconds = totalSeconds % 60L
+
+        return String.format(Locale.CHINA, "%d:%02d", minutes, seconds)
+
+    }
+
+    private fun triggerCaptureFromExternalEvent(source: String) {
+
+        val now = System.currentTimeMillis()
+
+        if (now - lastExternalCaptureTriggerAt < EXTERNAL_CAPTURE_DEBOUNCE_MS) {
+
+            recordDiagnostic("$source 触发被忽略: debounceMs=$EXTERNAL_CAPTURE_DEBOUNCE_MS")
+
+            return
+
+        }
+
+        lastExternalCaptureTriggerAt = now
+
+        recordDiagnostic("$source 触发现场抓拍比对")
+
+        runOnUiThread {
+
+            if (binding.settingsPage.visibility == View.VISIBLE ||
+
+                binding.historyPage.visibility == View.VISIBLE ||
+
+                binding.galleryPage.visibility == View.VISIBLE ||
+
+                binding.videoPage.visibility == View.VISIBLE
+
+            ) {
+
+                showMainPage()
+
+            }
+
+            takePhotoAndMatch()
+
+        }
+
+    }
+
+    private fun createRecognitionRecord(
+
+        status: String = STATUS_CAPTURING,
+
+        statusText: String = "正在请求眼镜拍照"
+
+    ): RecognitionRecord {
+
+        val now = System.currentTimeMillis()
+
+        val record = RecognitionRecord(
+
+            id = "${now}_${Random().nextInt(100000)}",
+
+            createdAt = now,
+
+            updatedAt = now,
+
+            status = status,
+
+            statusText = statusText
+
+        )
+
+        synchronized(recognitionRecords) {
+
+            recognitionRecords.add(0, record)
+
+        }
+
+        saveRecognitionRecords()
+
+        runOnUiThread {
+
+            renderHistoryListIfVisible()
+
+        }
+
+        return record
+
+    }
+
+    private fun findRecognitionRecord(recordId: String?): RecognitionRecord? {
+
+        if (recordId == null) return null
+
+        return synchronized(recognitionRecords) {
+
+            recognitionRecords.firstOrNull { it.id == recordId }
+
+        }
+
+    }
+
+    private fun updateRecognitionRecord(recordId: String?, block: (RecognitionRecord) -> Unit) {
+
+        val record = findRecognitionRecord(recordId) ?: return
+
+        block(record)
+
+        record.updatedAt = System.currentTimeMillis()
+
+        val updatedStatus = record.status
+
+        val updatedRecordId = record.id
+
+        saveRecognitionRecords()
+
+        updateGalleryBatchProgressForRecord(updatedRecordId, updatedStatus)
+
+        runOnUiThread {
+
+            renderHistoryListIfVisible()
+
+        }
+
+    }
+
+    private fun loadRecognitionRecords() {
+
+        val json = getSharedPreferences(HISTORY_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .getString(HISTORY_PREFS_KEY, "[]")
+
+        val type = object : TypeToken<MutableList<RecognitionRecord>>() {}.type
+
+        val loaded = try {
+
+            Gson().fromJson<MutableList<RecognitionRecord>>(json, type) ?: mutableListOf()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("读取识别记录失败，将重置历史", e)
+
+            mutableListOf()
+
+        }
+
+        synchronized(recognitionRecords) {
+
+            recognitionRecords.clear()
+
+            recognitionRecords.addAll(loaded.sortedByDescending { it.createdAt })
+
+        }
+
+    }
+
+    private fun saveRecognitionRecords() {
+
+        val snapshot = synchronized(recognitionRecords) {
+
+            recognitionRecords.sortedByDescending { it.createdAt }
+
+        }
+
+        executeWorker("保存识别记录") {
+
+            try {
+
+                val json = Gson().toJson(snapshot)
+
+                getSharedPreferences(HISTORY_PREFS_NAME, Context.MODE_PRIVATE)
+
+                    .edit()
+
+                    .putString(HISTORY_PREFS_KEY, json)
+
+                    .apply()
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("后台保存识别记录异常", e)
+
+            }
+
+        }
+
+    }
+
+    private fun executeThumbnailWorker(taskName: String, block: () -> Unit) {
+
+        if (!::thumbnailExecutor.isInitialized || thumbnailExecutor.isShutdown || thumbnailExecutor.isTerminated) {
+
+            Log.w(TAG, "Skip thumbnail task after shutdown: $taskName")
+
+            return
+
+        }
+
+        try {
+
+            thumbnailExecutor.execute {
+
+                try {
+
+                    block()
+
+                } catch (e: Exception) {
+
+                    Log.e(TAG, "Thumbnail task failed: $taskName", e)
+
+                }
+
+            }
+
+        } catch (e: RejectedExecutionException) {
+
+            Log.w(TAG, "Thumbnail task rejected after shutdown: $taskName")
+
+        }
+
+    }
+
+    private fun executeWorker(taskName: String, block: () -> Unit) {
+
+        if (!::workExecutor.isInitialized || workExecutor.isShutdown || workExecutor.isTerminated) {
+
+            Log.w(TAG, "Skip worker task after shutdown: $taskName")
+
+            return
+
+        }
+
+        try {
+
+            workExecutor.execute {
+
+                try {
+
+                    block()
+
+                } catch (e: Exception) {
+
+                    recordDiagnostic("$taskName 执行异常", e)
+
+                }
+
+            }
+
+        } catch (e: RejectedExecutionException) {
+
+            Log.w(TAG, "Worker task rejected after shutdown: $taskName", e)
+
+        }
+
+    }
+
+    private fun markInterruptedRecordsForRetry() {
+
+        var changed = false
+
+        synchronized(recognitionRecords) {
+
+            recognitionRecords.forEach { record ->
+
+                if (record.status in setOf(STATUS_CAPTURING, STATUS_LOCAL_PROCESSING, STATUS_UPLOADING)) {
+
+                    record.status = STATUS_INTERRUPTED
+
+                    record.statusText = "上次关闭时未完成，可手动重试"
+
+                    record.updatedAt = System.currentTimeMillis()
+
+                    changed = true
+
+                }
+
+            }
+
+        }
+
+        if (changed) {
+
+            saveRecognitionRecords()
+
+        }
+
+    }
+
+    private fun cleanupExpiredRecognitionRecords() {
+
+        val cutoff = System.currentTimeMillis() - HISTORY_RETENTION_MS
+
+        val expired = mutableListOf<RecognitionRecord>()
+
+        synchronized(recognitionRecords) {
+
+            val iterator = recognitionRecords.iterator()
+
+            while (iterator.hasNext()) {
+
+                val record = iterator.next()
+
+                if (record.createdAt < cutoff) {
+
+                    expired.add(record)
+
+                    iterator.remove()
+
+                }
+
+            }
+
+        }
+
+        expired.forEach { deleteRecognitionRecordFiles(it) }
+
+        if (expired.isNotEmpty()) {
+
+            saveRecognitionRecords()
+
+            recordDiagnostic("已自动清理过期识别记录: count=${expired.size}")
+
+        }
+
+    }
+
+    private fun historyDir(): File {
+
+        return File(filesDir, "recognition_history").apply {
+
+            if (!exists()) mkdirs()
+
+        }
+
+    }
+
+    private fun saveHistoryImage(recordId: String, suffix: String, bytes: ByteArray): String {
+
+        val file = File(historyDir(), "${recordId}_${suffix}.jpg")
+
+        file.writeBytes(bytes)
+
+        return file.absolutePath
+
+    }
+
+    private fun loadHistoryBytes(path: String?): ByteArray? {
+
+        if (path.isNullOrEmpty()) return null
+
+        val file = File(path)
+
+        return if (file.exists()) file.readBytes() else null
+
+    }
+
+    private fun decodeHistoryThumbnail(path: String?, maxSide: Int): Bitmap? {
+
+        if (path.isNullOrBlank()) return null
+
+        val file = File(path)
+
+        if (!file.exists()) return null
+
+        return try {
+
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+
+            BitmapFactory.decodeFile(path, bounds)
+
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+
+                return null
+
+            }
+
+            val options = BitmapFactory.Options().apply {
+
+                inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
+
+            }
+
+            BitmapFactory.decodeFile(path, options)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("识别记录缩略图解码失败: path=$path", e)
+
+            null
+
+        } catch (e: OutOfMemoryError) {
+
+            recordDiagnostic("识别记录缩略图解码内存不足: path=$path", e)
+
+            null
+
+        }
+
+    }
+
+    private fun deleteRecognitionRecord(recordId: String) {
+
+        val removed = synchronized(recognitionRecords) {
+
+            val record = recognitionRecords.firstOrNull { it.id == recordId }
+
+            if (record != null) {
+
+                recognitionRecords.remove(record)
+
+            }
+
+            record
+
+        }
+
+        if (removed != null) {
+
+            deleteRecognitionRecordFiles(removed)
+
+            saveRecognitionRecords()
+
+            renderHistoryList()
+
+            recordDiagnostic("手动删除识别记录: id=$recordId")
+
+        }
+
+    }
+
+    private fun deleteRecognitionRecordFiles(record: RecognitionRecord) {
+
+        listOf(record.originalImagePath, record.uploadImagePath).forEach { path ->
+
+            if (!path.isNullOrEmpty()) {
+
+                try {
+
+                     File(path).delete()
+
+                } catch (e: Exception) {
+
+                    recordDiagnostic("删除识别记录图片失败: $path", e)
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun clearFailedHistoryRecords() {
+
+        val toRemove = synchronized(recognitionRecords) {
+
+            val activeStates = setOf(STATUS_CAPTURING, STATUS_LOCAL_PROCESSING, STATUS_UPLOADING)
+
+            val filtered = recognitionRecords.filter { it.status != STATUS_SUCCESS && it.status !in activeStates }
+
+            recognitionRecords.removeAll(filtered)
+
+            filtered
+
+        }
+
+        
+
+        if (toRemove.isEmpty()) {
+
+            Toast.makeText(this, "暂无可清理的无识别记录", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        
+
+        executeWorker("清理无识别记录") {
+
+            toRemove.forEach { deleteRecognitionRecordFiles(it) }
+
+            saveRecognitionRecords()
+
+            runOnUiThread {
+
+                renderHistoryList()
+
+                Toast.makeText(this@MainActivity, "已清理 ${toRemove.size} 条无识别记录", Toast.LENGTH_SHORT).show()
+
+            }
+
+        }
+
+        recordDiagnostic("一键清除无识别记录: 清除数量=${toRemove.size}")
+
+    }
+
+    private fun retryRecognitionRecord(recordId: String) {
+
+        val record = findRecognitionRecord(recordId)
+
+        if (record == null) {
+
+            Toast.makeText(this, "记录不存在", Toast.LENGTH_SHORT).show()
+
+            return
+
+        }
+
+        val uploadBytes = loadHistoryBytes(record.uploadImagePath)
+
+        val originalBytes = loadHistoryBytes(record.originalImagePath)
+
+        when {
+
+            uploadBytes != null -> {
+
+                updateRecognitionRecord(recordId) {
+
+                    it.status = STATUS_UPLOADING
+
+                    it.statusText = "正在重新上传识别"
+
+                    it.errorMessage = null
+
+                    it.experts.clear()
+
+                }
+
+                val base64Data = Base64.encodeToString(uploadBytes, Base64.NO_WRAP)
+
+                postFaceSearchRequest(recordId, "data:image/jpeg;base64,$base64Data", DEFAULT_CLOUD_MAX_FACE_NUM)
+
+            }
+
+            originalBytes != null -> {
+
+                updateRecognitionRecord(recordId) {
+
+                    it.status = STATUS_LOCAL_PROCESSING
+
+                    it.statusText = "正在重新检测人脸"
+
+                    it.errorMessage = null
+
+                    it.experts.clear()
+
+                }
+
+                processCapturedFrameForMatch(recordId, originalBytes)
+
+            }
+
+            else -> {
+
+                updateRecognitionRecord(recordId) {
+
+                    it.status = STATUS_FAILED
+
+                    it.statusText = "原始照片不存在，无法重试"
+
+                    it.errorMessage = it.statusText
+
+                }
+
+                Toast.makeText(this, "原始照片不存在，无法重试", Toast.LENGTH_SHORT).show()
+
+            }
+
+        }
+
+    }
+
+    private fun renderHistoryList() {
+
+        if (!::binding.isInitialized) return
+
+        val records = synchronized(recognitionRecords) {
+
+            recognitionRecords.sortedByDescending { it.createdAt }
+
+        }
+
+        binding.historyList.removeAllViews()
+
+        binding.tvHistoryEmpty.visibility = if (records.isEmpty()) View.VISIBLE else View.GONE
+
+        records.forEach { record ->
+
+            try {
+
+                binding.historyList.addView(createHistoryRecordView(record))
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("渲染识别记录异常: id=${record.id}, status=${record.status}", e)
+
+            }
+
+        }
+
+    }
+
+    private fun renderHistoryListIfVisible() {
+
+        if (::binding.isInitialized && binding.historyPage.visibility == View.VISIBLE) {
+
+            renderHistoryList()
+
+        }
+
+    }
+
+    private fun createHistoryRecordView(record: RecognitionRecord): View {
+
+        val card = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_page_panel)
+
+        }
+
+        val layoutParams = LinearLayout.LayoutParams(
+
+            LinearLayout.LayoutParams.MATCH_PARENT,
+
+            LinearLayout.LayoutParams.WRAP_CONTENT
+
+        ).apply {
+
+            bottomMargin = dp(12)
+
+        }
+
+        card.layoutParams = layoutParams
+
+        val topRow = LinearLayout(this).apply {
+
+            orientation = LinearLayout.HORIZONTAL
+
+            gravity = android.view.Gravity.CENTER_VERTICAL
+
+        }
+
+        val thumb = ImageView(this).apply {
+
+            setLayoutParams(
+
+                LinearLayout.LayoutParams(dp(68), dp(88)).apply {
+
+                    setMargins(0, 0, dp(12), 0)
+
+                }
+
+            )
+
+            scaleType = ImageView.ScaleType.CENTER_CROP
+
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+            val bitmap = decodeHistoryThumbnail(record.uploadImagePath ?: record.originalImagePath, dp(120))
+
+            if (bitmap != null) setImageBitmap(bitmap)
+
+        }
+
+        val textBox = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        }
+
+        if (record.experts.isNotEmpty()) {
+
+            val expert = record.experts[0] // 拆分后每条卡片有且仅有 1 个专家
+
+            
+
+            // 1. 时间与相似度分值药丸行
+
+            val headerRow = LinearLayout(this).apply {
+
+                orientation = LinearLayout.HORIZONTAL
+
+                gravity = android.view.Gravity.CENTER_VERTICAL
+
+            }
+
+            headerRow.addView(TextView(this).apply {
+
+                text = historyTimeFormat.format(Date(record.createdAt))
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+                textSize = 12f
+
+            })
+
+            headerRow.addView(TextView(this).apply {
+
+                text = String.format(Locale.getDefault(), "  相似度 %.1f%%", expert.score)
+
+                if (expert.score >= 85.0) {
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_error_red))
+                } else {
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_aurora_green))
+                }
+
+                textSize = 12f
+
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+
+            })
+
+            textBox.addView(headerRow)
+
+            
+
+            // 2. 专家姓名大字行
+
+            textBox.addView(TextView(this).apply {
+
+                text = expert.name
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+
+                textSize = 17f
+
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+
+                setPadding(0, dp(2), 0, dp(4))
+
+            })
+
+            
+
+            // 3. 结构化档案详情行
+
+            val detailLines = listOf(
+
+                "身份证：" to (expert.idCard?.takeIf { it.isNotBlank() } ?: "-"),
+
+                "手机号：" to expert.phone,
+
+                "单　位：" to expert.company,
+
+                "专　业：" to expert.major
+
+            )
+
+            detailLines.forEach { (label, value) ->
+
+                val lineLayout = LinearLayout(this).apply {
+
+                    orientation = LinearLayout.HORIZONTAL
+
+                    setPadding(0, dp(1), 0, dp(1))
+
+                }
+
+                lineLayout.addView(TextView(this).apply {
+
+                    text = label
+
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+                    textSize = 12f
+
+                })
+
+                lineLayout.addView(TextView(this).apply {
+
+                    text = value
+
+                    if (label == "手机号：" && value != "-" && value.isNotBlank()) {
+
+                        setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_aurora_green))
+
+                        paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+
+                        setOnClickListener {
+
+                            try {
+
+                                val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+
+                                val clip = android.content.ClipData.newPlainText("phone", value)
+
+                                clipboard.setPrimaryClip(clip)
+
+                                Toast.makeText(this@MainActivity, "已复制手机号：$value", Toast.LENGTH_SHORT).show()
+
+                            } catch (e: Exception) {
+
+                                Toast.makeText(this@MainActivity, "复制失败", Toast.LENGTH_SHORT).show()
+
+                            }
+
+                        }
+
+                    } else {
+
+                        setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+
+                    }
+
+                    textSize = 12f
+
+                })
+
+                textBox.addView(lineLayout)
+
+            }
+
+        } else {
+
+            // 没有专家匹配成功（如失败/未检测人脸）的卡片排版
+
+            textBox.addView(TextView(this).apply {
+
+                text = "${historyTimeFormat.format(Date(record.createdAt))}  ${statusLabel(record.status)}"
+
+                setTextColor(statusColor(record.status))
+
+                textSize = 14f
+
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+
+            })
+
+            textBox.addView(TextView(this).apply {
+
+                text = record.statusText
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+                textSize = 12f
+
+                setPadding(0, dp(2), 0, 0)
+
+            })
+
+            textBox.addView(TextView(this).apply {
+
+                text = historyExpertSummary(record)
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+
+                textSize = 12f
+
+                setPadding(0, dp(2), 0, 0)
+
+            })
+
+        }
+
+        topRow.addView(thumb)
+
+        topRow.addView(textBox)
+
+        card.addView(topRow)
+
+        val actionBox = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(0, dp(10), 0, 0)
+
+        }
+
+        val actionButtons = mutableListOf(
+
+            createHistoryActionButton("原图", R.color.accent_aurora_green) {
+
+                showOriginalImage(record)
+
+            }
+
+        )
+
+        val expertPhotoPath = record.experts.firstOrNull()?.photoPath.orEmpty()
+
+        if (record.status == STATUS_SUCCESS && expertPhotoPath.isNotBlank()) {
+
+            actionButtons.add(
+
+                createHistoryActionButton("专家照", R.color.button_gradient_start) {
+
+                    showExpertOriginalImage(record)
+
+                }
+
+            )
+
+        }
+
+        actionButtons.add(
+
+            createHistoryActionButton("重试", R.color.button_gradient_end) {
+
+                retryRecognitionRecord(record.id)
+
+            }
+
+        )
+
+        actionButtons.add(
+
+            createHistoryActionButton("删除", R.color.accent_warning_orange) {
+
+                deleteRecognitionRecord(record.id)
+
+            }
+
+        )
+
+        addHistoryActionRows(actionBox, actionButtons)
+
+        card.addView(actionBox)
+
+        return card
+
+    }
+
+    private fun createHistoryActionButton(textValue: String, colorRes: Int, onClick: () -> Unit): Button {
+
+        return Button(this).apply {
+
+            text = textValue
+
+            textSize = 12f
+
+            minWidth = 0
+
+            minimumWidth = 0
+
+            setTextColor(Color.WHITE)
+
+            backgroundTintList = android.content.res.ColorStateList.valueOf(
+
+                ContextCompat.getColor(this@MainActivity, colorRes)
+
+            )
+
+            setOnClickListener { onClick() }
+
+        }
+
+    }
+
+    private fun addHistoryActionRows(container: LinearLayout, buttons: List<Button>) {
+
+        buttons.chunked(2).forEachIndexed { rowIndex, rowButtons ->
+
+            val row = LinearLayout(this).apply {
+
+                orientation = LinearLayout.HORIZONTAL
+
+                if (rowIndex > 0) {
+
+                    setPadding(0, dp(6), 0, 0)
+
+                }
+
+            }
+
+            rowButtons.forEachIndexed { index, button ->
+
+                val params = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+
+                    if (index > 0) {
+
+                        marginStart = dp(8)
+
+                    }
+
+                }
+
+                row.addView(button, params)
+
+            }
+
+            if (rowButtons.size == 1) {
+
+                row.addView(View(this), LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+
+                    marginStart = dp(8)
+
+                })
+
+            }
+
+            container.addView(row)
+
+        }
+
+    }
+
+    private fun showOriginalImage(record: RecognitionRecord) {
+
+        val originalPath = record.originalImagePath
+
+        if (originalPath.isNullOrBlank()) {
+
+            Toast.makeText(this, "这条记录没有保存原图", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("查看原图失败: originalPath为空, id=${record.id}")
+
+            return
+
+        }
+
+        val originalFile = File(originalPath)
+
+        if (!originalFile.exists()) {
+
+            Toast.makeText(this, "原图文件不存在", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("查看原图失败: 文件不存在, id=${record.id}, path=$originalPath")
+
+            return
+
+        }
+
+        val bitmap = BitmapFactory.decodeFile(originalPath)
+
+        if (bitmap == null) {
+
+            Toast.makeText(this, "原图无法打开", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("查看原图失败: decode失败, id=${record.id}, path=$originalPath")
+
+            return
+
+        }
+
+        val content = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(dp(12), dp(8), dp(12), 0)
+
+        }
+
+        content.addView(TextView(this).apply {
+
+            text = String.format(
+
+                Locale.getDefault(),
+
+                "眼镜回传原图  %dx%d  %.1f KB",
+
+                bitmap.width,
+
+                bitmap.height,
+
+                originalFile.length() / 1024f
+
+            )
+
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+            textSize = 12f
+
+            setPadding(0, 0, 0, dp(8))
+
+        })
+
+        content.addView(ImageView(this).apply {
+
+            setImageBitmap(bitmap)
+
+            adjustViewBounds = true
+
+            scaleType = ImageView.ScaleType.FIT_CENTER
+
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.bg_dark))
+
+            layoutParams = LinearLayout.LayoutParams(
+
+                LinearLayout.LayoutParams.MATCH_PARENT,
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            )
+
+        })
+
+        val scrollView = ScrollView(this).apply {
+
+            addView(content)
+
+        }
+
+        val dialog = AlertDialog.Builder(this)
+
+            .setTitle("查看原图")
+
+            .setView(scrollView)
+
+            .setPositiveButton("关闭", null)
+
+            .create()
+
+        dialog.setOnShowListener {
+
+            dialog.window?.setLayout(
+
+                (resources.displayMetrics.widthPixels * 0.94f).toInt(),
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            )
+
+        }
+
+        dialog.show()
+
+        recordDiagnostic("查看原图: id=${record.id}, size=${bitmap.width}x${bitmap.height}, bytes=${originalFile.length()}")
+
+    }
+
+    private fun showExpertOriginalImage(record: RecognitionRecord) {
+
+        val expert = record.experts.firstOrNull()
+
+        if (expert == null || expert.photoPath.isBlank()) {
+
+            Toast.makeText(this, "这条记录没有专家照片", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("查看专家原图失败: photoPath为空, id=${record.id}")
+
+            return
+
+        }
+
+        val url = expertPhotoUrl(expert.photoPath)
+
+        Toast.makeText(this, "正在加载专家照片...", Toast.LENGTH_SHORT).show()
+
+        recordDiagnostic("开始查看专家原图: id=${record.id}, name=${expert.name}, url=$url")
+
+        val request = Request.Builder().url(url).build()
+
+        okHttpClient.newCall(request).enqueue(object : Callback {
+
+            override fun onFailure(call: Call, e: IOException) {
+
+                recordDiagnostic("查看专家原图网络失败: id=${record.id}, url=$url", e)
+
+                runOnUiThread {
+
+                    Toast.makeText(this@MainActivity, "专家照片加载失败", Toast.LENGTH_SHORT).show()
+
+                }
+
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+
+                response.use {
+
+                    if (!it.isSuccessful) {
+
+                        recordDiagnostic("查看专家原图 HTTP 失败: id=${record.id}, code=${it.code}, url=$url")
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "专家照片加载失败: HTTP ${it.code}", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    val bytes = it.body?.bytes()
+
+                    if (bytes == null || bytes.isEmpty()) {
+
+                        recordDiagnostic("查看专家原图失败: 空响应, id=${record.id}, url=$url")
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "专家照片为空", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+                    if (bitmap == null) {
+
+                        recordDiagnostic("查看专家原图失败: decode失败, id=${record.id}, bytes=${bytes.size}, url=$url")
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "专家照片无法打开", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    runOnUiThread {
+
+                        showBitmapDialog(
+
+                            title = "专家原图",
+
+                            summary = "${expert.name}  ${bitmap.width}x${bitmap.height}  %.1f KB".format(Locale.getDefault(), bytes.size / 1024f),
+
+                            bitmap = bitmap
+
+                        )
+
+                    }
+
+                    recordDiagnostic(
+
+                        "查看专家原图: id=${record.id}, name=${expert.name}, " +
+
+                            "size=${bitmap.width}x${bitmap.height}, bytes=${bytes.size}"
+
+                    )
+
+                }
+
+            }
+
+        })
+
+    }
+
+    private fun showBitmapDialog(title: String, summary: String, bitmap: Bitmap) {
+
+        val content = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(dp(12), dp(8), dp(12), 0)
+
+        }
+
+        content.addView(TextView(this).apply {
+
+            text = summary
+
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+            textSize = 12f
+
+            setPadding(0, 0, 0, dp(8))
+
+        })
+
+        content.addView(ImageView(this).apply {
+
+            setImageBitmap(bitmap)
+
+            adjustViewBounds = true
+
+            scaleType = ImageView.ScaleType.FIT_CENTER
+
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.bg_dark))
+
+            layoutParams = LinearLayout.LayoutParams(
+
+                LinearLayout.LayoutParams.MATCH_PARENT,
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            )
+
+        })
+
+        val scrollView = ScrollView(this).apply {
+
+            addView(content)
+
+        }
+
+        val dialog = AlertDialog.Builder(this)
+
+            .setTitle(title)
+
+            .setView(scrollView)
+
+            .setPositiveButton("关闭", null)
+
+            .create()
+
+        dialog.setOnShowListener {
+
+            dialog.window?.setLayout(
+
+                (resources.displayMetrics.widthPixels * 0.94f).toInt(),
+
+                LinearLayout.LayoutParams.WRAP_CONTENT
+
+            )
+
+        }
+
+        dialog.show()
+
+    }
+
+    private fun historyExpertSummary(record: RecognitionRecord): String {
+
+        return when {
+
+            record.experts.isNotEmpty() -> "识别到 ${record.experts.size} 位：${record.experts.joinToString("，") { it.name }}"
+
+            !record.errorMessage.isNullOrEmpty() -> humanReadableCloudError(record.errorMessage ?: "")
+
+            else -> "照片：${record.uploadWidth.takeIf { it > 0 } ?: record.originalWidth}x${record.uploadHeight.takeIf { it > 0 } ?: record.originalHeight}"
+
+        }
+
+    }
+
+    private fun cloudErrorMessage(responseCode: Int, bodyString: String): String {
+
+        val decoded = humanReadableCloudError(bodyString)
+
+        return if (responseCode > 0 && decoded.isNotBlank()) {
+
+            "HTTP $responseCode: $decoded"
+
+        } else if (responseCode > 0) {
+
+            "HTTP $responseCode: 云端未返回匹配结果"
+
+        } else {
+
+            decoded.ifBlank { "云端未返回匹配结果" }
+
+        }
+
+    }
+
+    private fun humanReadableCloudError(rawMessage: String): String {
+
+        val trimmed = rawMessage.trim()
+
+        if (trimmed.isEmpty()) {
+
+            return ""
+
+        }
+
+        val httpMatch = Regex("^HTTP\\s+(\\d+):\\s*(.*)$").find(trimmed)
+
+        if (httpMatch != null) {
+
+            val code = httpMatch.groupValues[1]
+
+            val body = httpMatch.groupValues[2]
+
+            val decodedBody = decodeCloudErrorBody(body)
+
+            return "HTTP $code: ${decodedBody ?: body}"
+
+        }
+
+        return decodeCloudErrorBody(trimmed) ?: trimmed
+
+    }
+
+    private fun decodeCloudErrorBody(bodyString: String): String? {
+
+        val trimmed = bodyString.trim()
+
+        if (!trimmed.startsWith("{")) {
+
+            return null
+
+        }
+
+        return try {
+
+            val bodyObj = Gson().fromJson(trimmed, JsonObject::class.java)
+
+            val messageKeys = arrayOf("error", "message", "msg", "detail")
+
+            messageKeys.firstNotNullOfOrNull { key ->
+
+                val value = bodyObj.get(key)
+
+                if (value != null && !value.isJsonNull) {
+
+                    value.asString.takeIf { it.isNotBlank() }
+
+                } else {
+
+                    null
+
+                }
+
+            }
+
+        } catch (e: Exception) {
+
+            null
+
+        }
+
+    }
+
+    private fun statusLabel(status: String): String {
+
+        return when (status) {
+
+            STATUS_CAPTURING -> "正在拍照"
+
+            STATUS_LOCAL_PROCESSING -> "本地检测中"
+
+            STATUS_UPLOADING -> "正在识别"
+
+            STATUS_SUCCESS -> "识别成功"
+
+            STATUS_NO_FACE -> "未检测到人脸"
+
+            STATUS_NO_MATCH -> "未匹配"
+
+            STATUS_FAILED -> "失败"
+
+            STATUS_INTERRUPTED -> "可重试"
+
+            else -> status
+
+        }
+
+    }
+
+    private fun statusColor(status: String): Int {
+
+        val colorRes = when (status) {
+
+            STATUS_SUCCESS -> R.color.accent_aurora_green
+
+            STATUS_CAPTURING, STATUS_LOCAL_PROCESSING, STATUS_UPLOADING -> R.color.accent_warning_orange
+
+            else -> R.color.text_secondary
+
+        }
+
+        return ContextCompat.getColor(this, colorRes)
+
+    }
+
+    private fun dp(value: Int): Int {
+
+        return (value * resources.displayMetrics.density).toInt()
+
+    }
+
+    /**
+
+     * 3. 记录并处理 Android 系统转发到手机端 App 的按键事件。
+
+     */
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+
+        if (event.action == KeyEvent.ACTION_DOWN) {
+
+            val keyCode = event.keyCode
+
+            val keyName = KeyEvent.keyCodeToString(keyCode)
+
+            val deviceName = event.device?.name ?: "unknown"
+
+            recordDiagnostic(
+
+                "收到系统按键事件: keyCode=$keyCode, keyName=$keyName, " +
+
+                    "scanCode=${event.scanCode}, repeat=${event.repeatCount}, " +
+
+                    "source=${event.source}, device=$deviceName"
+
+            )
+
+            
+
+            // 镜腿向前滑动 / 音量加键 -> 轮播到下个专家卡片
+
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+
+                showNextExpert()
+
+                return true
+
+            } 
+
+            // 镜腿向后滑动 / 音量减键 -> 轮播到上个专家卡片
+
+            else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+
+                showPrevExpert()
+
+                return true
+
+            }
+
+            else if (keyCode == KeyEvent.KEYCODE_CAMERA ||
+
+                keyCode == KeyEvent.KEYCODE_ENTER ||
+
+                keyCode == KeyEvent.KEYCODE_DPAD_CENTER) {
+
+                triggerCaptureFromExternalEvent("系统按键 $keyName")
+
+                return true
+
+            }
+
+        }
+
+        return super.dispatchKeyEvent(event)
+
+    }
+
+    /**
+
+     * 4. 无线流连接：通过 CXR-L 协议建立协同链路
+
+     */
+
+    private fun requestCxrAuthorizationAndConnect() {
+
+        try {
+
+            recordDiagnostic("开始 Rokid 授权检查: runtime=${runtimePermissionStatus()}")
+
+            val authHelper = AuthorizationHelper
+
+            val hasRequiredRokidApp = authHelper.isRequiredRokidAppInstalled(this) ||
+
+                authHelper.isRequiredHiRokidInstalled(this)
+
+            recordDiagnostic(
+
+                "Rokid 官方 App 状态: required=${authHelper.isRequiredRokidAppInstalled(this)}, " +
+
+                    "hi=${authHelper.isRequiredHiRokidInstalled(this)}, connectHi=${authHelper.isConnectHiRokid()}"
+
+            )
+
+            if (!hasRequiredRokidApp) {
+
+                updateStatus("请先安装/升级 Rokid AI 或 Hi Rokid App，并完成眼镜无线连接", isWorking = false)
+
+                return
+
+            }
+
+            val authResult = authHelper.requestAuthorization(
+
+                this,
+
+                REQUIRED_GLASS_PERMISSIONS,
+
+                REQUEST_CODE_CXR_AUTH
+
+            )
+
+            recordDiagnostic(
+
+                "requestAuthorization 返回: direct=${authResult != null}, " +
+
+                    "code=${authResult?.first}, hasIntent=${authResult?.second != null}, glassPerm=${glassPermissionStatus()}"
+
+            )
+
+            if (authResult?.first == Activity.RESULT_OK && authResult.second != null) {
+
+                handleCxrAuthorizationResult(authResult.first, authResult.second)
+
+            } else {
+
+                updateStatus("等待 Rokid 官方 App 授权眼镜相机/媒体权限...", isWorking = false)
+
+            }
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "CXR-L authorization request failed", e)
+
+            recordDiagnostic("CXR-L 授权初始化异常", e)
+
+            updateStatus("CXR-L 授权初始化失败: ${e.message}", isWorking = false)
+
+        }
+
+    }
+
+    private fun handleCxrAuthorizationResult(resultCode: Int, data: Intent?) {
+
+        recordDiagnostic("处理 Rokid 授权结果: resultCode=$resultCode, hasData=${data != null}")
+
+        when (val result = AuthorizationHelper.parseAuthorizationResult(resultCode, data)) {
+
+            is AuthResult.AuthSuccess -> {
+
+                cxrAuthToken = result.token
+
+                recordDiagnostic("Rokid 授权成功: tokenLength=${result.token.length}, glassPerm=${glassPermissionStatus()}")
+
+                initCxrLink(result.token)
+
+            }
+
+            is AuthResult.AuthCancel -> {
+
+                recordDiagnostic("Rokid 授权取消")
+
+                updateStatus("已取消 Rokid 眼镜授权，无法启动无线拍照", isWorking = false)
+
+            }
+
+            is AuthResult.AuthFail -> {
+
+                recordDiagnostic("Rokid 授权失败: glassPerm=${glassPermissionStatus()}")
+
+                updateStatus("Rokid 眼镜授权失败，请在官方 App 中确认权限", isWorking = false)
+
+            }
+
+            else -> {
+
+                recordDiagnostic("Rokid 授权返回未知状态: ${result?.javaClass?.name}")
+
+                updateStatus("Rokid 眼镜授权返回未知状态，请重试", isWorking = false)
+
+            }
+
+        }
+
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == REQUEST_CODE_CXR_AUTH) {
+
+            handleCxrAuthorizationResult(resultCode, data)
+
+        } else if (requestCode == REQUEST_CODE_PICK_VIDEO) {
+
+            if (resultCode == Activity.RESULT_OK) {
+
+                handlePickedVideo(data)
+
+            } else {
+
+                recordDiagnostic("系统视频选择器取消: resultCode=$resultCode")
+
+            }
+
+        } else if (requestCode == REQUEST_CODE_PICK_IMAGE) {
+
+            if (resultCode == Activity.RESULT_OK) {
+
+                handlePickedImage(data)
+
+            } else {
+
+                recordDiagnostic("系统图片选择器取消: resultCode=$resultCode")
+
+            }
+
+        }
+
+    }
+
+    private fun initCxrLink(authToken: String = cxrAuthToken ?: "") {
+
+        if (authToken.isEmpty()) {
+
+            updateStatus("缺少 Rokid 授权 token，无法连接眼镜", isWorking = false)
+
+            return
+
+        }
+
+        try {
+
+            updateStatus("正在通过官方 CXR-L 无线链路连接眼镜...", isWorking = false)
+
+            recordDiagnostic("初始化 CXR-L: tokenPresent=${authToken.isNotEmpty()}, tokenLength=${authToken.length}")
+
+            cxrLink?.disconnect()
+
+            cxrLink = null
+
+            isCxrServiceConnected = false
+
+            isGlassWirelessConnected = false
+
+            
+
+            val link = CXRLink(applicationContext)
+
+            cxrLink = link
+
+            val sessionConfigured = link.configCXRSession(
+
+                CxrDefs.CXRSession(CxrDefs.CXRSessionType.CUSTOMVIEW)
+
+            )
+
+            Log.i(TAG, "CXR-L session configured: $sessionConfigured")
+
+            recordDiagnostic("CXR-L 会话配置: type=CUSTOMVIEW, result=$sessionConfigured")
+
+            if (!sessionConfigured) {
+
+                cxrLink = null
+
+                updateStatus("CXR-L 会话配置失败，请重新授权连接", isWorking = false)
+
+                return
+
+            }
+
+            link.apply {
+
+                recordDiagnostic("当前 CUSTOMVIEW 会话未启用眼镜端物理按键转发；物理键需 CUSTOMAPP + 眼镜端 App")
+
+                setCXRLinkCbk(object : ICXRLinkCbk {
+
+                    override fun onCXRLConnected(connected: Boolean) {
+
+                        isCxrServiceConnected = connected
+
+                        isGlassWirelessConnected = if (connected) {
+
+                            try {
+
+                                link.isGlassBtConnected()
+
+                            } catch (e: Exception) {
+
+                                recordDiagnostic("读取眼镜蓝牙连接状态异常", e)
+
+                                false
+
+                            }
+
+                        } else {
+
+                            false
+
+                        }
+
+                        recordDiagnostic(
+
+                            "CXR-L 服务回调: serviceConnected=$connected, " +
+
+                                "glassBtConnected=$isGlassWirelessConnected, glassPerm=${glassPermissionStatus()}"
+
+                        )
+
+                        runOnUiThread {
+
+                            if (connected) {
+
+                                if (isGlassWirelessConnected) {
+
+                                    updateStatus("CXR-L 无线链路已就绪，可触发眼镜拍照", isWorking = false)
+
+                                    Toast.makeText(this@MainActivity, "眼镜无线链路已就绪", Toast.LENGTH_SHORT).show()
+
+                                } else {
+
+                                    updateStatus("已连接 Rokid 服务，请在官方 App 中确认眼镜已无线连接", isWorking = false)
+
+                                }
+
+                            } else {
+
+                                updateStatus("眼镜无线链路已断开，请检查 Rokid 官方 App 连接状态", isWorking = false)
+
+                                hideArOverlay()
+
+                            }
+
+                        }
+
+                    }
+
+                    override fun onGlassBtConnected(connected: Boolean) {
+
+                        isGlassWirelessConnected = connected
+
+                        recordDiagnostic("眼镜无线连接回调: connected=$connected")
+
+                        runOnUiThread {
+
+                            if (connected) {
+
+                                updateStatus("眼镜无线连接已建立，可触发拍照核验", isWorking = false)
+
+                            } else {
+
+                                updateStatus("眼镜无线连接已断开，请在 Rokid 官方 App 中重新连接", isWorking = false)
+
+                            }
+
+                        }
+
+                    }
+
+                    override fun onGlassDeviceInfo(info: GlassInfo) {
+
+                        Log.i(TAG, "Glass device info: $info")
+
+                        recordDiagnostic("眼镜设备信息回调: $info")
+
+                    }
+
+                    override fun onGlassWearingStatus(wearing: Boolean) {
+
+                        recordDiagnostic("眼镜佩戴状态回调: wearing=$wearing")
+
+                    }
+
+                    override fun onGlassAiAssistStart() {
+
+                        recordDiagnostic("收到 CXR-L AI 对话开始事件: onGlassAiAssistStart，仅记录不触发抓拍")
+
+                    }
+
+                    override fun onGlassAiAssistStop() {
+
+                        recordDiagnostic("收到 CXR-L AI 对话结束事件: onGlassAiAssistStop")
+
+                    }
+
+                    override fun onGlassAiInterrupt(interrupt: Boolean) {
+
+                        recordDiagnostic("眼镜 AI 打断状态: interrupt=$interrupt")
+
+                    }
+
+                })
+
+                
+
+                // 监听眼镜端的图像流
+
+                setCXRImageCbk(object : IImageStreamCbk {
+
+                    override fun onImageReceived(data: ByteArray?) {
+
+                        recordDiagnostic(
+
+                            "眼镜图片回调: bytes=${data?.size ?: 0}, pendingCapture=$pendingGlassCapture, " +
+
+                                "matching=$isMatchingRequestRunning"
+
+                        )
+
+                        data?.let {
+
+                            val frameBytes = it.copyOf()
+
+                            latestFrameBytes = frameBytes
+
+                            val lateTaskId = timedOutCaptureTaskId
+
+                            val acceptsLateCapture = !pendingGlassCapture &&
+
+                                lateTaskId != null &&
+
+                                System.currentTimeMillis() <= timedOutCaptureAcceptUntil
+
+                            if (pendingGlassCapture || acceptsLateCapture) {
+
+                                val captureTaskId = if (pendingGlassCapture) activeCaptureTaskId else lateTaskId
+
+                                val isLateCapture = acceptsLateCapture && !pendingGlassCapture
+
+                                val callbackCostMs = if (activeCaptureRequestStartedAt > 0L) {
+
+                                    System.currentTimeMillis() - activeCaptureRequestStartedAt
+
+                                } else {
+
+                                    -1L
+
+                                }
+
+                                val requestBrief = "${activeCaptureRequestWidth}x$activeCaptureRequestHeight q=$activeCaptureRequestQuality"
+
+                                pendingGlassCapture = false
+
+                                activeCaptureTaskId = null
+
+                                if (isLateCapture) {
+
+                                    timedOutCaptureTaskId = null
+
+                                    timedOutCaptureAcceptUntil = 0L
+
+                                }
+
+                                isMatchingRequestRunning = false
+
+                                mainHandler.removeCallbacks(glassCaptureTimeoutRunnable)
+
+                                updateRecognitionRecord(captureTaskId) {
+
+                                    it.status = STATUS_LOCAL_PROCESSING
+
+                                    it.statusText = if (isLateCapture) {
+
+                                        "超时后收到眼镜照片，正在本地检测人脸"
+
+                                    } else {
+
+                                        "已收到眼镜照片，正在本地检测人脸"
+
+                                    }
+
+                                    it.errorMessage = null
+
+                                }
+
+                                recordDiagnostic(
+
+                                    "处理${if (isLateCapture) "迟到" else "正常"}抓拍图片: " +
+
+                                        "recordId=$captureTaskId, request=$requestBrief, callbackCostMs=$callbackCostMs, bytes=${frameBytes.size}"
+
+                                )
+
+                                processCapturedFrameForMatch(captureTaskId, frameBytes)
+
+                            } else {
+
+                                // 非抓拍帧只用于预览，避免抓拍主路径重复解码同一张图。
+
+                                val bitmap = BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.size)
+
+                                runOnUiThread {
+
+                                    if (bitmap != null) {
+
+                                        binding.ivPreview.setImageBitmap(bitmap)
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    override fun onImageError(code: Int, msg: String?) {
+
+                        if (pendingGlassCapture) {
+
+                            val errorTaskId = activeCaptureTaskId
+
+                            pendingGlassCapture = false
+
+                            activeCaptureTaskId = null
+
+                            isMatchingRequestRunning = false
+
+                            mainHandler.removeCallbacks(glassCaptureTimeoutRunnable)
+
+                            updateRecognitionRecord(errorTaskId) {
+
+                                it.status = STATUS_FAILED
+
+                                it.statusText = "眼镜图像流异常"
+
+                                it.errorMessage = msg ?: "code=$code"
+
+                            }
+
+                        }
+
+                        Log.e(TAG, "CXR Image Stream Error: $msg")
+
+                        recordDiagnostic("眼镜图像流异常: code=$code, msg=${msg ?: "-"}")
+
+                        runOnUiThread {
+
+                            updateStatus("眼镜图像流异常: ${msg ?: code}", isWorking = false)
+
+                        }
+
+                    }
+
+                })
+
+                
+
+                // 发起连接
+
+                val bindStarted = connect(authToken)
+
+                recordDiagnostic("CXR-L bindService 发起: result=$bindStarted")
+
+                if (!bindStarted) {
+
+                    updateStatus("CXR-L 媒体流服务连接失败，请确认官方 App 已启动", isWorking = false)
+
+                }
+
+            }
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "CXR-L Link init failed", e)
+
+            recordDiagnostic("CXR-L 初始化异常", e)
+
+            updateStatus("CXR-L 初始化失败: ${e.message}", isWorking = false)
+
+        }
+
+    }
+
+    /**
+
+     * 5. 抓拍方案：通过 CXR-L 无线命令触发眼镜拍照，拿到回调帧后再本地初筛与上传
+
+     */
+
+    private fun takePhotoAndMatch() {
+
+        recordDiagnostic(
+
+            "准备抓拍: service=$isCxrServiceConnected, glass=$isGlassWirelessConnected, " +
+
+                "matching=$isMatchingRequestRunning, pending=$pendingGlassCapture, token=${cxrAuthToken != null}"
+
+        )
+
+        if (pendingGlassCapture || isMatchingRequestRunning) {
+
+            Toast.makeText(this, "正在等待上一张照片回传，请稍候", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("抓拍被忽略: 上一次眼镜拍照尚未回传")
+
+            return
+
+        }
+
+        playCaptureBeep()
+
+        val link = cxrLink
+
+        if (link == null || !isCxrServiceConnected) {
+
+            Toast.makeText(this, "CXR-L 服务尚未连接，请先完成 Rokid 授权", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("抓拍前检查失败: linkNull=${link == null}, serviceConnected=$isCxrServiceConnected")
+
+            playResultBeep(success = false)
+
+            requestCxrAuthorizationAndConnect()
+
+            return
+
+        }
+
+        val permissionCheckStartedAt = System.currentTimeMillis()
+
+        val hasCameraGlassPermission = try {
+
+            AuthorizationHelper.hasGlassPermission(GlassPermission.CAMERA)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("读取 Rokid CAMERA 权限异常", e)
+
+            false
+
+        }
+
+        recordDiagnostic("抓拍前权限检查完成: camera=$hasCameraGlassPermission, costMs=${System.currentTimeMillis() - permissionCheckStartedAt}")
+
+        if (!hasCameraGlassPermission) {
+
+            recordDiagnostic("抓拍前检查失败: Rokid CAMERA 权限无效, glassPerm=${glassPermissionStatus()}")
+
+            updateStatus("Rokid 眼镜相机授权已失效，请重新授权后再拍照", isWorking = false)
+
+            playResultBeep(success = false)
+
+            requestCxrAuthorizationAndConnect()
+
+            return
+
+        }
+
+        val connectionCheckStartedAt = System.currentTimeMillis()
+
+        val usedCachedGlassConnection = isGlassWirelessConnected
+
+        val glassConnected = if (usedCachedGlassConnection) {
+
+            true
+
+        } else {
+
+            try {
+
+                link.isGlassBtConnected()
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("抓拍前读取眼镜连接状态异常", e)
+
+                false
+
+            }
+
+        }
+
+        isGlassWirelessConnected = glassConnected
+
+        recordDiagnostic("抓拍前连接检查完成: glass=$glassConnected, costMs=${System.currentTimeMillis() - connectionCheckStartedAt}, usedCached=$usedCachedGlassConnection")
+
+        if (!glassConnected) {
+
+            val record = createRecognitionRecord()
+
+            updateRecognitionRecord(record.id) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "眼镜未无线连接"
+
+                it.errorMessage = "请先在 Rokid 官方 App 中连接眼镜"
+
+            }
+
+            recordDiagnostic("抓拍前检查失败: isGlassBtConnected=false")
+
+            updateStatus("眼镜未无线连接，请先在 Rokid 官方 App 中连接眼镜", isWorking = false)
+
+            playResultBeep(success = false)
+
+            return
+
+        }
+
+        val record = createRecognitionRecord()
+
+        val requestWidth = glassCaptureWidth
+
+        val requestHeight = glassCaptureHeight
+
+        val requestQuality = glassCaptureQuality
+
+        recordDiagnostic("抓拍记录创建完成: id=${record.id}")
+
+        isMatchingRequestRunning = true
+
+        pendingGlassCapture = true
+
+        activeCaptureTaskId = record.id
+
+        timedOutCaptureTaskId = null
+
+        timedOutCaptureAcceptUntil = 0L
+
+        activeCaptureRequestStartedAt = System.currentTimeMillis()
+
+        activeCaptureRequestWidth = requestWidth
+
+        activeCaptureRequestHeight = requestHeight
+
+        activeCaptureRequestQuality = requestQuality
+
+        activeCaptureTimeoutMs = captureTimeoutMsFor(requestWidth, requestHeight)
+
+        capturedFrameBytes = null
+
+        lastLocalFaceCrop = null
+
+        updateStatus("正在通过无线链路触发眼镜拍照...", isWorking = true)
+
+        recordDiagnostic(
+
+            "调用 CXR takePhoto: width=$requestWidth, height=$requestHeight, " +
+
+                "quality=$requestQuality"
+
+        )
+
+        val requested = try {
+
+            link.takePhoto(requestWidth, requestHeight, requestQuality)
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "CXR takePhoto failed", e)
+
+            recordDiagnostic("CXR takePhoto 抛出异常", e)
+
+            false
+
+        }
+
+        recordDiagnostic("CXR takePhoto 返回: requested=$requested")
+
+        if (!requested) {
+
+            pendingGlassCapture = false
+
+            activeCaptureTaskId = null
+
+            isMatchingRequestRunning = false
+
+            updateRecognitionRecord(record.id) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "眼镜拍照请求失败"
+
+                it.errorMessage = "CXR-L takePhoto 返回 false"
+
+            }
+
+            Log.w(
+
+                TAG,
+
+                "CXR takePhoto returned false. serviceConnected=$isCxrServiceConnected, " +
+
+                    "glassConnected=$isGlassWirelessConnected, hasCameraPermission=$hasCameraGlassPermission"
+
+            )
+
+            recordDiagnostic(
+
+                "抓拍请求失败详情: service=$isCxrServiceConnected, glass=$isGlassWirelessConnected, " +
+
+                    "cameraPerm=$hasCameraGlassPermission, glassPerm=${glassPermissionStatus()}"
+
+            )
+
+            updateStatus("眼镜拍照请求失败，请检查 CXR-L 权限和无线连接", isWorking = false)
+
+            playResultBeep(success = false)
+
+            return
+
+        }
+
+        mainHandler.removeCallbacks(glassCaptureTimeoutRunnable)
+
+        mainHandler.postDelayed(glassCaptureTimeoutRunnable, activeCaptureTimeoutMs)
+
+        recordDiagnostic("抓拍请求已发送，等待图片回调，timeoutMs=$activeCaptureTimeoutMs")
+
+    }
+
+    private fun captureTimeoutMsFor(width: Int, height: Int): Long {
+
+        val megapixels = width.toLong() * height.toLong()
+
+        return when {
+
+            megapixels >= 10_000_000L -> 30000L
+
+            megapixels >= 5_000_000L -> 22000L
+
+            else -> GLASS_CAPTURE_TIMEOUT_MS
+
+        }
+
+    }
+
+    private fun processCapturedFrameForMatch(
+        recordId: String?,
+        bytes: ByteArray,
+        sourceLabel: String = "抓拍帧",
+        processInline: Boolean = false
+    ) {
+        capturedFrameBytes = bytes // 锁存抓拍的一帧数据，防止网络延迟后流画面更新导致裁剪错位
+        recordDiagnostic("开始处理$sourceLabel: bytes=${bytes.size}")
+        if (recordId != null) {
+            updateRecognitionRecord(recordId) {
+                it.status = STATUS_LOCAL_PROCESSING
+                it.statusText = "正在本地检测人脸"
+            }
+        }
+
+        runOnUiThread {
+
+            val statusText = if (sourceLabel.contains("图库")) {
+
+                "已读取图库照片，正在本地检测人脸..."
+
+            } else {
+
+                "已收到眼镜照片，正在本地检测人脸..."
+
+            }
+
+            updateStatus(statusText, isWorking = true)
+
+        }
+
+        val processFrame = processFrame@{
+
+            try {
+
+                var decoded = decodeBitmapForProcessing(bytes, sourceLabel, processingMaxSideFor(sourceLabel))
+
+                if (decoded == null) {
+
+                    updateRecognitionRecord(recordId) {
+
+                        it.status = STATUS_FAILED
+
+                        it.statusText = "图片解析失败"
+
+                        it.errorMessage = "图片字节无法解码"
+
+                    }
+
+                    recordDiagnostic("$sourceLabel 解析失败: bytes=${bytes.size}")
+
+                    if (!sourceLabel.contains("图库")) {
+
+                        runOnUiThread {
+
+                            playResultBeep(success = false)
+
+                            updateStatus("❌ 图片解析失败", isWorking = false)
+
+                        }
+
+                    }
+
+                    return@processFrame
+
+                }
+
+                var bitmap = decoded.bitmap
+
+                recordDiagnostic(
+
+                    "$sourceLabel 解析成功: bitmap=${bitmap.width}x${bitmap.height}, " +
+
+                        "bytes=${bytes.size}, sample=${decoded.sampleSize}, exif=${decoded.exifOrientation}, " +
+
+                        "requested=${activeCaptureRequestWidth}x$activeCaptureRequestHeight q=$activeCaptureRequestQuality"
+
+                )
+
+                val inputImage = InputImage.fromBitmap(bitmap, 0)
+
+                var faces = Tasks.await(faceDetector.process(inputImage))
+
+                if (faces.isEmpty() && sourceLabel.contains("图库") && decoded.sampleSize > 1) {
+
+                    recordDiagnostic(
+
+                        "图库低分辨率未检测到人脸，尝试高分辨率重检: sample=${decoded.sampleSize}, " +
+
+                            "bitmap=${bitmap.width}x${bitmap.height}"
+
+                    )
+
+                    val highResDecoded = decodeBitmapForProcessing(
+
+                        bytes,
+
+                        sourceLabel,
+
+                        GALLERY_RETRY_PROCESS_MAX_IMAGE_SIDE
+
+                    )
+
+                    if (highResDecoded != null && highResDecoded.sampleSize < decoded.sampleSize) {
+
+                        bitmap.recycle()
+
+                        decoded = highResDecoded
+
+                        bitmap = decoded.bitmap
+
+                        faces = Tasks.await(faceDetector.process(InputImage.fromBitmap(bitmap, 0)))
+
+                        recordDiagnostic(
+
+                            "图库高分辨率重检完成: faces=${faces.size}, bitmap=${bitmap.width}x${bitmap.height}, " +
+
+                                "sample=${decoded.sampleSize}, exif=${decoded.exifOrientation}"
+
+                        )
+
+                    } else {
+
+                        highResDecoded?.bitmap?.recycle()
+
+                    }
+
+                }
+
+                if (faces.isEmpty()) {
+
+                    val retryMaxSide = if (sourceLabel.contains("图库")) {
+
+                        GALLERY_RETRY_PROCESS_MAX_IMAGE_SIDE
+
+                    } else {
+
+                        IMAGE_SENSITIVE_RETRY_PROCESS_MAX_SIDE
+
+                    }
+
+                    var sensitiveDecoded: DecodedBitmap? = null
+
+                    if (decoded.sampleSize > 1 && maxOf(bitmap.width, bitmap.height) < retryMaxSide) {
+
+                        sensitiveDecoded = decodeBitmapForProcessing(
+
+                            bytes,
+
+                            "$sourceLabel 敏感补检",
+
+                            retryMaxSide
+
+                        )
+
+                    }
+
+                    val fallbackBitmap = sensitiveDecoded?.bitmap ?: bitmap
+
+                    val sensitiveFaces = Tasks.await(
+
+                        sensitiveFaceDetector.process(InputImage.fromBitmap(fallbackBitmap, 0))
+
+                    )
+
+                    if (sensitiveFaces.isNotEmpty()) {
+
+                        if (sensitiveDecoded != null) {
+
+                            bitmap.recycle()
+
+                            decoded = sensitiveDecoded
+
+                            bitmap = decoded.bitmap
+
+                        }
+
+                        faces = sensitiveFaces
+
+                        recordDiagnostic(
+
+                            "$sourceLabel 敏感补检命中: faces=${faces.size}, bitmap=${bitmap.width}x${bitmap.height}, " +
+
+                                "sample=${decoded.sampleSize}, maxSide=$retryMaxSide"
+
+                        )
+
+                    } else {
+
+                        recordDiagnostic(
+
+                            "$sourceLabel 敏感补检未命中: bitmap=${fallbackBitmap.width}x${fallbackBitmap.height}, " +
+
+                                "sample=${sensitiveDecoded?.sampleSize ?: decoded.sampleSize}"
+
+                        )
+
+                        sensitiveDecoded?.bitmap?.recycle()
+
+                    }
+
+                }
+
+                if (sourceLabel.contains("图库") && shouldRunGallerySupplementalFaceDetection(decoded, bitmap, faces)) {
+
+                    recordDiagnostic(
+
+                        "图库疑似小脸或多人漏检，启动高分辨率补检: faces=${faces.size}, " +
+
+                            "bitmap=${bitmap.width}x${bitmap.height}, sample=${decoded.sampleSize}"
+
+                    )
+
+                    val supplementalDecoded = decodeBitmapForProcessing(
+
+                        bytes,
+
+                        "$sourceLabel 小脸补检",
+
+                        GALLERY_RETRY_PROCESS_MAX_IMAGE_SIDE
+
+                    )
+
+                    if (supplementalDecoded != null && supplementalDecoded.sampleSize < decoded.sampleSize) {
+
+                        val supplementalFaces = Tasks.await(
+
+                            sensitiveFaceDetector.process(InputImage.fromBitmap(supplementalDecoded.bitmap, 0))
+
+                        )
+
+                        if (supplementalFaces.size > faces.size) {
+
+                            bitmap.recycle()
+
+                            decoded = supplementalDecoded
+
+                            bitmap = decoded.bitmap
+
+                            faces = supplementalFaces
+
+                            recordDiagnostic(
+
+                                "图库高分辨率补检采用: faces=${faces.size}, bitmap=${bitmap.width}x${bitmap.height}, " +
+
+                                    "sample=${decoded.sampleSize}"
+
+                            )
+
+                        } else {
+
+                            supplementalDecoded.bitmap.recycle()
+
+                            recordDiagnostic(
+
+                                "图库高分辨率补检未增加人脸: originalFaces=${faces.size}, supplementalFaces=${supplementalFaces.size}"
+
+                            )
+
+                        }
+
+                    } else {
+
+                        supplementalDecoded?.bitmap?.recycle()
+
+                        recordDiagnostic("图库高分辨率补检跳过: 无更高分辨率可用")
+
+                    }
+
+                }
+
+                updateRecognitionRecord(recordId) {
+
+                    it.originalWidth = decoded.originalWidth
+
+                    it.originalHeight = decoded.originalHeight
+
+                }
+
+                runOnUiThread {
+
+                    binding.ivPreview.setImageBitmap(bitmap)
+
+                }
+
+                recordDiagnostic("本地人脸检测完成: faces=${faces.size}")
+                handleLocalFaceDetectionResult(recordId, bitmap, faces, sourceLabel, bytes, decoded)
+
+            } catch (e: Exception) {
+
+                Log.e(TAG, "Capture frame error", e)
+
+                updateRecognitionRecord(recordId) {
+
+                    it.status = STATUS_FAILED
+
+                    it.statusText = "图片处理或本地人脸检测异常"
+
+                    it.errorMessage = e.message
+
+                }
+
+                recordDiagnostic("$sourceLabel 处理异常", e)
+
+                if (!sourceLabel.contains("图库")) {
+
+                    runOnUiThread {
+
+                        playResultBeep(success = false)
+
+                        updateStatus("❌ 图片处理异常: ${e.message}", isWorking = false)
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        if (processInline) {
+            if (recordId != null) {
+                saveOriginalImageForRecordAsync(recordId, bytes, sourceLabel)
+            }
+            processFrame()
+        } else {
+            executeWorker("处理$sourceLabel", processFrame)
+            if (recordId != null) {
+                saveOriginalImageForRecordAsync(recordId, bytes, sourceLabel)
+            }
+        }
+
+    }
+
+    private fun saveOriginalImageForRecordAsync(recordId: String, bytes: ByteArray, sourceLabel: String) {
+        executeWorker("保存$sourceLabel 原图") {
+            try {
+                if (findRecognitionRecord(recordId) == null) {
+                    recordDiagnostic("$sourceLabel 原图保存跳过: 记录已不存在, id=$recordId")
+                    return@executeWorker
+                }
+                val historyBytes = if (sourceLabel.contains("图库") && bytes.size > 3 * 1024 * 1024) {
+                    compressLargeImage(bytes, 2560, 85)
+                } else {
+                    bytes
+                }
+                val originalPath = saveHistoryImage(recordId, "original", historyBytes)
+                updateRecognitionRecord(recordId) {
+                    it.originalImagePath = originalPath
+                }
+                recordDiagnostic(
+                    "$sourceLabel 原图后台保存完成: id=$recordId, sourceBytes=${bytes.size}, " +
+                        "savedBytes=${historyBytes.size}"
+                )
+            } catch (e: Exception) {
+                recordDiagnostic("$sourceLabel 原图后台保存异常: id=$recordId", e)
+            }
+        }
+    }
+
+    /**
+
+     * 5.1 手机端本地初筛：无脸不上云；有脸则裁剪人脸区域后再上传，减少无效云端调用。
+
+     */
+
+    private fun handleLocalFaceDetectionResult(
+        recordId: String?,
+        sourceBitmap: Bitmap,
+        faces: List<Face>,
+        sourceLabel: String = "抓拍帧",
+        originalBytes: ByteArray? = null,
+        decodedMeta: DecodedBitmap? = null
+    ) {
+
+        val isGallery = sourceLabel.contains("图库")
+
+        if (faces.isEmpty()) {
+
+            updateRecognitionRecord(recordId) {
+
+                it.status = STATUS_NO_FACE
+
+                it.statusText = "未检测到人脸"
+
+                it.errorMessage = "本地检测未发现人脸，未调用云端接口"
+
+            }
+
+            recordDiagnostic("本地人脸初筛 ($sourceLabel): 未检测到人脸，停止云端请求")
+
+            if (!isGallery) {
+
+                runOnUiThread {
+
+                    playResultBeep(success = false)
+
+                    updateStatus("未检测到人脸，已取消云端识别", isWorking = false)
+
+                    Toast.makeText(this, "未检测到人脸，请调整视角后重试", Toast.LENGTH_SHORT).show()
+
+                }
+
+            }
+
+            return
+
+        }
+
+        if (isGallery) {
+
+            galleryBatchFaceCount += 1
+
+        }
+
+        try {
+            val uploadMaxSide = uploadMaxSideFor(faces.size)
+
+            var uploadBitmap: Bitmap
+            var cropRect: Rect
+            var localFaceRects: List<FaceRect>
+
+            val highResCrop = if (originalBytes != null && decodedMeta != null && decodedMeta.sampleSize > 1) {
+                cropHighResFaces(originalBytes, decodedMeta, sourceBitmap, faces, uploadMaxSide)
+            } else null
+
+            if (highResCrop != null) {
+                uploadBitmap = highResCrop.bitmap
+                cropRect = highResCrop.sourceCropRect
+                localFaceRects = highResCrop.localFaceRects
+            } else {
+                val faceBounds = buildFaceUnionBounds(sourceBitmap, faces)
+                val uploadImage = buildFaceUploadImage(sourceBitmap, faces, faceBounds, uploadMaxSide)
+                uploadBitmap = uploadImage.bitmap
+                cropRect = uploadImage.sourceCropRect
+                localFaceRects = uploadImage.localFaceRects
+            }
+
+            val uploadBytes = bitmapToJpegBytes(uploadBitmap, FACE_UPLOAD_JPEG_QUALITY)
+
+            recordDiagnostic(
+                "本地人脸预处理 ($sourceLabel): faces=${faces.size}, source=${sourceBitmap.width}x${sourceBitmap.height}, " +
+                    "crop=${cropRect.left},${cropRect.top}," +
+                    "${cropRect.right},${cropRect.bottom}, " +
+                    "upload=${uploadBitmap.width}x${uploadBitmap.height}, minSide=${minOf(uploadBitmap.width, uploadBitmap.height)}, " +
+                    "bytes=${uploadBytes.size}, quality=$FACE_UPLOAD_JPEG_QUALITY, maxSide=$uploadMaxSide, " +
+                    "localUploadRects=${localFaceRects.size}"
+            )
+
+            capturedFrameBytes = uploadBytes
+            lastLocalFaceCrop = uploadBitmap
+
+            if (recordId != null) {
+                updateRecognitionRecord(recordId) {
+                    it.uploadImagePath = saveHistoryImage(recordId, "upload", uploadBytes)
+                    it.uploadWidth = uploadBitmap.width
+                    it.uploadHeight = uploadBitmap.height
+                    it.localFaceRects.clear()
+                    it.localFaceRects.addAll(localFaceRects)
+                    it.status = STATUS_UPLOADING
+                    it.statusText = "正在上传云端识别"
+                    it.errorMessage = null
+                }
+            }
+
+            val base64Data = Base64.encodeToString(uploadBytes, Base64.NO_WRAP)
+
+            val formattedBase64 = "data:image/jpeg;base64,$base64Data"
+
+            if (!isGallery) {
+
+                runOnUiThread {
+
+                    val status = if (faces.size > 1) {
+
+                        "本地检测到${faces.size}张人脸，正在上传人脸区域..."
+
+                    } else {
+
+                        "本地检测到人脸，正在上传识别..."
+
+                    }
+
+                    updateStatus(status, isWorking = true)
+
+                }
+
+            }
+
+            val maxFaceNum = cloudMaxFaceNumFor(faces.size)
+
+            recordDiagnostic("云端识别参数 ($sourceLabel): localFaces=${faces.size}, maxFaceNum=$maxFaceNum")
+
+            postFaceSearchRequest(recordId, formattedBase64, maxFaceNum, sourceLabel)
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "Local face preprocessing failed", e)
+
+            updateRecognitionRecord(recordId) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "本地人脸预处理失败"
+
+                it.errorMessage = e.message
+
+            }
+
+            recordDiagnostic("本地人脸预处理异常 ($sourceLabel)", e)
+
+            if (!isGallery) {
+
+                runOnUiThread {
+
+                    playResultBeep(success = false)
+
+                    updateStatus("❌ 本地人脸预处理失败: ${e.message}", isWorking = false)
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun buildFaceUnionBounds(sourceBitmap: Bitmap, faces: List<Face>): Rect {
+
+        var left = sourceBitmap.width
+
+        var top = sourceBitmap.height
+
+        var right = 0
+
+        var bottom = 0
+
+        faces.forEach { face ->
+
+            val bounds = Rect(face.boundingBox)
+
+            bounds.left = bounds.left.coerceIn(0, sourceBitmap.width)
+
+            bounds.top = bounds.top.coerceIn(0, sourceBitmap.height)
+
+            bounds.right = bounds.right.coerceIn(0, sourceBitmap.width)
+
+            bounds.bottom = bounds.bottom.coerceIn(0, sourceBitmap.height)
+
+            if (bounds.width() > 0 && bounds.height() > 0) {
+
+                left = minOf(left, bounds.left)
+
+                top = minOf(top, bounds.top)
+
+                right = maxOf(right, bounds.right)
+
+                bottom = maxOf(bottom, bounds.bottom)
+
+            }
+
+        }
+
+        if (right <= left || bottom <= top) {
+
+            return Rect(0, 0, sourceBitmap.width, sourceBitmap.height)
+
+        }
+
+        return Rect(left, top, right, bottom)
+
+    }
+
+    private fun compressLargeImage(bytes: ByteArray, maxSide: Int, quality: Int): ByteArray {
+        try {
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+            val sampleSize = calculateInSampleSize(options.outWidth, options.outHeight, maxSide)
+            val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            val rawBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions) ?: return bytes
+            val exif = readExifOrientation(bytes)
+            val oriented = applyExifOrientation(rawBitmap, exif)
+            if (oriented !== rawBitmap) rawBitmap.recycle()
+
+            val maxDim = maxOf(oriented.width, oriented.height)
+            val finalBitmap = if (maxDim > maxSide) {
+                val scale = maxSide.toFloat() / maxDim
+                val scaled = Bitmap.createScaledBitmap(oriented, (oriented.width * scale).toInt(), (oriented.height * scale).toInt(), true)
+                oriented.recycle()
+                scaled
+            } else {
+                oriented
+            }
+
+            val out = ByteArrayOutputStream()
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            finalBitmap.recycle()
+            return out.toByteArray()
+        } catch (e: Exception) {
+            recordDiagnostic("压缩超大历史原图失败", e)
+            return bytes
+        }
+    }
+
+    private fun mapRectToUnrotated(rect: Rect, rotatedW: Int, rotatedH: Int, orientation: Int): Rect {
+        val isSwapped = orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                orientation == ExifInterface.ORIENTATION_TRANSVERSE ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_270
+        val unrotatedW = if (isSwapped) rotatedH else rotatedW
+        val unrotatedH = if (isSwapped) rotatedW else rotatedH
+
+        fun mapPoint(x: Int, y: Int): Pair<Int, Int> {
+            return when (orientation) {
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> Pair(unrotatedW - x, y)
+                ExifInterface.ORIENTATION_ROTATE_180 -> Pair(unrotatedW - x, unrotatedH - y)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> Pair(x, unrotatedH - y)
+                ExifInterface.ORIENTATION_TRANSPOSE -> Pair(y, x)
+                ExifInterface.ORIENTATION_ROTATE_90 -> Pair(y, unrotatedW - x)
+                ExifInterface.ORIENTATION_TRANSVERSE -> Pair(unrotatedH - y, unrotatedW - x)
+                ExifInterface.ORIENTATION_ROTATE_270 -> Pair(unrotatedH - y, x)
+                else -> Pair(x, y)
+            }
+        }
+
+        val p1 = mapPoint(rect.left, rect.top)
+        val p2 = mapPoint(rect.right, rect.top)
+        val p3 = mapPoint(rect.right, rect.bottom)
+        val p4 = mapPoint(rect.left, rect.bottom)
+
+        val uMin = minOf(p1.first, p2.first, p3.first, p4.first)
+        val vMin = minOf(p1.second, p2.second, p3.second, p4.second)
+        val uMax = maxOf(p1.first, p2.first, p3.first, p4.first)
+        val vMax = maxOf(p1.second, p2.second, p3.second, p4.second)
+
+        return Rect(uMin, vMin, uMax, vMax)
+    }
+
+    private fun cropHighResFaces(
+        originalBytes: ByteArray,
+        decodedMeta: DecodedBitmap,
+        detectionBitmap: Bitmap,
+        faces: List<Face>,
+        uploadMaxSide: Int
+    ): FaceUploadImage? {
+        try {
+            val faceBounds = buildFaceUnionBounds(detectionBitmap, faces)
+            val padX = (faceBounds.width() * FACE_CROP_HORIZONTAL_PADDING).toInt()
+            val padTop = (faceBounds.height() * FACE_CROP_TOP_PADDING).toInt()
+            val padBottom = (faceBounds.height() * FACE_CROP_BOTTOM_PADDING).toInt()
+
+            val detLeft = (faceBounds.left - padX).coerceAtLeast(0)
+            val detTop = (faceBounds.top - padTop).coerceAtLeast(0)
+            val detRight = (faceBounds.right + padX).coerceAtMost(detectionBitmap.width)
+            val detBottom = (faceBounds.bottom + padBottom).coerceAtMost(detectionBitmap.height)
+
+            val detCropRect = if (detRight <= detLeft || detBottom <= detTop) {
+                Rect(0, 0, detectionBitmap.width, detectionBitmap.height)
+            } else {
+                expandRectToMinimumSide(Rect(detLeft, detTop, detRight, detBottom), detectionBitmap.width, detectionBitmap.height, MIN_UPLOAD_IMAGE_SIDE)
+            }
+
+            val unrotatedDetRect = mapRectToUnrotated(detCropRect, detectionBitmap.width, detectionBitmap.height, decodedMeta.exifOrientation)
+
+            val isSwapped = decodedMeta.exifOrientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                    decodedMeta.exifOrientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                    decodedMeta.exifOrientation == ExifInterface.ORIENTATION_TRANSVERSE ||
+                    decodedMeta.exifOrientation == ExifInterface.ORIENTATION_ROTATE_270
+            val unrotatedDetW = if (isSwapped) detectionBitmap.height else detectionBitmap.width
+            val unrotatedDetH = if (isSwapped) detectionBitmap.width else detectionBitmap.height
+
+            val scaleX = decodedMeta.originalWidth.toFloat() / unrotatedDetW.toFloat()
+            val scaleY = decodedMeta.originalHeight.toFloat() / unrotatedDetH.toFloat()
+
+            val origLeft = (unrotatedDetRect.left * scaleX).toInt().coerceAtLeast(0)
+            val origTop = (unrotatedDetRect.top * scaleY).toInt().coerceAtLeast(0)
+            val origRight = (unrotatedDetRect.right * scaleX).toInt().coerceAtMost(decodedMeta.originalWidth)
+            val origBottom = (unrotatedDetRect.bottom * scaleY).toInt().coerceAtMost(decodedMeta.originalHeight)
+            val origCropRect = Rect(origLeft, origTop, origRight, origBottom)
+
+            if (origCropRect.width() <= 0 || origCropRect.height() <= 0) return null
+
+            val decoder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                BitmapRegionDecoder.newInstance(originalBytes, 0, originalBytes.size)
+            } else {
+                @Suppress("DEPRECATION")
+                BitmapRegionDecoder.newInstance(originalBytes, 0, originalBytes.size, false)
+            } ?: return null
+
+            var sampleSize = 1
+            while (origCropRect.width() / (sampleSize * 2) >= uploadMaxSide && origCropRect.height() / (sampleSize * 2) >= uploadMaxSide) {
+                sampleSize *= 2
+            }
+
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+
+            val rawCropped = decoder.decodeRegion(origCropRect, options)
+            decoder.recycle()
+            if (rawCropped == null) return null
+
+            val finalCropped = applyExifOrientation(rawCropped, decodedMeta.exifOrientation)
+            if (finalCropped !== rawCropped) rawCropped.recycle()
+
+            val maxDim = maxOf(finalCropped.width, finalCropped.height)
+            val uploadBitmap = if (maxDim > uploadMaxSide) {
+                val scale = uploadMaxSide.toFloat() / maxDim
+                val scaled = Bitmap.createScaledBitmap(finalCropped, (finalCropped.width * scale).toInt(), (finalCropped.height * scale).toInt(), true)
+                finalCropped.recycle()
+                scaled
+            } else {
+                finalCropped
+            }
+
+            val scaleDetX = uploadBitmap.width.toFloat() / detCropRect.width().toFloat()
+            val scaleDetY = uploadBitmap.height.toFloat() / detCropRect.height().toFloat()
+            val localFaceRects = faces
+                .sortedWith(compareBy<Face> { it.boundingBox.left }.thenBy { it.boundingBox.top })
+                .mapNotNull { face ->
+                    mapLocalFaceToUploadRect(face.boundingBox, detCropRect, scaleDetX, scaleDetY, uploadBitmap.width, uploadBitmap.height)
+                }
+
+            return FaceUploadImage(uploadBitmap, origCropRect, localFaceRects)
+        } catch (e: Exception) {
+            recordDiagnostic("高清图库区域解码失败", e)
+            return null
+        }
+    }
+
+    private fun buildFaceUploadImage(
+
+        sourceBitmap: Bitmap,
+
+        faces: List<Face>,
+
+        faceBounds: Rect,
+
+        maxUploadSide: Int
+
+    ): FaceUploadImage {
+
+        val padX = (faceBounds.width() * FACE_CROP_HORIZONTAL_PADDING).toInt()
+
+        val padTop = (faceBounds.height() * FACE_CROP_TOP_PADDING).toInt()
+
+        val padBottom = (faceBounds.height() * FACE_CROP_BOTTOM_PADDING).toInt()
+
+        val left = (faceBounds.left - padX).coerceAtLeast(0)
+
+        val top = (faceBounds.top - padTop).coerceAtLeast(0)
+
+        val right = (faceBounds.right + padX).coerceAtMost(sourceBitmap.width)
+
+        val bottom = (faceBounds.bottom + padBottom).coerceAtMost(sourceBitmap.height)
+
+        val cropRect = if (right <= left || bottom <= top) {
+
+            Rect(0, 0, sourceBitmap.width, sourceBitmap.height)
+
+        } else {
+
+            expandRectToMinimumSide(
+
+                Rect(left, top, right, bottom),
+
+                sourceBitmap.width,
+
+                sourceBitmap.height,
+
+                MIN_UPLOAD_IMAGE_SIDE
+
+            )
+
+        }
+
+        val cropped = Bitmap.createBitmap(sourceBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
+
+        val uploadBitmap = resizeBitmapForUpload(cropped, maxUploadSide)
+
+        val scaleX = uploadBitmap.width.toFloat() / cropRect.width().toFloat()
+
+        val scaleY = uploadBitmap.height.toFloat() / cropRect.height().toFloat()
+
+        val localFaceRects = faces
+
+            .sortedWith(compareBy<Face> { it.boundingBox.left }.thenBy { it.boundingBox.top })
+
+            .mapNotNull { face ->
+
+                mapLocalFaceToUploadRect(face.boundingBox, cropRect, scaleX, scaleY, uploadBitmap.width, uploadBitmap.height)
+
+            }
+
+        return FaceUploadImage(uploadBitmap, cropRect, localFaceRects)
+
+    }
+
+    private fun mapLocalFaceToUploadRect(
+
+        faceBounds: Rect,
+
+        cropRect: Rect,
+
+        scaleX: Float,
+
+        scaleY: Float,
+
+        uploadWidth: Int,
+
+        uploadHeight: Int
+
+    ): FaceRect? {
+
+        val left = faceBounds.left.coerceIn(cropRect.left, cropRect.right)
+
+        val top = faceBounds.top.coerceIn(cropRect.top, cropRect.bottom)
+
+        val right = faceBounds.right.coerceIn(cropRect.left, cropRect.right)
+
+        val bottom = faceBounds.bottom.coerceIn(cropRect.top, cropRect.bottom)
+
+        if (right <= left || bottom <= top) {
+
+            return null
+
+        }
+
+        val mappedLeft = ((left - cropRect.left) * scaleX).coerceIn(0f, uploadWidth.toFloat())
+
+        val mappedTop = ((top - cropRect.top) * scaleY).coerceIn(0f, uploadHeight.toFloat())
+
+        val mappedRight = ((right - cropRect.left) * scaleX).coerceIn(0f, uploadWidth.toFloat())
+
+        val mappedBottom = ((bottom - cropRect.top) * scaleY).coerceIn(0f, uploadHeight.toFloat())
+
+        if (mappedRight <= mappedLeft || mappedBottom <= mappedTop) {
+
+            return null
+
+        }
+
+        return FaceRect(
+
+            x = mappedLeft,
+
+            y = mappedTop,
+
+            width = mappedRight - mappedLeft,
+
+            height = mappedBottom - mappedTop
+
+        )
+
+    }
+
+    private fun expandRectToMinimumSide(rect: Rect, imageWidth: Int, imageHeight: Int, minSide: Int): Rect {
+
+        var left = rect.left.coerceIn(0, imageWidth)
+
+        var top = rect.top.coerceIn(0, imageHeight)
+
+        var right = rect.right.coerceIn(0, imageWidth)
+
+        var bottom = rect.bottom.coerceIn(0, imageHeight)
+
+        if (right <= left || bottom <= top) {
+
+            return Rect(0, 0, imageWidth, imageHeight)
+
+        }
+
+        if (right - left < minSide) {
+
+            val extra = minSide - (right - left)
+
+            left -= extra / 2
+
+            right += extra - extra / 2
+
+            if (left < 0) {
+
+                right = (right - left).coerceAtMost(imageWidth)
+
+                left = 0
+
+            }
+
+            if (right > imageWidth) {
+
+                left = (left - (right - imageWidth)).coerceAtLeast(0)
+
+                right = imageWidth
+
+            }
+
+        }
+
+        if (bottom - top < minSide) {
+
+            val extra = minSide - (bottom - top)
+
+            top -= extra / 2
+
+            bottom += extra - extra / 2
+
+            if (top < 0) {
+
+                bottom = (bottom - top).coerceAtMost(imageHeight)
+
+                top = 0
+
+            }
+
+            if (bottom > imageHeight) {
+
+                top = (top - (bottom - imageHeight)).coerceAtLeast(0)
+
+                bottom = imageHeight
+
+            }
+
+        }
+
+        return Rect(left, top, right, bottom)
+
+    }
+
+    private fun resizeBitmapForUpload(bitmap: Bitmap, maxUploadSide: Int): Bitmap {
+
+        var result = bitmap
+
+        val currentMaxSide = maxOf(result.width, result.height)
+
+        if (currentMaxSide > maxUploadSide) {
+
+            val scale = maxUploadSide.toFloat() / currentMaxSide.toFloat()
+
+            val targetWidth = (result.width * scale).toInt().coerceAtLeast(1)
+
+            val targetHeight = (result.height * scale).toInt().coerceAtLeast(1)
+
+            result = Bitmap.createScaledBitmap(result, targetWidth, targetHeight, true)
+
+        }
+
+        val currentMinSide = minOf(result.width, result.height)
+
+        if (currentMinSide in 1 until MIN_UPLOAD_IMAGE_SIDE) {
+
+            val scale = MIN_UPLOAD_IMAGE_SIDE.toFloat() / currentMinSide.toFloat()
+
+            val targetWidth = (result.width * scale).toInt().coerceAtLeast(MIN_UPLOAD_IMAGE_SIDE)
+
+            val targetHeight = (result.height * scale).toInt().coerceAtLeast(MIN_UPLOAD_IMAGE_SIDE)
+
+            result = Bitmap.createScaledBitmap(result, targetWidth, targetHeight, true)
+
+        }
+
+        return result
+
+    }
+
+    private fun uploadMaxSideFor(faceCount: Int): Int {
+
+        return if (faceCount > 1) {
+
+            MULTI_FACE_MAX_UPLOAD_IMAGE_SIDE
+
+        } else {
+
+            MAX_UPLOAD_IMAGE_SIDE
+
+        }
+
+    }
+
+    private fun processingMaxSideFor(sourceLabel: String): Int {
+
+        return if (sourceLabel.contains("图库")) {
+
+            GALLERY_FAST_PROCESS_MAX_IMAGE_SIDE
+
+        } else {
+
+            GLASS_PROCESS_MAX_IMAGE_SIDE
+
+        }
+
+    }
+
+    private fun shouldRunGallerySupplementalFaceDetection(
+        decoded: DecodedBitmap,
+        bitmap: Bitmap,
+        faces: List<Face>
+    ): Boolean {
+
+        if (decoded.sampleSize <= 1 || faces.isEmpty() || faces.size >= CLOUD_MAX_FACE_NUM) {
+
+            return false
+
+        }
+
+        val sourceMaxSide = maxOf(decoded.originalWidth, decoded.originalHeight)
+
+        if (sourceMaxSide < GALLERY_SUPPLEMENTAL_MIN_SOURCE_SIDE) {
+
+            return false
+
+        }
+
+        val largestFaceRatio = faces.maxOf {
+
+            localFaceAreaRatio(it.boundingBox, bitmap.width, bitmap.height)
+
+        }
+
+        val smallestFaceRatio = faces.minOf {
+
+            localFaceAreaRatio(it.boundingBox, bitmap.width, bitmap.height)
+
+        }
+
+        return largestFaceRatio < GALLERY_SUPPLEMENTAL_LARGE_FACE_RATIO ||
+
+            smallestFaceRatio < GALLERY_SUPPLEMENTAL_SMALL_FACE_RATIO
+
+    }
+
+    private fun localFaceAreaRatio(rect: Rect, width: Int, height: Int): Float {
+
+        val clipped = clippedRect(rect, width, height) ?: return 0f
+
+        return clipped.width().toFloat() * clipped.height().toFloat() /
+
+            (width.toFloat() * height.toFloat()).coerceAtLeast(1f)
+
+    }
+
+    private fun decodeBitmapForProcessing(bytes: ByteArray, sourceLabel: String, maxSide: Int): DecodedBitmap? {
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+
+            return null
+
+        }
+
+        val sampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
+
+        val options = BitmapFactory.Options().apply {
+
+            inSampleSize = sampleSize
+
+            // 图库照片使用 ARGB_8888 保证人脸检测准确度；眼镜抓拍使用 RGB_565 节省内存
+
+            inPreferredConfig = if (sourceLabel.contains("图库")) Bitmap.Config.ARGB_8888 else Bitmap.Config.RGB_565
+
+        }
+
+        val rawBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+
+        val exifOrientation = readExifOrientation(bytes)
+
+        val orientedBitmap = applyExifOrientation(rawBitmap, exifOrientation)
+
+        if (orientedBitmap !== rawBitmap) {
+
+            rawBitmap.recycle()
+
+        }
+
+        if (sampleSize > 1 || exifOrientation != ExifInterface.ORIENTATION_NORMAL) {
+
+            recordDiagnostic(
+
+                "$sourceLabel 解码优化: source=${bounds.outWidth}x${bounds.outHeight}, " +
+
+                    "decoded=${orientedBitmap.width}x${orientedBitmap.height}, sample=$sampleSize, exif=$exifOrientation"
+
+            )
+
+        }
+
+        val rotates = exifOrientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+
+            exifOrientation == ExifInterface.ORIENTATION_ROTATE_270 ||
+
+            exifOrientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+
+            exifOrientation == ExifInterface.ORIENTATION_TRANSVERSE
+
+        val originalWidth = if (rotates) bounds.outHeight else bounds.outWidth
+
+        val originalHeight = if (rotates) bounds.outWidth else bounds.outHeight
+
+        return DecodedBitmap(orientedBitmap, sampleSize, exifOrientation, originalWidth, originalHeight)
+
+    }
+
+    private fun calculateInSampleSize(width: Int, height: Int, maxSide: Int): Int {
+
+        if (maxSide <= 0) return 1
+
+        var sampleSize = 1
+
+        val sourceMaxSide = maxOf(width, height)
+
+        while (sourceMaxSide / sampleSize > maxSide && sampleSize < 16) {
+
+            sampleSize *= 2
+
+        }
+
+        return sampleSize.coerceAtLeast(1)
+
+    }
+
+    private fun readExifOrientation(bytes: ByteArray): Int {
+
+        return try {
+
+            ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
+
+                ExifInterface.TAG_ORIENTATION,
+
+                ExifInterface.ORIENTATION_NORMAL
+
+            )
+
+        } catch (e: Exception) {
+
+            ExifInterface.ORIENTATION_NORMAL
+
+        }
+
+    }
+
+    private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+
+        val matrix = Matrix()
+
+        when (orientation) {
+
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.setScale(1f, -1f)
+
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+
+                matrix.setRotate(90f)
+
+                matrix.postScale(-1f, 1f)
+
+            }
+
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+
+                matrix.setRotate(-90f)
+
+                matrix.postScale(-1f, 1f)
+
+            }
+
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+
+            else -> return bitmap
+
+        }
+
+        return try {
+
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("EXIF 方向修正失败: orientation=$orientation", e)
+
+            bitmap
+
+        }
+
+    }
+
+    private fun bitmapToJpegBytes(bitmap: Bitmap, quality: Int): ByteArray {
+
+        val stream = ByteArrayOutputStream()
+
+        stream.use {
+
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, it)
+
+            return it.toByteArray()
+
+        }
+
+    }
+
+    private fun cloudMaxFaceNumFor(localFaceCount: Int): Int {
+
+        return localFaceCount.coerceIn(1, CLOUD_MAX_FACE_NUM)
+
+    }
+
+    private fun parseFaceRect(matchItem: JsonObject): FaceRect? {
+
+        val rectObj = firstJsonObject(matchItem, "face_rect", "faceRect", "FaceRect", "rect", "Rect", "location", "Location")
+
+            ?: return null
+
+        val x = firstJsonFloat(rectObj, "x", "X", "left", "Left", "originX", "OriginX") ?: return null
+
+        val y = firstJsonFloat(rectObj, "y", "Y", "top", "Top", "originY", "OriginY") ?: return null
+
+        val width = firstJsonFloat(rectObj, "width", "Width", "w", "W") ?: return null
+
+        val height = firstJsonFloat(rectObj, "height", "Height", "h", "H") ?: return null
+
+        return FaceRect(x, y, width, height).takeIf { width > 0f && height > 0f }
+
+    }
+
+    private fun firstJsonObject(parent: JsonObject, vararg names: String): JsonObject? {
+
+        names.forEach { name ->
+
+            val element = parent.get(name)
+
+            if (element != null && element.isJsonObject) {
+
+                return element.asJsonObject
+
+            }
+
+        }
+
+        return null
+
+    }
+
+    private fun firstJsonFloat(parent: JsonObject, vararg names: String): Float? {
+
+        names.forEach { name ->
+
+            val element = parent.get(name)
+
+            if (element != null && !element.isJsonNull) {
+
+                try {
+
+                    return element.asFloat
+
+                } catch (e: Exception) {
+
+                    // Try the next alias.
+
+                }
+
+            }
+
+        }
+
+        return null
+
+    }
+
+    /**
+
+     * 6. 网络中转请求：将抓拍上传至您的云服务器进行人脸检索，支持抓取定位框与系统头像
+
+     */
+
+    private fun postFaceSearchRequest(
+
+        recordId: String?,
+
+        base64Image: String,
+
+        maxFaceNum: Int = DEFAULT_CLOUD_MAX_FACE_NUM,
+
+        sourceLabel: String = "抓拍帧"
+
+    ) {
+
+        val isGallery = sourceLabel.contains("图库")
+
+        val requestUrl = "$serverBaseUrl/dlsgzs/api/face/search"
+
+        val requestMaxFaceNum = cloudMaxFaceNumFor(maxFaceNum)
+
+        recordDiagnostic("准备云端识别请求 ($sourceLabel): url=$requestUrl, imageChars=${base64Image.length}, maxFaceNum=$requestMaxFaceNum")
+
+        val jsonPayload = JsonObject().apply {
+
+            addProperty("image", base64Image)
+
+            addProperty("max_face_num", requestMaxFaceNum)
+
+            addProperty("search_mode", "speed")
+
+        }
+
+        val requestBodyString = jsonPayload.toString()
+
+        val request: Request
+
+        try {
+
+            val requestBody = requestBodyString
+
+                .toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+
+            request = Request.Builder()
+
+                .url(requestUrl)
+
+                .post(requestBody)
+
+                .build()
+
+            recordDiagnostic("云端识别请求已构建 ($sourceLabel): bodyChars=${requestBodyString.length}")
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "Invalid server request", e)
+
+            updateRecognitionRecord(recordId) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "服务器地址或请求参数无效"
+
+                it.errorMessage = e.message
+
+            }
+
+            recordDiagnostic("云端识别请求构建异常 ($sourceLabel)", e)
+
+            if (!isGallery) {
+
+                runOnUiThread {
+
+                    playResultBeep(success = false)
+
+                    updateStatus("❌ 服务器地址或请求参数无效: ${e.message}", isWorking = false)
+
+                }
+
+            }
+
+            return
+
+        }
+
+        fun handleSuccess(bodyString: String, responseCode: Int) {
+
+            if (responseCode in 200..299 && bodyString.isNotEmpty()) {
+
+                try {
+
+                    val resultObj = Gson().fromJson(bodyString, JsonObject::class.java)
+
+                    val success = resultObj.get("success")?.asBoolean ?: false
+
+                    recordDiagnostic("云端 JSON 解析 ($sourceLabel): success=$success")
+
+                    if (success) {
+
+                        val resultsArray = resultObj.getAsJsonArray("results")
+
+                        if (resultsArray != null && resultsArray.size() > 0) {
+
+                            recordDiagnostic("云端匹配结果数量 ($sourceLabel): ${resultsArray.size()}")
+
+                            val expertsForRecord = mutableListOf<ExpertInfo>()
+
+                            val nameList = StringBuilder()
+
+                            
+
+                            for (i in 0 until resultsArray.size()) {
+
+                                val matchItem = resultsArray.get(i).asJsonObject
+
+                                val score = matchItem.get("score")?.asFloat ?: 0f
+
+                                val expert = matchItem.getAsJsonObject("expert")
+
+                                
+
+                                val name = expert.get("name")?.asString ?: "-"
+
+                                val company = expert.get("company")?.asString ?: "无工作单位"
+
+                                val major = expert.get("major")?.asString ?: "未填写"
+
+                                val phone = expert.get("phone")?.asString ?: "-"
+
+                                val idCard = expert.get("id_card")?.asString ?: "-"
+
+                                val photoPath = expert.get("photo_path")?.asString ?: ""
+
+                                
+
+                                val faceRect = parseFaceRect(matchItem)
+
+                                recordDiagnostic(
+
+                                    "云端匹配项 ($sourceLabel): index=$i, name=$name, score=$score, " +
+
+                                        "faceRect=${faceRect?.let { "${it.x},${it.y},${it.width},${it.height}" } ?: "null"}"
+
+                                )
+
+                                 
+
+                                expertsForRecord.add(ExpertInfo(name, company, major, phone, idCard, score, photoPath, faceRect))
+
+                                
+
+                                if (i > 0) nameList.append("，")
+
+                                nameList.append(name)
+
+                            }
+
+                            // 数据落库与图片裁剪物理处理，在后台执行以防卡顿主线程。
+
+                            executeWorker("落库云端识别结果 ($sourceLabel)") {
+
+                                val mainRecord = findRecognitionRecord(recordId)
+
+                                val originalBytes = loadHistoryBytes(mainRecord?.originalImagePath)
+
+                                val recognitionImageBytes = loadHistoryBytes(mainRecord?.uploadImagePath) ?: originalBytes
+
+                                val cropTargets = mutableListOf<Pair<String, ExpertInfo>>()
+
+                                val fallbackRects = mainRecord?.localFaceRects ?: emptyList()
+
+                                val expertsWithRects = expertsForRecord.mapIndexed { index, expert ->
+
+                                    if (expert.faceRect != null || fallbackRects.isEmpty()) {
+
+                                        expert
+
+                                    } else {
+
+                                        val fallbackRect = fallbackRects.getOrNull(index) ?: fallbackRects.firstOrNull()
+
+                                        if (fallbackRect != null) {
+
+                                            recordDiagnostic(
+
+                                                "云端未返回人脸框 ($sourceLabel)，使用本地上传图人脸框: index=$index, " +
+
+                                                    "rect=${fallbackRect.x},${fallbackRect.y},${fallbackRect.width},${fallbackRect.height}"
+
+                                            )
+
+                                            expert.copy(faceRect = fallbackRect)
+
+                                        } else {
+
+                                            expert
+
+                                        }
+
+                                    }
+
+                                }
+
+                                
+
+                                for (i in expertsWithRects.indices) {
+
+                                    val expert = expertsWithRects[i]
+
+                                    if (i == 0) {
+
+                                        // 第 1 位专家更新原主卡片
+
+                                        updateRecognitionRecord(recordId) {
+
+                                            it.status = STATUS_SUCCESS
+
+                                            it.statusText = "识别成功"
+
+                                            it.errorMessage = null
+
+                                            it.experts.clear()
+
+                                            it.experts.add(expert)
+
+                                        }
+
+                                        if (!recordId.isNullOrEmpty()) {
+
+                                            cropTargets.add(recordId to expert)
+
+                                        }
+
+                                    } else {
+
+                                        // 其余专家各自生成独立的历史卡片
+
+                                        val newId = "${System.currentTimeMillis()}_${Random().nextInt(100000)}"
+
+                                        val newRecord = RecognitionRecord(
+
+                                            id = newId,
+
+                                            createdAt = (mainRecord?.createdAt ?: System.currentTimeMillis()) - i * 10, // 微小时间偏移使列表时间倒序保持顺序正确
+
+                                            updatedAt = System.currentTimeMillis(),
+
+                                            status = STATUS_SUCCESS,
+
+                                            statusText = "识别成功"
+
+                                        )
+
+                                        
+
+                                        // 物理复制大图实现独立卡片解耦
+
+                                        val dupPath = duplicateOriginalImage(mainRecord?.originalImagePath, newId)
+
+                                        newRecord.originalImagePath = dupPath
+
+                                        newRecord.originalWidth = mainRecord?.originalWidth ?: 0
+
+                                        newRecord.originalHeight = mainRecord?.originalHeight ?: 0
+
+                                        newRecord.uploadWidth = mainRecord?.uploadWidth ?: 0
+
+                                        newRecord.uploadHeight = mainRecord?.uploadHeight ?: 0
+
+                                        newRecord.localFaceRects.addAll(mainRecord?.localFaceRects ?: emptyList())
+
+                                        newRecord.experts.add(expert)
+
+                                        cropTargets.add(newId to expert)
+
+                                        
+
+                                        synchronized(recognitionRecords) {
+
+                                            recognitionRecords.add(0, newRecord)
+
+                                        }
+
+                                    }
+
+                                }
+
+                                saveRecognitionRecords()
+
+                                 if (sourceLabel.contains("图库")) {
+
+                                     galleryBatchExpertCount += expertsWithRects.size
+
+                                 }
+
+                                
+
+                                // 处理完成后切回主线程渲染前台 UI
+
+                                val displayBytes = recognitionImageBytes ?: originalBytes
+
+                                runOnUiThread {
+
+                                    if (displayBytes != null) {
+
+                                        capturedFrameBytes = displayBytes
+
+                                        lastLocalFaceCrop = BitmapFactory.decodeByteArray(displayBytes, 0, displayBytes.size)
+
+                                    }
+
+                                    matchedExpertsList.clear()
+
+                                    matchedExpertsList.addAll(expertsWithRects)
+
+                                    currentDisplayIndex = 0
+
+                                    
+
+                                    // 仅当不是图库照片时，才将匹配成功的卡片展示在前台并语音播放，防止批量识别干扰
+
+                                    if (!isGallery) {
+
+                                        showExpertInfoAt(currentDisplayIndex)
+
+                                        playResultBeep(success = true)
+
+                                        speakOut("核验通过，发现评标专家：$nameList")
+
+                                        updateStatus("评标专家比对成功", isWorking = false)
+
+                                    }
+
+                                }
+
+                                if (recognitionImageBytes != null) {
+
+                                    cropTargets.forEach { (targetRecordId, expert) ->
+
+                                        val rect = expert.faceRect ?: return@forEach
+
+                                        val crop = cropAndSaveBestFaceImage(
+
+                                            recognitionImageBytes,
+
+                                            originalBytes,
+
+                                            rect,
+
+                                            targetRecordId
+
+                                        )
+
+                                        if (crop != null) {
+
+                                            updateRecognitionRecord(targetRecordId) {
+
+                                                it.uploadImagePath = crop.path
+
+                                                it.uploadWidth = crop.width
+
+                                                it.uploadHeight = crop.height
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                            return
+
+                        }
+
+                    }
+
+                    
+
+                    val errMsg = resultObj.get("error")?.asString ?: "未匹配到登记的专家档案"
+
+                    updateRecognitionRecord(recordId) {
+
+                        it.status = STATUS_NO_MATCH
+
+                        it.statusText = "未匹配到登记专家"
+
+                        it.errorMessage = errMsg
+
+                        it.experts.clear()
+
+                    }
+
+                    recordDiagnostic("云端业务未匹配 ($sourceLabel): error=$errMsg")
+
+                    if (!isGallery) {
+
+                        runOnUiThread {
+
+                            playResultBeep(success = false)
+
+                            updateStatus(errMsg, isWorking = false)
+
+                            speakOut("比对失败")
+
+                            hideArOverlay()
+
+                        }
+
+                    }
+
+                } catch (e: Exception) {
+
+                    updateRecognitionRecord(recordId) {
+
+                        it.status = STATUS_FAILED
+
+                        it.statusText = "结果解析失败"
+
+                        it.errorMessage = e.message
+
+                    }
+
+                    recordDiagnostic("云端响应解析异常 ($sourceLabel): preview=${bodyString.take(300)}", e)
+
+                    if (!isGallery) {
+
+                        runOnUiThread {
+
+                            playResultBeep(success = false)
+
+                            updateStatus("❌ 结果解析失败", isWorking = false)
+
+                        }
+
+                    }
+
+                }
+
+            } else {
+
+                val cloudMessage = cloudErrorMessage(responseCode, bodyString)
+
+                updateRecognitionRecord(recordId) {
+
+                    it.status = STATUS_NO_MATCH
+
+                    it.statusText = "云端未返回匹配结果"
+
+                    it.errorMessage = cloudMessage
+
+                    it.experts.clear()
+
+                }
+
+                recordDiagnostic(
+
+                    "云端 HTTP 失败或空响应 ($sourceLabel): code=$responseCode, message=$cloudMessage, " +
+
+                        "bodyPreview=${bodyString.take(300)}"
+
+                )
+
+                if (!isGallery) {
+
+                    runOnUiThread {
+
+                        playResultBeep(success = false)
+
+                        updateStatus("⚠️ $cloudMessage", isWorking = false)
+
+                        speakOut("核验未通过")
+
+                        hideArOverlay()
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        fun handleFailure(e: Exception) {
+
+            updateRecognitionRecord(recordId) {
+
+                it.status = STATUS_FAILED
+
+                it.statusText = "云端识别网络异常，可手动重试"
+
+                it.errorMessage = e.message
+
+            }
+
+            recordDiagnostic("云端识别网络异常 ($sourceLabel): url=$requestUrl", e)
+
+            if (!isGallery) {
+
+                runOnUiThread {
+
+                    playResultBeep(success = false)
+
+                    updateStatus("❌ 网络故障，请确认您服务器的IP端口是否可达", isWorking = false)
+
+                }
+
+            }
+
+        }
+
+        if (isGallery) {
+
+            // 图库批量识别同步执行：阻塞当前工作线程，实现最大并发受工作线程池 (MAX_PARALLEL_WORKERS = 3) 完美控制，绝不超频上云
+
+            try {
+
+                okHttpClient.newCall(request).execute().use { response ->
+
+                    val bodyString = response.body?.string() ?: ""
+
+                    recordDiagnostic("云端识别同步响应 ($sourceLabel): code=${response.code}, success=${response.isSuccessful}, bodyChars=${bodyString.length}")
+
+                    handleSuccess(bodyString, response.code)
+
+                }
+
+            } catch (e: Exception) {
+
+                handleFailure(e)
+
+            }
+
+        } else {
+
+            // 普通抓拍继续异步入队
+
+            okHttpClient.newCall(request).enqueue(object : Callback {
+
+                override fun onFailure(call: Call, e: IOException) {
+
+                    handleFailure(e)
+
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+
+                    val bodyString = response.body?.string() ?: ""
+
+                    recordDiagnostic("云端识别响应 ($sourceLabel): code=${response.code}, success=${response.isSuccessful}, bodyChars=${bodyString.length}")
+
+                    handleSuccess(bodyString, response.code)
+
+                }
+
+            })
+
+        }
+
+    }
+
+    /**
+
+     * 7. 渲染卡片 (支持轮播且支持头像多端异步显示与裁剪比对)
+
+     */
+
+    private fun showExpertInfoAt(index: Int) {
+
+        if (index < 0 || index >= matchedExpertsList.size) return
+
+        
+
+        mainHandler.removeCallbacks(hideArRunnable)
+
+        val expert = matchedExpertsList[index]
+
+        // A. 手机端 UI 卡片渲染
+
+        if (matchedExpertsList.size > 1) {
+
+            binding.tvArHeader.text = String.format(Locale.getDefault(), "候选专家 %d/%d", index + 1, matchedExpertsList.size)
+
+            binding.tvArHeader.setTextColor(ContextCompat.getColor(this, R.color.accent_warning_orange))
+
+            binding.tvArScore.setTextColor(ContextCompat.getColor(this, R.color.accent_warning_orange))
+
+        } else {
+
+            binding.tvArHeader.text = "评标专家比对通过"
+
+            binding.tvArHeader.setTextColor(ContextCompat.getColor(this, R.color.accent_aurora_green))
+
+            binding.tvArScore.setTextColor(ContextCompat.getColor(this, R.color.accent_aurora_green))
+
+        }
+
+        
+
+        binding.tvArScore.text = String.format(Locale.getDefault(), "%.1f%%", expert.score)
+
+        binding.tvArName.text = expert.name
+
+        binding.tvArCompany.text = expert.company
+
+        binding.tvArMajor.text = expert.major
+
+        binding.tvArPhone.text = expert.phone
+
+        // 清空之前的头像占位，准备异步填充
+
+        binding.ivCropFace.setImageBitmap(null)
+
+        binding.ivSystemFace.setImageBitmap(null)
+
+        currentLiveFace = null
+
+        currentSystemFace = null
+
+        if (binding.arOverlayLayout.visibility != View.VISIBLE) {
+
+            val fadeIn = AlphaAnimation(0f, 1f).apply { duration = 300 }
+
+            binding.arOverlayLayout.startAnimation(fadeIn)
+
+            binding.arOverlayLayout.visibility = View.VISIBLE
+
+        }
+
+        // B. 眼镜 HUD 端空间防抖渲染 (通过 DisplayManager 获取外接 AR 眼镜显示屏进行投射)
+
+        try {
+
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+
+            val displays = displayManager.displays
+
+            var glassDisplay: Display? = null
+
+            for (d in displays) {
+
+                if (d.displayId != Display.DEFAULT_DISPLAY) {
+
+                    glassDisplay = d
+
+                    break
+
+                }
+
+            }
+
+            
+
+            if (glassDisplay != null) {
+
+                if (arPresentation == null) {
+
+                    arPresentation = CxrArPresentation(this, glassDisplay)
+
+                }
+
+                arPresentation?.let {
+
+                    if (!it.isShowing) {
+
+                        it.show()
+
+                    }
+
+                    it.showExpertInfo(expert.name, expert.company, expert.major, expert.phone, expert.score, index, matchedExpertsList.size, null, null)
+
+                }
+
+            }
+
+        } catch (e: Exception) {
+
+            Log.e(TAG, "AR presentation render error", e)
+
+        }
+
+        // C. 启动头像数据异步拉取与流截帧裁剪
+
+        if (expert.faceRect != null) {
+
+            cropLiveFace(capturedFrameBytes, expert.faceRect)
+
+        } else {
+
+            lastLocalFaceCrop?.let { localFaceCrop ->
+
+                currentLiveFace = localFaceCrop
+
+                binding.ivCropFace.setImageBitmap(localFaceCrop)
+
+                arPresentation?.setLiveFace(localFaceCrop)
+
+            }
+
+        }
+
+        loadSystemFace(expert.photoPath)
+
+        val delayMs = if (matchedExpertsList.size > 1) 8000L else 5000L
+
+        mainHandler.postDelayed(hideArRunnable, delayMs)
+
+    }
+
+    /**
+
+     * 8. 异步执行现场人脸定位裁剪
+
+     */
+
+    private fun cropLiveFace(bytes: ByteArray?, rect: FaceRect?) {
+
+        if (bytes == null || rect == null) {
+
+            return
+
+        }
+
+        executeWorker("裁剪现场人脸") {
+
+            try {
+
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+                if (bitmap != null) {
+
+                    val cropped = cropBitmapForFace(bitmap, rect)
+
+                    if (cropped != null) {
+
+                        currentLiveFace = cropped
+
+                        
+
+                        runOnUiThread {
+
+                            // 刷新手机端现场图
+
+                            binding.ivCropFace.setImageBitmap(cropped)
+
+                            // 刷新眼镜 AR HUD 端现场图
+
+                            arPresentation?.setLiveFace(cropped)
+
+                        }
+
+                    }
+
+                }
+
+            } catch (e: Exception) {
+
+                Log.e(TAG, "Crop live face error", e)
+
+            }
+
+        }
+
+    }
+
+    private fun cropAndSaveBestFaceImage(
+        recognitionImageBytes: ByteArray,
+        originalImageBytes: ByteArray?,
+        rect: FaceRect,
+        destRecordId: String
+    ): SavedFaceCrop? {
+        var recognitionBitmap: Bitmap? = null
+        val candidates = mutableListOf<FaceCropCandidate>()
+        return try {
+            recognitionBitmap = BitmapFactory.decodeByteArray(recognitionImageBytes, 0, recognitionImageBytes.size)
+                ?: return null
+
+            addFaceCropCandidate(candidates, "upload-face-rect", recognitionBitmap, rect)
+
+            if (candidates.isEmpty()) {
+                recordDiagnostic("专家现场图裁剪无候选: destRecordId=$destRecordId, rect=$rect")
+                return null
+            }
+
+            val selected = candidates.first()
+            val stream = ByteArrayOutputStream()
+            selected.bitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream)
+            val cropBytes = stream.toByteArray()
+            val path = saveHistoryImage(destRecordId, "upload", cropBytes)
+
+            recordDiagnostic(
+                "专家现场图裁剪完成: destRecordId=$destRecordId, selected=${selected.label}, " +
+                    "size=${selected.bitmap.width}x${selected.bitmap.height}"
+            )
+
+            SavedFaceCrop(path, selected.bitmap.width, selected.bitmap.height)
+        } catch (e: Exception) {
+            recordDiagnostic("裁剪并保存人脸图片异常: destRecordId=$destRecordId", e)
+            null
+        } finally {
+            recognitionBitmap?.recycle()
+            candidates.forEach { it.bitmap.recycle() }
+        }
+    }
+
+    private fun addFaceCropCandidate(
+
+        candidates: MutableList<FaceCropCandidate>,
+
+        label: String,
+
+        sourceBitmap: Bitmap,
+
+        rect: FaceRect
+
+    ) {
+
+        val cropped = cropBitmapForFace(sourceBitmap, rect) ?: return
+
+        candidates.add(FaceCropCandidate(label, cropped))
+
+    }
+
+    private fun cropBitmapForFace(sourceBitmap: Bitmap, rect: FaceRect): Bitmap? {
+
+        val pixelRect = rect.toPixelRect(sourceBitmap.width, sourceBitmap.height) ?: return null
+
+        val padX = (pixelRect.width() * 0.15f).roundToInt()
+
+        val padY = (pixelRect.height() * 0.15f).roundToInt()
+
+        val left = (pixelRect.left - padX).coerceAtLeast(0)
+
+        val top = (pixelRect.top - padY).coerceAtLeast(0)
+
+        val right = (pixelRect.right + padX).coerceAtMost(sourceBitmap.width)
+
+        val bottom = (pixelRect.bottom + padY).coerceAtMost(sourceBitmap.height)
+
+        if (right <= left || bottom <= top) {
+
+            return null
+
+        }
+
+        return Bitmap.createBitmap(sourceBitmap, left, top, right - left, bottom - top)
+
+    }
+
+    private fun scoreFaceCrop(bitmap: Bitmap): Int {
+
+        return try {
+
+            val faces = Tasks.await(
+
+                faceDetector.process(InputImage.fromBitmap(bitmap, 0)),
+
+                1500,
+
+                TimeUnit.MILLISECONDS
+
+            )
+
+            if (faces.isEmpty()) {
+
+                0
+
+            } else {
+
+                val largestFaceArea = faces.maxOf { face ->
+
+                    val bounds = face.boundingBox
+
+                    (bounds.width().coerceAtLeast(0) * bounds.height().coerceAtLeast(0))
+
+                }
+
+                faces.size * 1_000_000 + largestFaceArea
+
+            }
+
+        } catch (e: Exception) {
+
+            0
+
+        }
+
+    }
+
+    private fun scaleFaceRect(rect: FaceRect, fromWidth: Int, fromHeight: Int, toWidth: Int, toHeight: Int): FaceRect {
+
+        if (fromWidth <= 0 || fromHeight <= 0 || toWidth <= 0 || toHeight <= 0) {
+
+            return rect
+
+        }
+
+        val scaleX = toWidth.toFloat() / fromWidth.toFloat()
+
+        val scaleY = toHeight.toFloat() / fromHeight.toFloat()
+
+        return FaceRect(
+
+            x = rect.x * scaleX,
+
+            y = rect.y * scaleY,
+
+            width = rect.width * scaleX,
+
+            height = rect.height * scaleY
+
+        )
+
+    }
+
+    private fun duplicateOriginalImage(srcPath: String?, destRecordId: String): String? {
+
+        if (srcPath.isNullOrEmpty()) return null
+
+        return try {
+
+            val srcFile = File(srcPath)
+
+            if (srcFile.exists()) {
+
+                val destFile = File(historyDir(), "${destRecordId}_original.jpg")
+
+                srcFile.copyTo(destFile, overwrite = true)
+
+                destFile.absolutePath
+
+            } else {
+
+                null
+
+            }
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("复制原始大图失败: srcPath=$srcPath, destRecordId=$destRecordId", e)
+
+            null
+
+        }
+
+    }
+
+    private fun expertPhotoUrl(photoPath: String): String {
+
+        if (photoPath.startsWith("http://") || photoPath.startsWith("https://")) {
+
+            return photoPath
+
+        }
+
+        val normalizedPath = if (photoPath.startsWith("/")) photoPath else "/$photoPath"
+
+        return serverBaseUrl.trimEnd('/') + normalizedPath
+
+    }
+
+    /**
+
+     * 9. 异步下载系统存档照片
+
+     */
+
+    private fun loadSystemFace(photoPath: String) {
+
+        if (photoPath.isEmpty()) {
+
+            return
+
+        }
+
+        val url = expertPhotoUrl(photoPath)
+
+        val request = Request.Builder().url(url).build()
+
+        
+
+        okHttpClient.newCall(request).enqueue(object : Callback {
+
+            override fun onFailure(call: Call, e: IOException) {
+
+                Log.e(TAG, "Failed to load system face: $url", e)
+
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+
+                if (response.isSuccessful) {
+
+                    val bytes = response.body?.bytes()
+
+                    if (bytes != null) {
+
+                        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+                        if (bitmap != null) {
+
+                            currentSystemFace = bitmap
+
+                            runOnUiThread {
+
+                                // 刷新手机端系统存档图
+
+                                binding.ivSystemFace.setImageBitmap(bitmap)
+
+                                // 刷新眼镜 AR HUD 端系统存档图
+
+                                arPresentation?.setSystemFace(bitmap)
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        })
+
+    }
+
+    /**
+
+     * 10. 轮播控制：下一个 (向前滑动)
+
+     */
+
+    private fun showNextExpert() {
+
+        if (matchedExpertsList.size > 1) {
+
+            currentDisplayIndex = (currentDisplayIndex + 1) % matchedExpertsList.size
+
+            showExpertInfoAt(currentDisplayIndex)
+
+            speakOut(matchedExpertsList[currentDisplayIndex].name) 
+
+        }
+
+    }
+
+    /**
+
+     * 11. 轮播控制：上一个 (向后滑动)
+
+     */
+
+    private fun showPrevExpert() {
+
+        if (matchedExpertsList.size > 1) {
+
+            currentDisplayIndex = (currentDisplayIndex - 1 + matchedExpertsList.size) % matchedExpertsList.size
+
+            showExpertInfoAt(currentDisplayIndex)
+
+            speakOut(matchedExpertsList[currentDisplayIndex].name)
+
+        }
+
+    }
+
+    private fun hideArOverlay() {
+
+        if (binding.arOverlayLayout.visibility == View.VISIBLE) {
+
+            val fadeOut = AlphaAnimation(1f, 0f).apply { duration = 300 }
+
+            binding.arOverlayLayout.startAnimation(fadeOut)
+
+            binding.arOverlayLayout.visibility = View.GONE
+
+        }
+
+        
+
+        try {
+
+            arPresentation?.dismiss()
+
+        } catch (e: Exception) {
+
+            // ignore
+
+        }
+
+        arPresentation = null // 重置为空以防重新发现眼镜副屏时复用旧 Display 导致 InvalidDisplayException 闪退
+
+    }
+
+    private fun recordDiagnostic(message: String, throwable: Throwable? = null) {
+
+        val line = "[${diagnosticTimeFormat.format(Date())}] $message"
+
+        val fullLine = if (throwable != null) {
+
+            "$line\n${Log.getStackTraceString(throwable).lineSequence().take(8).joinToString("\n")}"
+
+        } else {
+
+            line
+
+        }
+
+        synchronized(diagnosticLines) {
+
+            diagnosticLines.addLast(fullLine)
+
+            while (diagnosticLines.size > MAX_DIAGNOSTIC_LINES) {
+
+                diagnosticLines.removeFirst()
+
+            }
+
+        }
+
+        if (throwable != null) {
+
+            Log.e(TAG, message, throwable)
+
+        } else {
+
+            Log.d(TAG, message)
+
+        }
+
+        runOnUiThread {
+
+            if (::binding.isInitialized) {
+
+                binding.tvDiagnostics.text = diagnosticLogText()
+
+                binding.diagnosticsScroll.post {
+
+                    binding.diagnosticsScroll.fullScroll(View.FOCUS_DOWN)
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun diagnosticLogText(): String {
+
+        return synchronized(diagnosticLines) {
+
+            if (diagnosticLines.isEmpty()) {
+
+                getString(R.string.diagnostics_empty)
+
+            } else {
+
+                diagnosticLines.joinToString("\n")
+
+            }
+
+        }
+
+    }
+
+    private fun copyDiagnosticsToClipboard() {
+
+        val diagnostics = collectDiagnosticsSnapshot()
+
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+
+        clipboard.setPrimaryClip(ClipData.newPlainText("Rokid glasses diagnostics", diagnostics))
+
+        Toast.makeText(this, "诊断信息已复制，可直接发给开发排查", Toast.LENGTH_SHORT).show()
+
+        recordDiagnostic("用户复制诊断信息: chars=${diagnostics.length}")
+
+    }
+
+    private fun collectDiagnosticsSnapshot(): String {
+
+        val logText = synchronized(diagnosticLines) {
+
+            diagnosticLines.joinToString("\n")
+
+        }
+
+        return buildString {
+
+            appendLine("Field Recognition Companion Diagnostics")
+
+            appendLine("time=${Date()}")
+
+            appendLine("app=${appVersionBrief()}")
+
+            appendLine("device=${deviceBrief()}")
+
+            appendLine("serverBaseUrl=$serverBaseUrl")
+
+            appendLine("soundPromptEnabled=$soundPromptEnabled")
+
+            appendLine("captureParams=${captureParamsBrief()}")
+
+            appendLine("activeCaptureRequest=${activeCaptureRequestWidth}x$activeCaptureRequestHeight q=$activeCaptureRequestQuality timeoutMs=$activeCaptureTimeoutMs startedAt=$activeCaptureRequestStartedAt")
+
+            appendLine("runtimePermissions=${runtimePermissionStatus()}")
+
+            appendLine("galleryPermissions=${galleryPermissionStatus()}")
+
+            appendLine("videoPermissions=${videoPermissionStatus()}")
+
+            appendLine("glassPermissions=${glassPermissionStatus()}")
+
+            appendLine("requiredRokidAppInstalled=${safeBoolean { AuthorizationHelper.isRequiredRokidAppInstalled(this@MainActivity) }}")
+
+            appendLine("requiredHiRokidInstalled=${safeBoolean { AuthorizationHelper.isRequiredHiRokidInstalled(this@MainActivity) }}")
+
+            appendLine("isConnectHiRokid=${safeBoolean { AuthorizationHelper.isConnectHiRokid() }}")
+
+            appendLine("cxrAuthTokenPresent=${cxrAuthToken != null}")
+
+            appendLine("isCxrServiceConnected=$isCxrServiceConnected")
+
+            appendLine("isGlassWirelessConnected=$isGlassWirelessConnected")
+
+            appendLine("pendingGlassCapture=$pendingGlassCapture")
+
+            appendLine("isMatchingRequestRunning=$isMatchingRequestRunning")
+
+            appendLine("latestFrameBytes=${latestFrameBytes?.size ?: 0}")
+
+            appendLine("capturedFrameBytes=${capturedFrameBytes?.size ?: 0}")
+
+            appendLine("lastLocalFaceCrop=${lastLocalFaceCrop?.width ?: 0}x${lastLocalFaceCrop?.height ?: 0}")
+
+            appendLine("matchedExperts=${matchedExpertsList.size}")
+
+            appendLine("----- recent logs -----")
+
+            appendLine(logText)
+
+        }
+
+    }
+
+    private fun runtimePermissionStatus(): String {
+
+        return requiredRuntimePermissions().joinToString(",") { permission ->
+
+            val granted = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+            "${permission.substringAfterLast('.')}=$granted"
+
+        }
+
+    }
+
+    private fun galleryPermissionStatus(): String {
+
+        return galleryImagePermissions().joinToString(",") { permission ->
+
+            val granted = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+            "${permission.substringAfterLast('.')}=$granted"
+
+        }
+
+    }
+
+    private fun videoPermissionStatus(): String {
+
+        return galleryVideoPermissions().joinToString(",") { permission ->
+
+            val granted = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+            "${permission.substringAfterLast('.')}=$granted"
+
+        }
+
+    }
+
+    private fun glassPermissionStatus(): String {
+
+        return REQUIRED_GLASS_PERMISSIONS.joinToString(",") { permission ->
+
+            val granted = try {
+
+                AuthorizationHelper.hasGlassPermission(permission)
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("读取 Rokid 权限异常: ${permission.name}", e)
+
+                false
+
+            }
+
+            "${permission.name}=$granted"
+
+        }
+
+    }
+
+    private fun appVersionBrief(): String {
+
+        return try {
+
+            val info = packageManager.getPackageInfo(packageName, 0)
+
+            "${info.versionName}(${info.longVersionCode}) package=$packageName"
+
+        } catch (e: Exception) {
+
+            "unknown package=$packageName"
+
+        }
+
+    }
+
+    private fun deviceBrief(): String {
+
+        return "${Build.MANUFACTURER}/${Build.MODEL} android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}"
+
+    }
+
+    private inline fun safeBoolean(block: () -> Boolean): String {
+
+        return try {
+
+            block().toString()
+
+        } catch (e: Exception) {
+
+            "error:${e.javaClass.simpleName}:${e.message ?: "-"}"
+
+        }
+
+    }
+
+    private fun updateStatus(statusText: String, isWorking: Boolean) {
+
+        recordDiagnostic("状态更新: working=$isWorking, text=$statusText")
+
+        runOnUiThread {
+
+            binding.tvStatus.text = statusText
+
+            if (isWorking) {
+
+                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_warning_orange))
+
+            } else {
+
+                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.text_primary))
+
+            }
+
+        }
+
+    }
+
+    // TTS 播报初始化
+
+    override fun onInit(status: Int) {
+
+        recordDiagnostic("TTS 初始化回调: status=$status")
+
+        if (status == TextToSpeech.SUCCESS) {
+
+            val audioResult = tts?.setAudioAttributes(
+
+                AudioAttributes.Builder()
+
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+
+                    .build()
+
+            )
+
+            val result = tts?.setLanguage(Locale.CHINESE)
+
+            if (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED) {
+
+                isTtsInitialized = true
+
+            }
+
+            recordDiagnostic("TTS 中文设置结果: audioResult=$audioResult, result=$result, initialized=$isTtsInitialized")
+
+        }
+
+    }
+
+    private fun speakOut(text: String) {
+
+        if (text.isBlank()) {
+
+            return
+
+        }
+
+        if (!soundPromptEnabled) {
+
+            recordDiagnostic("TTS 播报跳过: soundPromptEnabled=false, text=$text")
+
+            return
+
+        }
+
+        if (isTtsInitialized && tts != null) {
+
+            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "FaceMatchTTS")
+
+            recordDiagnostic("TTS 播报请求: result=$result, text=$text")
+
+        } else {
+
+            recordDiagnostic("TTS 播报跳过: initialized=$isTtsInitialized, text=$text")
+
+        }
+
+    }
+
+    private fun playCaptureBeep() {
+
+        playPromptTone("抓拍提示音", ToneGenerator.TONE_PROP_ACK, CAPTURE_BEEP_DURATION_MS)
+
+    }
+
+    private fun playResultBeep(success: Boolean) {
+
+        if (success) {
+
+            playPromptTone("识别成功提示音", ToneGenerator.TONE_PROP_ACK, RESULT_BEEP_DURATION_MS)
+
+        } else {
+
+            playPromptTone("识别失败提示音", ToneGenerator.TONE_PROP_NACK, RESULT_BEEP_DURATION_MS)
+
+        }
+
+    }
+
+    private fun playPromptTone(label: String, toneType: Int, durationMs: Int) {
+
+        if (!soundPromptEnabled) {
+
+            recordDiagnostic("$label 跳过: soundPromptEnabled=false")
+
+            return
+
+        }
+
+        try {
+
+            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, PROMPT_TONE_VOLUME)
+
+            val started = tone.startTone(toneType, durationMs)
+
+            recordDiagnostic("$label: started=$started, stream=notification, durationMs=$durationMs")
+
+            mainHandler.postDelayed({
+
+                try {
+
+                    tone.release()
+
+                } catch (e: Exception) {
+
+                    // ignore
+
+                }
+
+            }, (durationMs + 100).toLong())
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("$label 播放失败", e)
+
+        }
+
+    }
+
+    private fun requiredRuntimePermissions(): Array<String> {
+
+        val permissions = mutableListOf(Manifest.permission.CAMERA)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+
+        }
+
+        return permissions.toTypedArray()
+
+    }
+
+    private fun allPermissionsGranted() = requiredRuntimePermissions().all {
+
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+
+    }
+
+    private fun galleryImagePermissions(): Array<String> {
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+
+            arrayOf(
+
+                Manifest.permission.READ_MEDIA_IMAGES,
+
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+
+            )
+
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+            arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+
+        } else {
+
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+        }
+
+    }
+
+    private fun galleryImagePermissionsGranted(): Boolean {
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
+
+                ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            galleryImagePermissions().all {
+
+                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+
+            }
+
+        }
+
+    }
+
+    private fun galleryVideoPermissions(): Array<String> {
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+
+            arrayOf(
+
+                Manifest.permission.READ_MEDIA_VIDEO,
+
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+
+            )
+
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+            arrayOf(Manifest.permission.READ_MEDIA_VIDEO)
+
+        } else {
+
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+        }
+
+    }
+
+    private fun galleryVideoPermissionsGranted(): Boolean {
+
+        return fullVideoLibraryPermissionGranted() || limitedMediaSelectionGranted()
+
+    }
+
+    private fun fullVideoLibraryPermissionGranted(): Boolean {
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+
+        }
+
+    }
+
+    private fun limitedMediaSelectionGranted(): Boolean {
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            false
+
+        }
+
+    }
+
+    override fun onRequestPermissionsResult(
+
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
+
+    ) {
+
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+
+            recordDiagnostic(
+
+                "运行时权限回调: ${permissions.zip(grantResults.toTypedArray()).joinToString(",") { (permission, result) ->
+
+                    "${permission.substringAfterLast('.')}=${result == PackageManager.PERMISSION_GRANTED}"
+
+                }}"
+
+            )
+
+            if (allPermissionsGranted()) {
+
+                requestCxrAuthorizationAndConnect()
+
+            } else {
+
+                recordDiagnostic("运行时权限被拒绝: ${runtimePermissionStatus()}")
+
+                Toast.makeText(this, "核心权限被拒绝，无法启动眼镜连接", Toast.LENGTH_SHORT).show()
+
+            }
+
+        } else if (requestCode == REQUEST_CODE_GALLERY_IMAGES) {
+
+            recordDiagnostic(
+
+                "图库权限回调: ${permissions.zip(grantResults.toTypedArray()).joinToString(",") { (permission, result) ->
+
+                    "${permission.substringAfterLast('.')}=${result == PackageManager.PERMISSION_GRANTED}"
+
+                }}"
+
+            )
+
+            if (galleryImagePermissionsGranted()) {
+
+                loadGalleryPreview(force = true)
+
+            } else {
+
+                updateGalleryStatus("未获得图库照片权限")
+
+                Toast.makeText(this, "未获得图库照片权限，无法读取最近照片", Toast.LENGTH_SHORT).show()
+
+            }
+
+        } else if (requestCode == REQUEST_CODE_GALLERY_VIDEOS) {
+
+            recordDiagnostic(
+
+                "视频权限回调: ${permissions.zip(grantResults.toTypedArray()).joinToString(",") { (permission, result) ->
+
+                    "${permission.substringAfterLast('.')}=${result == PackageManager.PERMISSION_GRANTED}"
+
+                }}"
+
+            )
+
+            if (galleryVideoPermissionsGranted()) {
+
+                loadVideoPreview(force = true)
+
+            } else {
+
+                updateVideoStatus("未获得图库视频权限")
+
+                Toast.makeText(this, "未获得图库视频权限，无法读取最近视频", Toast.LENGTH_SHORT).show()
+
+            }
+
+        }
+
+    }
+
+    override fun onDestroy() {
+
+        recordDiagnostic("Activity销毁: service=$isCxrServiceConnected, glass=$isGlassWirelessConnected")
+
+        super.onDestroy()
+
+        cxrLink?.disconnect()
+
+        cxrLink = null
+
+        faceDetector.close()
+
+        sensitiveFaceDetector.close()
+
+        videoFaceDetector.close()
+
+        workExecutor.shutdown()
+
+        if (::thumbnailExecutor.isInitialized) thumbnailExecutor.shutdown()
+
+        tts?.stop()
+
+        tts?.shutdown()
+
+        mainHandler.removeCallbacks(hideArRunnable)
+
+        mainHandler.removeCallbacks(glassCaptureTimeoutRunnable)
+
+    }
+
+    companion object {
+
+        private const val TAG = "RokidCxrWireless"
+
+        private const val REQUEST_CODE_PERMISSIONS = 30
+
+        private const val REQUEST_CODE_CXR_AUTH = 31
+
+        private const val REQUEST_CODE_GALLERY_IMAGES = 32
+
+        private const val REQUEST_CODE_GALLERY_VIDEOS = 33
+
+        private const val REQUEST_CODE_PICK_VIDEO = 34
+        private const val REQUEST_CODE_PICK_IMAGE = 35
+
+        private const val MAX_PARALLEL_WORKERS = 3
+
+        private const val DEFAULT_GLASS_CAPTURE_WIDTH = 2560
+
+        private const val DEFAULT_GLASS_CAPTURE_HEIGHT = 1440
+
+        private const val DEFAULT_GLASS_CAPTURE_QUALITY = 92
+
+        private const val CAPTURE_MIN_SIZE = 320
+
+        private const val CAPTURE_MAX_SIZE = 4096
+
+        private const val CAPTURE_MIN_QUALITY = 50
+
+        private const val CAPTURE_MAX_QUALITY = 100
+
+        private const val GLASS_CAPTURE_TIMEOUT_MS = 15000L
+
+        private const val LATE_CAPTURE_ACCEPT_MS = 10000L
+
+        private const val EXTERNAL_CAPTURE_DEBOUNCE_MS = 1500L
+
+        private const val FACE_UPLOAD_JPEG_QUALITY = 92
+
+        private const val MAX_UPLOAD_IMAGE_SIDE = 1280
+
+        private const val MULTI_FACE_MAX_UPLOAD_IMAGE_SIDE = 1920
+
+        private const val MIN_UPLOAD_IMAGE_SIDE = 224
+
+        private const val GLASS_PROCESS_MAX_IMAGE_SIDE = 1200
+
+        private const val GALLERY_FAST_PROCESS_MAX_IMAGE_SIDE = 1200
+
+        private const val GALLERY_RETRY_PROCESS_MAX_IMAGE_SIDE = 4096
+
+        private const val IMAGE_SENSITIVE_RETRY_PROCESS_MAX_SIDE = 2400
+
+        private const val GALLERY_SUPPLEMENTAL_MIN_SOURCE_SIDE = 2400
+
+        private const val GALLERY_SUPPLEMENTAL_SMALL_FACE_RATIO = 0.035f
+
+        private const val GALLERY_SUPPLEMENTAL_LARGE_FACE_RATIO = 0.08f
+
+        private const val FACE_CROP_HORIZONTAL_PADDING = 0.70f
+
+        private const val FACE_CROP_TOP_PADDING = 0.75f
+
+        private const val FACE_CROP_BOTTOM_PADDING = 1.00f
+
+        private const val PROMPT_TONE_VOLUME = 100
+
+        private const val CAPTURE_BEEP_DURATION_MS = 160
+
+        private const val RESULT_BEEP_DURATION_MS = 180
+
+        private const val MAX_DIAGNOSTIC_LINES = 80
+
+        private const val DEFAULT_GALLERY_BATCH_SIZE = 5
+
+        private const val MAX_GALLERY_BATCH_SIZE = 20
+
+        private const val GALLERY_PREVIEW_SIZE = 30
+
+        private const val GALLERY_GRID_COLUMNS = 3
+
+        private const val GALLERY_PULL_HINT_DISTANCE_DP = 28
+
+        private const val GALLERY_PULL_REFRESH_DISTANCE_DP = 72
+
+        private const val GALLERY_PROGRESS_HIDE_DELAY_MS = 1200L
+
+        private const val VIDEO_PREVIEW_SIZE = 20
+
+        private const val VIDEO_GRID_COLUMNS = 2
+
+        private const val VIDEO_QUICK_SAMPLE_INTERVAL_MS = 300L
+
+        private const val VIDEO_QUICK_SHORT_DURATION_MS = 15000L
+
+        private const val VIDEO_QUICK_SHORT_INTERVAL_MS = 100L
+
+        private const val VIDEO_QUICK_DENSE_DURATION_MS = 60000L
+
+        private const val VIDEO_MAX_QUICK_SAMPLE_FRAMES = 180
+
+        private const val VIDEO_QUICK_PROCESS_MAX_SIDE = 960
+
+        private const val VIDEO_FINE_SAMPLE_INTERVAL_MS = 150L
+
+        private const val VIDEO_FINE_WINDOW_BEFORE_MS = 800L
+
+        private const val VIDEO_FINE_WINDOW_AFTER_MS = 800L
+
+        private const val VIDEO_MAX_FINE_SAMPLE_FRAMES = 50
+
+        private const val VIDEO_FINE_PROCESS_MAX_SIDE = 960
+
+        private const val VIDEO_MAX_UPLOAD_IMAGE_SIDE = 1600
+
+        private const val VIDEO_FRAME_JPEG_QUALITY = 92
+
+        private const val VIDEO_MAX_LOCAL_CANDIDATES = 12
+
+        private const val VIDEO_MAX_CLOUD_UPLOADS = 10
+
+        private const val VIDEO_MAX_SAVED_EXPERTS = 10
+
+        private const val VIDEO_CLOUD_MAX_FACE_NUM = 3
+
+        private const val VIDEO_MIN_FACE_AREA_RATIO = 0.0006f
+
+        private const val VIDEO_FACE_HASH_DUP_DISTANCE = 5
+
+        private const val VIDEO_CROSS_TRACK_HASH_DUP_DISTANCE = 5
+
+        private const val VIDEO_HASH_SIZE = 8
+
+        private const val VIDEO_SHARPNESS_SAMPLE_SIDE = 160
+
+        private const val VIDEO_PROGRESS_HIDE_DELAY_MS = 1200L
+
+        private const val VIDEO_PULL_HINT_DISTANCE_DP = 28
+
+        private const val VIDEO_PULL_REFRESH_DISTANCE_DP = 72
+
+        private const val DEFAULT_CLOUD_MAX_FACE_NUM = 5
+
+        private const val CLOUD_MAX_FACE_NUM = 10
+
+        private const val PAGE_CAPTURE = "capture"
+
+        private const val PAGE_GALLERY = "gallery"
+
+        private const val PAGE_VIDEO = "video"
+
+        private const val PAGE_HISTORY = "history"
+
+        private const val PAGE_SETTINGS = "settings"
+
+        private const val HISTORY_PREFS_NAME = "recognition_history"
+
+        private const val HISTORY_PREFS_KEY = "records"
+
+        private const val GALLERY_PREFS_NAME = "gallery_state"
+
+        private const val GALLERY_PREF_PROCESSED_KEYS = "processed_photo_keys"
+
+        private const val PROCESSED_GALLERY_KEY_LIMIT = 1000
+
+        private const val CAPTURE_PREFS_NAME = "capture_params"
+
+        private const val CAPTURE_PREF_WIDTH = "width"
+
+        private const val CAPTURE_PREF_HEIGHT = "height"
+
+        private const val CAPTURE_PREF_QUALITY = "quality"
+
+        private const val SOUND_PREFS_NAME = "sound_settings"
+
+        private const val SOUND_PREF_ENABLED = "sound_prompt_enabled"
+
+        private const val HISTORY_RETENTION_MS = 3L * 24L * 60L * 60L * 1000L
+
+        private const val STATUS_CAPTURING = "capturing"
+
+        private const val STATUS_LOCAL_PROCESSING = "local_processing"
+
+        private const val STATUS_UPLOADING = "uploading"
+
+        private const val STATUS_SUCCESS = "success"
+
+        private const val STATUS_NO_FACE = "no_face"
+
+        private const val STATUS_NO_MATCH = "no_match"
+
+        private const val STATUS_FAILED = "failed"
+
+        private const val STATUS_INTERRUPTED = "interrupted"
+
+        private val REQUIRED_GLASS_PERMISSIONS = arrayOf(
+
+            GlassPermission.CAMERA,
+
+            GlassPermission.MEDIA
+
+        )
+
+    }
+
+}
+
+data class RecognitionRecord(
+
+    var id: String = "",
+
+    var createdAt: Long = 0L,
+
+    var updatedAt: Long = 0L,
+
+    var status: String = "",
+
+    var statusText: String = "",
+
+    var errorMessage: String? = null,
+
+    var originalImagePath: String? = null,
+
+    var uploadImagePath: String? = null,
+
+    var originalWidth: Int = 0,
+
+    var originalHeight: Int = 0,
+
+    var uploadWidth: Int = 0,
+
+    var uploadHeight: Int = 0,
+
+    var localFaceRects: MutableList<FaceRect> = mutableListOf(),
+
+    var experts: MutableList<ExpertInfo> = mutableListOf()
+
+)
+
+data class DecodedBitmap(
+
+    val bitmap: Bitmap,
+
+    val sampleSize: Int,
+
+    val exifOrientation: Int,
+
+    val originalWidth: Int,
+
+    val originalHeight: Int
+
+)
+
+data class GalleryPhoto(
+
+    val uri: Uri,
+
+    val displayName: String,
+
+    val dateTaken: Long,
+
+    val sizeBytes: Long,
+
+    val width: Int,
+
+    val height: Int
+
+)
+
+data class GalleryVideo(
+
+    val uri: Uri,
+
+    val displayName: String,
+
+    val dateTaken: Long,
+
+    val sizeBytes: Long,
+
+    val width: Int,
+
+    val height: Int,
+
+    val durationMs: Long
+
+)
+
+data class VideoMetadata(
+
+    val width: Int,
+
+    val height: Int,
+
+    val durationMs: Long
+
+)
+
+data class FaceUploadImage(
+
+    val bitmap: Bitmap,
+
+    val sourceCropRect: Rect,
+
+    val localFaceRects: List<FaceRect>
+
+)
+
+data class ExpertInfo(
+
+    val name: String,
+
+    val company: String,
+
+    val major: String,
+
+    val phone: String,
+
+    val idCard: String? = "-",
+
+    val score: Float,
+
+    val photoPath: String,
+
+    val faceRect: FaceRect?
+
+)
+
+data class FaceRect(
+
+    val x: Float,
+
+    val y: Float,
+
+    val width: Float,
+
+    val height: Float
+
+) {
+
+    fun isNormalized(): Boolean {
+
+        return x in 0f..1f && y in 0f..1f && width in 0f..1f && height in 0f..1f
+
+    }
+
+    fun toPixelRect(imageWidth: Int, imageHeight: Int): Rect? {
+
+        if (imageWidth <= 0 || imageHeight <= 0 || width <= 0f || height <= 0f) {
+
+            return null
+
+        }
+
+        val leftFloat: Float
+
+        val topFloat: Float
+
+        val widthFloat: Float
+
+        val heightFloat: Float
+
+        if (isNormalized()) {
+
+            leftFloat = x * imageWidth
+
+            topFloat = y * imageHeight
+
+            widthFloat = width * imageWidth
+
+            heightFloat = height * imageHeight
+
+        } else {
+
+            leftFloat = x
+
+            topFloat = y
+
+            widthFloat = width
+
+            heightFloat = height
+
+        }
+
+        val left = leftFloat.roundToInt().coerceIn(0, imageWidth)
+
+        val top = topFloat.roundToInt().coerceIn(0, imageHeight)
+
+        val right = (leftFloat + widthFloat).roundToInt().coerceIn(0, imageWidth)
+
+        val bottom = (topFloat + heightFloat).roundToInt().coerceIn(0, imageHeight)
+
+        if (right <= left || bottom <= top) {
+
+            return null
+
+        }
+
+        return Rect(left, top, right, bottom)
+
+    }
+
+}
+
+data class FaceCropCandidate(
+
+    val label: String,
+
+    val bitmap: Bitmap
+
+)
+
+data class SavedFaceCrop(
+
+    val path: String,
+
+    val width: Int,
+
+    val height: Int
+
+)
+
+data class VideoFaceCandidate(
+
+    val frameTimeMs: Long,
+
+    val qualityScore: Int,
+
+    val faceHash: Long,
+
+    var originalBytes: ByteArray?,
+
+    val originalBitmap: Bitmap?,
+
+    val originalWidth: Int,
+
+    val originalHeight: Int,
+
+    val uploadBytes: ByteArray,
+
+    val uploadWidth: Int,
+
+    val uploadHeight: Int,
+
+    val localFaceRect: FaceRect,
+
+    val faceAreaRatio: Float,
+
+    val yaw: Float,
+
+    val roll: Float,
+
+    val trackingId: Int? = null
+
+)
+
+data class CloudFaceSearchResult(
+
+    val experts: List<ExpertInfo>,
+
+    val message: String
+
+)
+

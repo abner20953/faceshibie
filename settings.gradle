@@ -1,0 +1,19 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // Vendor Maven repository for the wearable SDK.
+        maven { url 'https://maven.rokid.com/repository/maven-public/' }
+    }
+}
+
+rootProject.name = "FieldRecognitionCompanion"
+include ':app'
