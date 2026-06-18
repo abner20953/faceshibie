@@ -21,9 +21,13 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 
+import android.graphics.Canvas
+
 import android.graphics.Color
 
 import android.graphics.Matrix
+
+import android.graphics.Paint
 
 import android.graphics.Rect
 
@@ -34,6 +38,14 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 
 import android.media.ExifInterface
+
+import android.media.Image
+
+import android.media.MediaCodec
+
+import android.media.MediaExtractor
+
+import android.media.MediaFormat
 
 import android.media.MediaMetadataRetriever
 
@@ -3392,14 +3404,52 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val faceHitTimes = mutableListOf<Long>()
 
             val candidates = mutableListOf<VideoFaceCandidate>()
+            val rescueObservations = mutableListOf<VideoRescueObservation>()
 
-            
-
-            // 物理人脸轨迹信息，在粗扫阶段记录各 trackingId 对应的得分最高时刻
-
-            class TrackQuickInfo(val timeMs: Long, val score: Int)
-
-            val trackQuickBestMap = mutableMapOf<Int, TrackQuickInfo>()
+            val processQuickFrame: (Int, Long, Long, Bitmap) -> Unit = { index, targetTimeMs, actualTimeMs, frame ->
+                updateVideoProgress(
+                    batchId,
+                    "正在快速扫脸 ${index + 1}/${quickSampleTimes.size}",
+                    index,
+                    quickSampleTimes.size,
+                    finished = false
+                )
+                try {
+                    val detectionBitmap = resizeBitmapToMaxSide(frame, VIDEO_QUICK_PROCESS_MAX_SIDE)
+                    val faces = Tasks.await(videoFaceDetector.process(InputImage.fromBitmap(detectionBitmap, 0)))
+                    if (faces.isNotEmpty()) {
+                        faceHitTimes.add(targetTimeMs)
+                        val faceDetails = faces.joinToString(
+                            prefix = "[",
+                            postfix = "]",
+                            limit = 4,
+                            truncated = "..."
+                        ) { face ->
+                            "id=${face.trackingId ?: "-"},yaw=${face.headEulerAngleY.roundToInt()}," +
+                                "pitch=${face.headEulerAngleX.roundToInt()}," +
+                                "rect=${face.boundingBox.width()}x${face.boundingBox.height()}"
+                        }
+                        recordDiagnostic(
+                            "视频快速扫脸命中: targetMs=$targetTimeMs, actualMs=$actualTimeMs, faces=${faces.size}, " +
+                                "frame=${frame.width}x${frame.height}, detection=${detectionBitmap.width}x${detectionBitmap.height}, " +
+                            "details=$faceDetails"
+                        )
+                    }
+                    rescueObservations.add(
+                        buildVideoRescueObservation(
+                            frame,
+                            detectionBitmap,
+                            faces,
+                            targetTimeMs
+                        )
+                    )
+                    if (detectionBitmap !== frame) {
+                        detectionBitmap.recycle()
+                    }
+                } finally {
+                    frame.recycle()
+                }
+            }
 
             recordDiagnostic(
 
@@ -3407,183 +3457,46 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
                     "quickSamples=${quickSampleTimes.size}, first=${quickSampleTimes.firstOrNull() ?: 0}, " +
 
-                    "last=${quickSampleTimes.lastOrNull() ?: 0}"
+                    "last=${quickSampleTimes.lastOrNull() ?: 0}, mode=sequential-first"
 
             )
 
-            quickSampleTimes.forEachIndexed { index, timeMs ->
-
-                updateVideoProgress(
-
-                    batchId,
-
-                    "正在快速扫脸 ${index + 1}/${quickSampleTimes.size}",
-
-                    index,
-
-                    quickSampleTimes.size,
-
-                    finished = false
-
+            val sequentialProcessedTimes = scanVideoFramesSequential(
+                video.uri,
+                quickSampleTimes,
+                VIDEO_QUICK_DECODE_MAX_SIDE,
+                processQuickFrame
+            )
+            val fallbackTimes = quickSampleTimes.filterNot { it in sequentialProcessedTimes }
+            if (fallbackTimes.isNotEmpty()) {
+                recordDiagnostic(
+                    "视频快速扫脸回退取帧: processed=${sequentialProcessedTimes.size}, " +
+                        "fallback=${fallbackTimes.size}, total=${quickSampleTimes.size}"
                 )
-
-                val frame = extractVideoFrame(retriever, timeMs, precise = false, maxSide = 640)
-
+            }
+            fallbackTimes.forEach { timeMs ->
+                val index = quickSampleTimes.indexOf(timeMs)
+                val frame = extractVideoFrame(retriever, timeMs, precise = true, maxSide = VIDEO_QUICK_DECODE_MAX_SIDE)
                 if (frame == null) {
-
                     recordDiagnostic("视频快速抽帧失败: timeMs=$timeMs")
-
-                    return@forEachIndexed
-
+                } else {
+                    processQuickFrame(index, timeMs, timeMs, frame)
                 }
-
-                try {
-
-                    val detectionBitmap = resizeBitmapToMaxSide(frame, VIDEO_QUICK_PROCESS_MAX_SIDE)
-
-                    val faces = Tasks.await(videoFaceDetector.process(InputImage.fromBitmap(detectionBitmap, 0)))
-
-                    if (faces.isNotEmpty()) {
-
-                        faceHitTimes.add(timeMs)
-
-                        
-
-                        // 遍历检测到的人脸，更新各追踪轨迹的最佳粗扫帧
-
-                        faces.forEach { face ->
-
-                            val trackingId = face.trackingId
-
-                            if (trackingId != null) {
-
-                                val faceRectOnDetection = clippedRect(face.boundingBox, detectionBitmap.width, detectionBitmap.height)
-
-                                if (faceRectOnDetection != null) {
-                                    val scaleX = frame.width.toFloat() / detectionBitmap.width.toFloat()
-                                    val scaleY = frame.height.toFloat() / detectionBitmap.height.toFloat()
-                                    val faceRectOnFrame = Rect(
-                                        (faceRectOnDetection.left * scaleX).roundToInt().coerceIn(0, frame.width),
-                                        (faceRectOnDetection.top * scaleY).roundToInt().coerceIn(0, frame.height),
-                                        (faceRectOnDetection.right * scaleX).roundToInt().coerceIn(0, frame.width),
-                                        (faceRectOnDetection.bottom * scaleY).roundToInt().coerceIn(0, frame.height)
-                                    )
-                                    val score = scoreVideoFaceCandidate(frame, face, faceRectOnFrame)
-
-                                    val existing = trackQuickBestMap[trackingId]
-
-                                    if (existing == null || score > existing.score) {
-
-                                        trackQuickBestMap[trackingId] = TrackQuickInfo(timeMs, score)
-
-                                    }
-
-                                }
-
-                            }
-
-                        }
-
-                        recordDiagnostic(
-
-                            "视频快速扫脸命中: timeMs=$timeMs, faces=${faces.size}, " +
-
-                                "frame=${frame.width}x${frame.height}, detection=${detectionBitmap.width}x${detectionBitmap.height}"
-
-                        )
-
-                    }
-
-                    if (detectionBitmap !== frame) {
-
-                        detectionBitmap.recycle()
-
-                    }
-
-                } finally {
-
-                    frame.recycle()
-
-                }
-
             }
 
             if (faceHitTimes.isEmpty()) {
-
                 recordDiagnostic(
-
-                    "视频快速扫脸未命中: quickSamples=${quickSampleTimes.size}, " +
-
-                        "costMs=${System.currentTimeMillis() - startedAt}"
-
+                    "视频快速扫脸未命中，将尝试云端救援帧: quickSamples=${quickSampleTimes.size}, " +
+                        "rescueObservations=${rescueObservations.size}, costMs=${System.currentTimeMillis() - startedAt}"
                 )
-
-                finishVideoRecognition(batchId, "视频中未检测到可识别人脸", 0)
-
-                return
-
             }
 
-            // 智能剪枝精细抽帧窗口：优先针对每个 Track 的黄金时刻前后极窄区间采样，如果 TrackingID 映射为空则退回老方法
-
-            val fineSampleTimes = if (trackQuickBestMap.isNotEmpty()) {
-
-                val times = TreeSet<Long>()
-
-                trackQuickBestMap.forEach { (trackingId, bestInfo) ->
-
-                    val hitTime = bestInfo.timeMs
-
-                    val start = (hitTime - VIDEO_FINE_WINDOW_BEFORE_MS).coerceAtLeast(0L)
-
-                    val end = (hitTime + VIDEO_FINE_WINDOW_AFTER_MS).coerceAtMost(durationMs.coerceAtLeast(0L))
-
-                    var timeMs = start
-
-                    while (timeMs <= end) {
-
-                        times.add(timeMs)
-
-                        timeMs += VIDEO_FINE_SAMPLE_INTERVAL_MS
-
-                    }
-
-                    times.add(hitTime.coerceIn(0L, durationMs.coerceAtLeast(0L)))
-
-                    recordDiagnostic("视频Track黄金窗口剪枝: trackingId=$trackingId, bestQuickTimeMs=$hitTime, window=[$start, $end]")
-
-                }
-
-                
-
-                if (times.size <= VIDEO_MAX_FINE_SAMPLE_FRAMES) {
-
-                    times.toList()
-
-                } else {
-
-                    val sorted = times.toList()
-
-                    val sampled = mutableListOf<Long>()
-
-                    for (i in 0 until VIDEO_MAX_FINE_SAMPLE_FRAMES) {
-
-                        val sourceIndex = if (VIDEO_MAX_FINE_SAMPLE_FRAMES == 1) 0 else (i * (sorted.size - 1).toFloat() / (VIDEO_MAX_FINE_SAMPLE_FRAMES - 1).toFloat()).roundToInt()
-
-                        sampled.add(sorted[sourceIndex.coerceIn(0, sorted.lastIndex)])
-
-                    }
-
-                    sampled.distinct()
-
-                }
-
+            // 每个粗扫命中都应进入精扫窗口。侧脸等困难角度可能没有稳定 trackingId，
+            // 不能因为其他人脸拿到了 trackingId 就忽略这些命中时刻。
+            val fineSampleTimes = if (faceHitTimes.isEmpty()) {
+                emptyList()
             } else {
-
-                recordDiagnostic("视频未追踪到有效ID，退回全局命中点精扫")
-
                 buildVideoFocusedSampleTimes(faceHitTimes, durationMs)
-
             }
 
             recordDiagnostic(
@@ -3664,109 +3577,35 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             }
 
-            // 全局优选物理去重流程：
+            val localUploadCandidates = selectVideoUploadCandidatesByPersons(candidates)
+            val rescueCandidates = buildVideoRescueCandidates(
+                video,
+                retriever,
+                rescueObservations,
+                localUploadCandidates,
+                (VIDEO_MAX_CLOUD_UPLOADS - localUploadCandidates.size).coerceAtLeast(0)
+            )
+            val uploadCandidates = mergeVideoLocalAndRescueCandidates(
+                localUploadCandidates,
+                rescueCandidates
+            )
+                .take(VIDEO_MAX_CLOUD_UPLOADS)
 
-            val finalCandidates = mutableListOf<VideoFaceCandidate>()
-
-            
-
-            // 1. 优先按 trackingId 分组，同一 trackingId 轨迹仅保留质量分最高的一个
-
-            val withTrackId = candidates.filter { it.trackingId != null }
-
-            val groupedByTrack = withTrackId.groupBy { it.trackingId!! }
-
-            groupedByTrack.forEach { (trackingId, trackCandidates) ->
-
-                val bestOfTrack = trackCandidates.maxByOrNull { it.qualityScore }
-
-                if (bestOfTrack != null) {
-
-                    finalCandidates.add(bestOfTrack)
-
-                    recordDiagnostic(
-
-                        "视频Track物理优选: trackingId=$trackingId, 候选数=${trackCandidates.size}, " +
-
-                            "选中时刻=${bestOfTrack.frameTimeMs}ms, 选中分数=${bestOfTrack.qualityScore}"
-
-                    )
-
-                }
-
-            }
-
-            
-
-            // 2. 无 trackingId 人脸按 aHash 汉明距离去重兜底
-
-            val withoutTrackId = candidates.filter { it.trackingId == null }.sortedByDescending { it.qualityScore }
-
-            withoutTrackId.forEach { candidate ->
-
-                val duplicate = finalCandidates.any {
-
-                    hammingDistance(it.faceHash, candidate.faceHash) <= VIDEO_FACE_HASH_DUP_DISTANCE
-
-                }
-
-                if (!duplicate) {
-
-                    finalCandidates.add(candidate)
-
-                    recordDiagnostic("视频无TrackID人脸采用 (aHash去重): timeMs=${candidate.frameTimeMs}ms, score=${candidate.qualityScore}")
-
-                } else {
-
-                    recordDiagnostic("视频无TrackID人脸舍弃 (aHash重复): timeMs=${candidate.frameTimeMs}ms, score=${candidate.qualityScore}")
-
-                }
-
-            }
-
-            
-
-            // 3. 跨 Track 再次通过 aHash 去重做安全校验，防止同一个人由于转头导致 ID 突变而上传两次
-
-            val sortedFinal = finalCandidates.sortedByDescending { it.qualityScore }
-
-            val uploadCandidatesTemp = mutableListOf<VideoFaceCandidate>()
-
-            sortedFinal.forEach { candidate ->
-
-                val duplicate = uploadCandidatesTemp.any {
-
-                    hammingDistance(it.faceHash, candidate.faceHash) <= VIDEO_CROSS_TRACK_HASH_DUP_DISTANCE
-
-                }
-
-                if (!duplicate) {
-
-                    uploadCandidatesTemp.add(candidate)
-
-                } else {
-
-                    recordDiagnostic(
-
-                        "视频跨Track二级去重拦截: 舍弃时刻=${candidate.frameTimeMs}ms, 舍弃ID=${candidate.trackingId}, 舍弃分数=${candidate.qualityScore}, 保留了更优的相似轨迹"
-
-                    )
-
-                }
-
-            }
-
-            
-
-            // 只保留质量得分在 150 及其以上的人脸，过滤极端模糊或因角度偏侧严重扣分的无效人脸，最多上传最大限制数
-
-            val uploadCandidates = uploadCandidatesTemp.filter { it.qualityScore >= 10 }.take(VIDEO_MAX_CLOUD_UPLOADS)
+            recordDiagnostic(
+                "视频云端上传计划: total=${uploadCandidates.size}, localPersons=${localUploadCandidates.size}, " +
+                    "rescuePersons=${rescueCandidates.size}, candidates=${uploadCandidates.joinToString { candidate ->
+                        "${candidate.frameTimeMs}ms/${if (candidate.isRescueFrame) "rescue" else "local"}/" +
+                            "q=${candidate.qualityScore}/hash=${java.lang.Long.toHexString(candidate.faceHash)}"
+                    }}"
+            )
 
             recordDiagnostic(
 
                 "视频本地候选完成: quickHits=${faceHitTimes.size}, fineSamples=${fineSampleTimes.size}, " +
 
-                    "localCandidates=${candidates.size}, uploadCandidates=${uploadCandidates.size}, " +
+                    "localCandidates=${candidates.size}, localPersons=${localUploadCandidates.size}, " +
+                    "rescueObservations=${rescueObservations.size}, " +
+                    "rescueCandidates=${rescueCandidates.size}, uploadCandidates=${uploadCandidates.size}, " +
 
                     "costMs=${System.currentTimeMillis() - startedAt}"
 
@@ -3797,9 +3636,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return
             }
 
-            // 并行云端上传识别（最多 3 路并发），线程安全去重
-            val seenExperts = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-            val savedCountAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+            // 并行云端上传识别，云端返回多少条结果就保留多少条。
+            val cloudMatches = java.util.Collections.synchronizedList(mutableListOf<VideoCloudMatch>())
             val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
             val totalUploads = uploadCandidates.size
             val parallelism = 3.coerceAtMost(totalUploads)
@@ -3811,32 +3649,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             uploadCandidates.forEachIndexed { index, candidate ->
                 uploadPool.submit {
                     try {
-                        if (savedCountAtomic.get() >= VIDEO_MAX_SAVED_EXPERTS) {
-                            return@submit
-                        }
-
                         val base64Data = Base64.encodeToString(candidate.uploadBytes, Base64.NO_WRAP)
 
+                        val requestMaxFaceNum = if (candidate.isRescueFrame) {
+                            VIDEO_RESCUE_CLOUD_MAX_FACE_NUM
+                        } else {
+                            1
+                        }
                         val result = searchFaceOnCloudSync(
                             "data:image/jpeg;base64,$base64Data",
-                            VIDEO_CLOUD_MAX_FACE_NUM,
-                            "视频帧 ${index + 1}/$totalUploads ${candidate.frameTimeMs}ms"
+                            requestMaxFaceNum,
+                            "视频帧 ${index + 1}/$totalUploads ${candidate.frameTimeMs}ms rescue=${candidate.isRescueFrame}"
                         )
 
                         if (result.experts.isNotEmpty()) {
-                            synchronized(this@MainActivity) {
-                                val added = saveVideoExpertRecords(video, candidate, result.experts, seenExperts)
-                                savedCountAtomic.addAndGet(added)
-
-                                recordDiagnostic(
-                                    "视频候选云端命中: timeMs=${candidate.frameTimeMs}, experts=${result.experts.size}, " +
-                                        "newRecords=$added, totalSaved=${savedCountAtomic.get()}"
-                                )
-
-                                if (savedCountAtomic.get() >= VIDEO_MAX_SAVED_EXPERTS) {
-                                    recordDiagnostic("视频识别达到保存上限: max=$VIDEO_MAX_SAVED_EXPERTS")
-                                }
+                            val expertsToSave = result.experts
+                            expertsToSave.forEach { expert ->
+                                cloudMatches.add(VideoCloudMatch(candidate, expert))
                             }
+                            recordDiagnostic(
+                                "视频候选云端命中: timeMs=${candidate.frameTimeMs}, rescue=${candidate.isRescueFrame}, " +
+                                    "experts=${result.experts.size}, accepted=${expertsToSave.size}, " +
+                                    "pendingMatches=${cloudMatches.size}"
+                            )
                         } else {
                             recordDiagnostic(
                                 "视频候选云端未命中: timeMs=${candidate.frameTimeMs}, " +
@@ -3860,7 +3695,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             uploadPool.shutdown()
 
-            val savedCount = savedCountAtomic.get()
+            var savedCount = 0
+            cloudMatches.sortedBy { it.candidate.frameTimeMs }.forEach { match ->
+                savedCount += saveVideoExpertRecords(
+                    video,
+                    match.candidate,
+                    listOf(match.expert)
+                )
+            }
+            recordDiagnostic(
+                "视频云端结果汇总: raw=${cloudMatches.size}, saved=$savedCount, dedup=false"
+            )
             val message = if (savedCount > 0) {
                 "视频识别完成，发现 $savedCount 名专家"
             } else {
@@ -3901,6 +3746,225 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private fun scanVideoFramesSequential(
+        uri: Uri,
+        targetTimesMs: List<Long>,
+        maxSide: Int,
+        onFrame: (index: Int, targetTimeMs: Long, actualTimeMs: Long, bitmap: Bitmap) -> Unit
+    ): Set<Long> {
+        if (targetTimesMs.isEmpty()) {
+            return emptySet()
+        }
+        val processedTimes = linkedSetOf<Long>()
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        try {
+            extractor.setDataSource(this, uri, null)
+            var videoTrack = -1
+            var format: MediaFormat? = null
+            for (trackIndex in 0 until extractor.trackCount) {
+                val candidate = extractor.getTrackFormat(trackIndex)
+                val mime = candidate.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (mime.startsWith("video/")) {
+                    videoTrack = trackIndex
+                    format = candidate
+                    break
+                }
+            }
+            if (videoTrack < 0 || format == null) {
+                recordDiagnostic("视频顺序解码不可用: 未找到视频轨道")
+                return emptySet()
+            }
+
+            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+            val rotationDegrees = if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                format.getInteger(MediaFormat.KEY_ROTATION)
+            } else {
+                0
+            }
+            format.setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+            )
+            extractor.selectTrack(videoTrack)
+            codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+            var targetIndex = 0
+            var idleLoops = 0
+            val startedAt = System.currentTimeMillis()
+
+            while (!outputDone && targetIndex < targetTimesMs.size && idleLoops < VIDEO_CODEC_MAX_IDLE_LOOPS) {
+                var madeProgress = false
+                if (!inputDone) {
+                    val inputIndex = codec.dequeueInputBuffer(VIDEO_CODEC_DEQUEUE_TIMEOUT_US)
+                    if (inputIndex >= 0) {
+                        val inputBuffer = codec.getInputBuffer(inputIndex)
+                        val sampleSize = if (inputBuffer != null) {
+                            extractor.readSampleData(inputBuffer, 0)
+                        } else {
+                            -1
+                        }
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(
+                                inputIndex,
+                                0,
+                                0,
+                                0L,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(
+                                inputIndex,
+                                0,
+                                sampleSize,
+                                extractor.sampleTime.coerceAtLeast(0L),
+                                0
+                            )
+                            extractor.advance()
+                        }
+                        madeProgress = true
+                    }
+                }
+
+                when (val outputIndex = codec.dequeueOutputBuffer(bufferInfo, VIDEO_CODEC_DEQUEUE_TIMEOUT_US)) {
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        recordDiagnostic("视频顺序解码输出格式: ${codec.outputFormat}")
+                        madeProgress = true
+                    }
+                    else -> if (outputIndex >= 0) {
+                        madeProgress = true
+                        val actualTimeMs = bufferInfo.presentationTimeUs.coerceAtLeast(0L) / 1000L
+                        if (bufferInfo.size > 0 && actualTimeMs >= targetTimesMs[targetIndex]) {
+                            var selectedTargetIndex = targetIndex
+                            while (selectedTargetIndex + 1 < targetTimesMs.size &&
+                                targetTimesMs[selectedTargetIndex + 1] <= actualTimeMs
+                            ) {
+                                selectedTargetIndex += 1
+                            }
+                            val targetTimeMs = targetTimesMs[selectedTargetIndex]
+                            val image = codec.getOutputImage(outputIndex)
+                            if (image != null) {
+                                image.use {
+                                    var bitmap = yuvImageToScaledBitmap(it, maxSide)
+                                    bitmap = applyVideoRotation(bitmap, rotationDegrees)
+                                    onFrame(selectedTargetIndex, targetTimeMs, actualTimeMs, bitmap)
+                                    processedTimes.add(targetTimeMs)
+                                }
+                            }
+                            targetIndex = selectedTargetIndex + 1
+                        }
+                        outputDone = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                        codec.releaseOutputBuffer(outputIndex, false)
+                    }
+                }
+
+                idleLoops = if (madeProgress) 0 else idleLoops + 1
+            }
+
+            recordDiagnostic(
+                "视频顺序解码完成: processed=${processedTimes.size}/${targetTimesMs.size}, " +
+                    "rotation=$rotationDegrees, costMs=${System.currentTimeMillis() - startedAt}, " +
+                    "inputDone=$inputDone, outputDone=$outputDone, idleLoops=$idleLoops"
+            )
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "视频顺序解码失败，回退精确取帧: processed=${processedTimes.size}/${targetTimesMs.size}",
+                e
+            )
+        } finally {
+            try {
+                codec?.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                codec?.release()
+            } catch (_: Exception) {
+            }
+            try {
+                extractor.release()
+            } catch (_: Exception) {
+            }
+        }
+        return processedTimes
+    }
+
+    private fun yuvImageToScaledBitmap(image: Image, maxSide: Int): Bitmap {
+        require(image.planes.size >= 3) { "Unsupported decoded image planes=${image.planes.size}" }
+        val crop = image.cropRect
+        val sourceWidth = crop.width().coerceAtLeast(1)
+        val sourceHeight = crop.height().coerceAtLeast(1)
+        val scale = if (maxSide > 0) {
+            minOf(1f, maxSide.toFloat() / maxOf(sourceWidth, sourceHeight).toFloat())
+        } else {
+            1f
+        }
+        val targetWidth = (sourceWidth * scale).roundToInt().coerceAtLeast(1)
+        val targetHeight = (sourceHeight * scale).roundToInt().coerceAtLeast(1)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+        val pixels = IntArray(targetWidth * targetHeight)
+
+        for (targetY in 0 until targetHeight) {
+            val sourceY = crop.top + (targetY * sourceHeight / targetHeight)
+            for (targetX in 0 until targetWidth) {
+                val sourceX = crop.left + (targetX * sourceWidth / targetWidth)
+                val yValue = readImagePlaneValue(yBuffer, yPlane, sourceX, sourceY)
+                val chromaX = sourceX / 2
+                val chromaY = sourceY / 2
+                val uValue = readImagePlaneValue(uBuffer, uPlane, chromaX, chromaY) - 128
+                val vValue = readImagePlaneValue(vBuffer, vPlane, chromaX, chromaY) - 128
+                val luminance = (yValue - 16).coerceAtLeast(0)
+                val red = ((298 * luminance + 409 * vValue + 128) shr 8).coerceIn(0, 255)
+                val green = ((298 * luminance - 100 * uValue - 208 * vValue + 128) shr 8).coerceIn(0, 255)
+                val blue = ((298 * luminance + 516 * uValue + 128) shr 8).coerceIn(0, 255)
+                pixels[targetY * targetWidth + targetX] = Color.rgb(red, green, blue)
+            }
+        }
+        return Bitmap.createBitmap(pixels, targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun readImagePlaneValue(
+        buffer: java.nio.ByteBuffer,
+        plane: Image.Plane,
+        x: Int,
+        y: Int
+    ): Int {
+        val index = buffer.position() + y * plane.rowStride + x * plane.pixelStride
+        if (index < buffer.position() || index >= buffer.limit()) {
+            return 128
+        }
+        return buffer.get(index).toInt() and 0xFF
+    }
+
+    private fun applyVideoRotation(bitmap: Bitmap, rotationDegrees: Int): Bitmap {
+        val normalized = ((rotationDegrees % 360) + 360) % 360
+        if (normalized == 0) {
+            return bitmap
+        }
+        return try {
+            val matrix = Matrix().apply { postRotate(normalized.toFloat()) }
+            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated !== bitmap) {
+                bitmap.recycle()
+            }
+            rotated
+        } catch (e: Exception) {
+            recordDiagnostic("视频顺序解码方向修正失败: rotation=$rotationDegrees", e)
+            bitmap
+        }
+    }
+
     private fun buildVideoQuickSampleTimes(durationMs: Long): List<Long> {
 
         if (durationMs <= 0L) {
@@ -3918,36 +3982,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             VIDEO_QUICK_SAMPLE_INTERVAL_MS
 
         } else {
-
-            maxOf(
-
-                VIDEO_QUICK_SAMPLE_INTERVAL_MS,
-
-                durationMs / (VIDEO_MAX_QUICK_SAMPLE_FRAMES - 1).coerceAtLeast(1)
-
-            )
-
+            VIDEO_QUICK_SAMPLE_INTERVAL_MS
         }
 
-        val times = mutableListOf<Long>()
-
-        var timeMs = 0L
-
-        while (timeMs <= durationMs && times.size < VIDEO_MAX_QUICK_SAMPLE_FRAMES) {
-
-            times.add(timeMs)
-
-            timeMs += intervalMs
-
+        val naturalSampleCount = (durationMs / intervalMs + 1L).coerceAtLeast(1L)
+        if (naturalSampleCount <= VIDEO_MAX_QUICK_SAMPLE_FRAMES) {
+            val times = mutableListOf<Long>()
+            var timeMs = 0L
+            while (timeMs <= durationMs) {
+                times.add(timeMs)
+                timeMs += intervalMs
+            }
+            if (times.lastOrNull() != durationMs) {
+                times.add(durationMs)
+            }
+            return times.distinct()
         }
 
-        if (times.lastOrNull() != durationMs && times.size < VIDEO_MAX_QUICK_SAMPLE_FRAMES) {
-
-            times.add(durationMs.coerceAtLeast(0L))
-
-        }
-
-        return times.distinct()
+        return (0 until VIDEO_MAX_QUICK_SAMPLE_FRAMES).map { index ->
+            if (VIDEO_MAX_QUICK_SAMPLE_FRAMES == 1) {
+                0L
+            } else {
+                (index * durationMs.toDouble() / (VIDEO_MAX_QUICK_SAMPLE_FRAMES - 1).toDouble())
+                    .toLong()
+                    .coerceIn(0L, durationMs)
+            }
+        }.distinct()
 
     }
 
@@ -4009,6 +4069,956 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         return sampled.distinct()
 
+    }
+
+    private fun selectVideoUploadCandidatesByPersons(
+        candidates: List<VideoFaceCandidate>
+    ): List<VideoFaceCandidate> {
+        val trackingCandidates = candidates
+            .sortedBy { it.frameTimeMs }
+        if (trackingCandidates.isEmpty()) {
+            return emptyList()
+        }
+
+        data class PersonCluster(
+            val candidates: MutableList<VideoFaceCandidate>,
+            val trackingIds: MutableSet<Int>
+        )
+
+        val personClusters = mutableListOf<PersonCluster>()
+        trackingCandidates.groupBy { it.frameTimeMs }
+            .toSortedMap()
+            .forEach { (_, frameCandidates) ->
+                data class Match(
+                    val clusterIndex: Int,
+                    val candidateIndex: Int,
+                    val score: Int
+                )
+
+                val matches = mutableListOf<Match>()
+                personClusters.forEachIndexed { clusterIndex, cluster ->
+                    frameCandidates.forEachIndexed { candidateIndex, candidate ->
+                        val score = videoPersonTrackMatchScore(cluster.candidates, candidate)
+                        if (score >= VIDEO_PERSON_MATCH_MIN_SCORE) {
+                            matches.add(Match(clusterIndex, candidateIndex, score))
+                        }
+                    }
+                }
+
+                val assignedClusters = mutableSetOf<Int>()
+                val assignedCandidates = mutableSetOf<Int>()
+                matches.sortedByDescending { it.score }.forEach { match ->
+                    if (match.clusterIndex !in assignedClusters &&
+                        match.candidateIndex !in assignedCandidates
+                    ) {
+                        val candidate = frameCandidates[match.candidateIndex]
+                        val cluster = personClusters[match.clusterIndex]
+                        cluster.candidates.add(candidate)
+                        candidate.trackingId?.let { cluster.trackingIds.add(it) }
+                        assignedClusters.add(match.clusterIndex)
+                        assignedCandidates.add(match.candidateIndex)
+                    }
+                }
+
+                frameCandidates.forEachIndexed { candidateIndex, candidate ->
+                    if (candidateIndex !in assignedCandidates) {
+                        personClusters.add(
+                            PersonCluster(
+                                candidates = mutableListOf(candidate),
+                                trackingIds = candidate.trackingId?.let { mutableSetOf(it) }
+                                    ?: mutableSetOf()
+                            )
+                        )
+                    }
+                }
+            }
+
+        val stitchedClusters = stitchVideoPersonTracklets(personClusters.map { it.candidates })
+        val selected = stitchedClusters.mapNotNull { cluster ->
+            val best = cluster.maxByOrNull { it.qualityScore } ?: return@mapNotNull null
+            val isUsableSideProfile = abs(best.yaw) >= VIDEO_SIDE_PROFILE_MIN_YAW &&
+                best.qualityScore >= VIDEO_SIDE_PROFILE_MIN_UPLOAD_QUALITY_SCORE
+            if (best.qualityScore < VIDEO_MIN_UPLOAD_QUALITY_SCORE && !isUsableSideProfile) {
+                return@mapNotNull null
+            }
+            best.personTrackSignatures = cluster.map { it.toVideoPersonSignature() }
+            best
+        }.sortedByDescending { it.qualityScore }
+
+        recordDiagnostic(
+            "视频人物候选聚合: localCandidates=${candidates.size}, trackingCandidates=${trackingCandidates.size}, " +
+                "initialPersons=${personClusters.size}, persons=${stitchedClusters.size}, selected=${selected.size}, " +
+                "clusters=${stitchedClusters.joinToString(limit = 10, truncated = "...") { cluster ->
+                    val best = cluster.maxByOrNull { it.qualityScore }
+                    "count=${cluster.size}/ids=${cluster.mapNotNull { it.trackingId }.toSet()}/" +
+                        "best=${best?.frameTimeMs ?: -1}ms/q=${best?.qualityScore ?: 0}/" +
+                        "yaw=${best?.yaw?.roundToInt() ?: 0}/" +
+                        "center=${best?.faceCenterX?.let { "%.2f".format(Locale.ROOT, it) }}," +
+                        "${best?.faceCenterY?.let { "%.2f".format(Locale.ROOT, it) }}/" +
+                        "range=${cluster.minOfOrNull { it.frameTimeMs } ?: -1}-" +
+                        "${cluster.maxOfOrNull { it.frameTimeMs } ?: -1}ms"
+                }}"
+        )
+        return selected
+            .take(VIDEO_MAX_CLOUD_UPLOADS)
+    }
+
+    private fun VideoFaceCandidate.toVideoPersonSignature(): VideoPersonSignature {
+        return VideoPersonSignature(
+            frameTimeMs = frameTimeMs,
+            qualityScore = qualityScore,
+            differenceHash = differenceHash,
+            mirroredDifferenceHash = mirroredDifferenceHash,
+            appearanceHistogram = appearanceHistogram,
+            faceAreaRatio = faceAreaRatio,
+            faceCenterX = faceCenterX,
+            faceCenterY = faceCenterY,
+            yaw = yaw
+        )
+    }
+
+    private fun stitchVideoPersonTracklets(
+        sourceClusters: List<List<VideoFaceCandidate>>
+    ): List<MutableList<VideoFaceCandidate>> {
+        val clusters = sourceClusters
+            .filter { it.isNotEmpty() }
+            .map { it.sortedBy { candidate -> candidate.frameTimeMs }.toMutableList() }
+            .toMutableList()
+        var mergeCount = 0
+        while (true) {
+            var bestLeft = -1
+            var bestRight = -1
+            var bestScore = Int.MIN_VALUE
+            for (leftIndex in 0 until clusters.lastIndex) {
+                for (rightIndex in leftIndex + 1 until clusters.size) {
+                    val score = videoTrackletStitchScore(
+                        clusters[leftIndex],
+                        clusters[rightIndex]
+                    )
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestLeft = leftIndex
+                        bestRight = rightIndex
+                    }
+                }
+            }
+            if (bestLeft < 0 || bestScore < VIDEO_TRACKLET_STITCH_MIN_SCORE) {
+                break
+            }
+            val left = clusters[bestLeft]
+            val right = clusters[bestRight]
+            recordDiagnostic(
+                "视频人物轨迹二次拼接: score=$bestScore, " +
+                    "left=${left.minOf { it.frameTimeMs }}-${left.maxOf { it.frameTimeMs }}ms, " +
+                    "right=${right.minOf { it.frameTimeMs }}-${right.maxOf { it.frameTimeMs }}ms"
+            )
+            left.addAll(right)
+            left.sortBy { it.frameTimeMs }
+            clusters.removeAt(bestRight)
+            mergeCount += 1
+        }
+        recordDiagnostic(
+            "视频人物轨迹二次拼接完成: source=${sourceClusters.size}, " +
+                "merged=$mergeCount, result=${clusters.size}"
+        )
+        return clusters
+    }
+
+    private fun videoTrackletStitchScore(
+        first: List<VideoFaceCandidate>,
+        second: List<VideoFaceCandidate>
+    ): Int {
+        val left: List<VideoFaceCandidate>
+        val right: List<VideoFaceCandidate>
+        if (first.minOf { it.frameTimeMs } <= second.minOf { it.frameTimeMs }) {
+            left = first
+            right = second
+        } else {
+            left = second
+            right = first
+        }
+        val leftEnd = left.maxOf { it.frameTimeMs }
+        val rightStart = right.minOf { it.frameTimeMs }
+        val gapMs = rightStart - leftEnd
+        if (gapMs < VIDEO_TRACKLET_MIN_NON_OVERLAP_MS ||
+            gapMs > VIDEO_TRACKLET_MAX_STITCH_GAP_MS
+        ) {
+            return Int.MIN_VALUE
+        }
+
+        val leftRepresentatives = left.sortedByDescending { it.qualityScore }
+            .take(VIDEO_TRACKLET_REPRESENTATIVE_COUNT)
+        val rightRepresentatives = right.sortedByDescending { it.qualityScore }
+            .take(VIDEO_TRACKLET_REPRESENTATIVE_COUNT)
+        var bestAppearanceScore = Int.MIN_VALUE
+        leftRepresentatives.forEach { leftCandidate ->
+            rightRepresentatives.forEach { rightCandidate ->
+                val dHashDistance = minOf(
+                    hammingDistance(leftCandidate.differenceHash, rightCandidate.differenceHash),
+                    hammingDistance(leftCandidate.differenceHash, rightCandidate.mirroredDifferenceHash),
+                    hammingDistance(leftCandidate.mirroredDifferenceHash, rightCandidate.differenceHash)
+                )
+                val averageHashDistance = hammingDistance(
+                    leftCandidate.faceHash,
+                    rightCandidate.faceHash
+                )
+                val histogramSimilarity = histogramCosineSimilarity(
+                    leftCandidate.appearanceHistogram,
+                    rightCandidate.appearanceHistogram
+                )
+                val appearanceScore = 100 -
+                    dHashDistance * VIDEO_TRACKLET_DHASH_PENALTY -
+                    averageHashDistance * VIDEO_TRACKLET_AHASH_PENALTY +
+                    (histogramSimilarity * VIDEO_TRACKLET_HISTOGRAM_BONUS).roundToInt()
+                bestAppearanceScore = maxOf(bestAppearanceScore, appearanceScore)
+            }
+        }
+        if (bestAppearanceScore < VIDEO_TRACKLET_MIN_APPEARANCE_SCORE) {
+            return Int.MIN_VALUE
+        }
+        return bestAppearanceScore -
+            (gapMs / VIDEO_TRACKLET_GAP_PENALTY_DIVISOR_MS).toInt()
+    }
+
+    private fun histogramCosineSimilarity(left: IntArray, right: IntArray): Float {
+        if (left.isEmpty() || right.isEmpty() || left.size != right.size) {
+            return 0f
+        }
+        var dot = 0.0
+        var leftNorm = 0.0
+        var rightNorm = 0.0
+        left.indices.forEach { index ->
+            val leftValue = left[index].toDouble()
+            val rightValue = right[index].toDouble()
+            dot += leftValue * rightValue
+            leftNorm += leftValue * leftValue
+            rightNorm += rightValue * rightValue
+        }
+        if (leftNorm <= 0.0 || rightNorm <= 0.0) {
+            return 0f
+        }
+        return (dot / kotlin.math.sqrt(leftNorm * rightNorm)).toFloat()
+    }
+
+    private fun videoPersonTrackMatchScore(
+        trackCandidates: List<VideoFaceCandidate>,
+        candidate: VideoFaceCandidate
+    ): Int {
+        val last = trackCandidates.maxByOrNull { it.frameTimeMs } ?: return Int.MIN_VALUE
+        val timeGapMs = candidate.frameTimeMs - last.frameTimeMs
+        if (timeGapMs <= 0L || timeGapMs > VIDEO_PERSON_TRACK_MAX_GAP_MS) {
+            return Int.MIN_VALUE
+        }
+
+        val previous = trackCandidates
+            .asSequence()
+            .filter { it.frameTimeMs < last.frameTimeMs }
+            .maxByOrNull { it.frameTimeMs }
+        val predictedCenterX: Float
+        val predictedCenterY: Float
+        if (previous != null) {
+            val previousGapMs = (last.frameTimeMs - previous.frameTimeMs).coerceAtLeast(1L)
+            val predictionRatio = (
+                timeGapMs.toFloat() / previousGapMs.toFloat()
+                ).coerceIn(0f, VIDEO_PERSON_MAX_PREDICTION_RATIO)
+            predictedCenterX = last.faceCenterX +
+                (last.faceCenterX - previous.faceCenterX) * predictionRatio
+            predictedCenterY = last.faceCenterY +
+                (last.faceCenterY - previous.faceCenterY) * predictionRatio
+        } else {
+            predictedCenterX = last.faceCenterX
+            predictedCenterY = last.faceCenterY
+        }
+
+        val dx = candidate.faceCenterX - predictedCenterX
+        val dy = candidate.faceCenterY - predictedCenterY
+        val centerDistance = kotlin.math.sqrt(dx * dx + dy * dy)
+        val allowedCenterDistance = (
+            VIDEO_PERSON_BASE_CENTER_DISTANCE +
+                timeGapMs.toFloat() / VIDEO_PERSON_TRACK_MAX_GAP_MS.toFloat() *
+                VIDEO_PERSON_CENTER_DISTANCE_GROWTH
+            ).coerceAtMost(VIDEO_PERSON_MAX_CENTER_DISTANCE)
+        val sizeRatio = videoCandidateSizeRatio(last.faceAreaRatio, candidate.faceAreaRatio)
+        val hashDistance = hammingDistance(last.faceHash, candidate.faceHash)
+        val sameTrackingId = last.trackingId != null &&
+            last.trackingId == candidate.trackingId
+        val strongAppearanceMatch = hashDistance <= VIDEO_PERSON_STRONG_HASH_DISTANCE
+
+        if (!sameTrackingId && !strongAppearanceMatch &&
+            (centerDistance > allowedCenterDistance ||
+                sizeRatio > VIDEO_PERSON_MAX_SIZE_RATIO)
+        ) {
+            return Int.MIN_VALUE
+        }
+
+        var score = VIDEO_PERSON_BASE_MATCH_SCORE
+        score -= (centerDistance * VIDEO_PERSON_CENTER_PENALTY).roundToInt()
+        score -= (timeGapMs / VIDEO_PERSON_TIME_PENALTY_DIVISOR_MS).toInt()
+        score -= (kotlin.math.ln(sizeRatio.toDouble()) *
+            VIDEO_PERSON_SIZE_RATIO_PENALTY).roundToInt()
+        if (sameTrackingId) {
+            score += VIDEO_PERSON_TRACKING_ID_BONUS
+        }
+        if (hashDistance <= VIDEO_PERSON_RELAXED_HASH_DISTANCE) {
+            score += (VIDEO_PERSON_RELAXED_HASH_DISTANCE - hashDistance) *
+                VIDEO_PERSON_HASH_BONUS_PER_BIT
+        }
+        return score
+    }
+
+    private fun videoCandidateSizeRatio(leftArea: Float, rightArea: Float): Float {
+        val smaller = minOf(leftArea, rightArea).coerceAtLeast(0.000001f)
+        val larger = maxOf(leftArea, rightArea).coerceAtLeast(smaller)
+        return larger / smaller
+    }
+
+    private fun buildVideoRescueObservation(
+        bitmap: Bitmap,
+        detectionBitmap: Bitmap,
+        faces: List<Face>,
+        frameTimeMs: Long
+    ): VideoRescueObservation {
+        data class DetectedFaceRegion(
+            val rect: FaceRect,
+            val reliable: Boolean
+        )
+
+        val detectedRegions = faces.mapNotNull { face ->
+            clippedRect(face.boundingBox, detectionBitmap.width, detectionBitmap.height)?.let { rect ->
+                val faceAreaRatio = rect.width().toFloat() * rect.height().toFloat() /
+                    (detectionBitmap.width.toFloat() * detectionBitmap.height.toFloat())
+                        .coerceAtLeast(1f)
+                val shouldMaskAsReliableLocalFace =
+                    rect.width() >= VIDEO_RESCUE_MASK_MIN_FACE_SIDE &&
+                        rect.height() >= VIDEO_RESCUE_MASK_MIN_FACE_SIDE &&
+                        faceAreaRatio >= VIDEO_MIN_FACE_AREA_RATIO &&
+                        abs(face.headEulerAngleY) <= VIDEO_RESCUE_MASK_MAX_YAW &&
+                        abs(face.headEulerAngleX) <= VIDEO_RESCUE_MASK_MAX_PITCH
+                DetectedFaceRegion(
+                    rect = FaceRect(
+                        x = rect.left.toFloat() / detectionBitmap.width.toFloat(),
+                        y = rect.top.toFloat() / detectionBitmap.height.toFloat(),
+                        width = rect.width().toFloat() / detectionBitmap.width.toFloat(),
+                        height = rect.height().toFloat() / detectionBitmap.height.toFloat()
+                    ),
+                    reliable = shouldMaskAsReliableLocalFace
+                )
+            }
+        }
+        val knownFaceRects = detectedRegions.filter { it.reliable }.map { it.rect }
+        val unmaskedDetectedFace = detectedRegions
+            .filterNot { it.reliable }
+            .maxByOrNull { it.rect.width * it.rect.height }
+            ?.rect
+        val analysis = if (unmaskedDetectedFace != null) {
+            analyzeVideoRescueDetectedFace(bitmap, unmaskedDetectedFace)
+        } else {
+            analyzeVideoRescueRegion(bitmap, knownFaceRects)
+        }
+        val sharpnessRect = analysis.regionRect?.toPixelRect(bitmap.width, bitmap.height)
+        val sharpness = sharpnessRect?.let { estimateFaceSharpness(bitmap, it) } ?: 0
+        val score = sharpness +
+            (analysis.skinRatio * VIDEO_RESCUE_SKIN_SCORE_WEIGHT).roundToInt()
+        return VideoRescueObservation(
+            frameTimeMs = frameTimeMs,
+            qualityScore = score,
+            regionHash = analysis.regionHash,
+            skinRatio = analysis.skinRatio,
+            localFaceCount = faces.size,
+            knownFaceRects = knownFaceRects,
+            detectedFaceRects = detectedRegions.map { it.rect },
+            unmaskedDetectedFaceCount = detectedRegions.count { !it.reliable },
+            regionRect = analysis.regionRect,
+            regionCenterX = analysis.regionCenterX,
+            regionCenterY = analysis.regionCenterY,
+            regionAreaRatio = analysis.regionAreaRatio
+        )
+    }
+
+    private fun analyzeVideoRescueDetectedFace(
+        bitmap: Bitmap,
+        normalizedRect: FaceRect
+    ): VideoRescueRegionAnalysis {
+        val pixelRect = normalizedRect.toPixelRect(bitmap.width, bitmap.height)
+            ?: return VideoRescueRegionAnalysis()
+        val crop = Bitmap.createBitmap(
+            bitmap,
+            pixelRect.left,
+            pixelRect.top,
+            pixelRect.width(),
+            pixelRect.height()
+        )
+        val sample = resizeBitmapToMaxSide(crop, VIDEO_RESCUE_SKIN_SAMPLE_SIDE)
+        val pixels = IntArray(sample.width * sample.height)
+        sample.getPixels(pixels, 0, sample.width, 0, 0, sample.width, sample.height)
+        val skinRatio = pixels.count { isLikelySkinColor(it) }.toFloat() /
+            pixels.size.coerceAtLeast(1).toFloat()
+        if (sample !== crop) {
+            sample.recycle()
+        }
+        crop.recycle()
+        return VideoRescueRegionAnalysis(
+            skinRatio = skinRatio,
+            regionHash = averageFaceHash(bitmap, pixelRect),
+            regionRect = normalizedRect,
+            regionCenterX = normalizedRect.x + normalizedRect.width / 2f,
+            regionCenterY = normalizedRect.y + normalizedRect.height / 2f,
+            regionAreaRatio = normalizedRect.width * normalizedRect.height
+        )
+    }
+
+    private fun buildVideoRescueCandidates(
+        video: GalleryVideo,
+        retriever: MediaMetadataRetriever,
+        observations: List<VideoRescueObservation>,
+        localCandidates: List<VideoFaceCandidate>,
+        maxCandidates: Int
+    ): List<VideoFaceCandidate> {
+        if (observations.isEmpty() || maxCandidates <= 0) {
+            return emptyList()
+        }
+
+        data class RescuePersonCluster(
+            val observations: MutableList<VideoRescueObservation>
+        )
+
+        val eligible = observations
+            .filter { observation ->
+                observation.regionRect != null &&
+                    observation.skinRatio >= VIDEO_RESCUE_MIN_SKIN_RATIO
+            }
+            .sortedBy { it.frameTimeMs }
+
+        val clusters = mutableListOf<RescuePersonCluster>()
+        eligible.forEach { observation ->
+            val matchedCluster = clusters
+                .mapNotNull { cluster ->
+                    val score = cluster.observations
+                        .map { existing -> videoRescuePersonMatchScore(existing, observation) }
+                        .maxOrNull()
+                        ?: Int.MIN_VALUE
+                    if (score >= VIDEO_RESCUE_PERSON_MATCH_MIN_SCORE) {
+                        cluster to score
+                    } else {
+                        null
+                    }
+                }
+                .maxByOrNull { it.second }
+                ?.first
+            if (matchedCluster == null) {
+                clusters.add(RescuePersonCluster(mutableListOf(observation)))
+            } else {
+                matchedCluster.observations.add(observation)
+            }
+        }
+
+        val selectedObservations = clusters
+            .mapNotNull { cluster ->
+                cluster.observations.maxWithOrNull(
+                    compareBy<VideoRescueObservation> { videoRescueObservationPriority(it) }
+                        .thenBy { it.qualityScore }
+                )
+            }
+            .sortedWith(
+                compareByDescending<VideoRescueObservation> {
+                    videoRescueObservationPriority(it)
+                }.thenByDescending { it.qualityScore }
+            )
+            .take(minOf(VIDEO_MAX_RESCUE_UPLOADS, maxCandidates))
+
+        val rescueCandidates = selectedObservations.mapNotNull { observation ->
+            val frame = extractVideoFrame(
+                retriever,
+                observation.frameTimeMs,
+                precise = true,
+                maxSide = VIDEO_MAX_UPLOAD_IMAGE_SIDE
+            ) ?: return@mapNotNull null
+            try {
+                val maskedFrame = maskKnownFacesForVideoRescue(frame, observation.knownFaceRects)
+                try {
+                    val uploadBytes = bitmapToJpegBytes(maskedFrame, VIDEO_FRAME_JPEG_QUALITY)
+                    val localFaceRect = observation.regionRect?.let { rect ->
+                        FaceRect(
+                            x = rect.x * maskedFrame.width,
+                            y = rect.y * maskedFrame.height,
+                            width = rect.width * maskedFrame.width,
+                            height = rect.height * maskedFrame.height
+                        )
+                    } ?: FaceRect(
+                        0f,
+                        0f,
+                        maskedFrame.width.toFloat(),
+                        maskedFrame.height.toFloat()
+                    )
+                    val descriptorRect = localFaceRect.toPixelRect(
+                        maskedFrame.width,
+                        maskedFrame.height
+                    ) ?: Rect(0, 0, maskedFrame.width, maskedFrame.height)
+                    VideoFaceCandidate(
+                        frameTimeMs = observation.frameTimeMs,
+                        qualityScore = observation.qualityScore,
+                        faceHash = observation.regionHash,
+                        differenceHash = differenceFaceHash(
+                            maskedFrame,
+                            descriptorRect,
+                            mirror = false
+                        ),
+                        mirroredDifferenceHash = differenceFaceHash(
+                            maskedFrame,
+                            descriptorRect,
+                            mirror = true
+                        ),
+                        appearanceHistogram = faceAppearanceHistogram(
+                            maskedFrame,
+                            descriptorRect
+                        ),
+                        originalBytes = null,
+                        originalBitmap = null,
+                        originalWidth = video.width,
+                        originalHeight = video.height,
+                        uploadBytes = uploadBytes,
+                        uploadWidth = maskedFrame.width,
+                        uploadHeight = maskedFrame.height,
+                        localFaceRect = localFaceRect,
+                        faceAreaRatio = observation.regionAreaRatio,
+                        faceCenterX = observation.regionCenterX,
+                        faceCenterY = observation.regionCenterY,
+                        yaw = 0f,
+                        roll = 0f,
+                        trackingId = null,
+                        isRescueFrame = true,
+                        rescueSourceDetectedFaceRects = observation.detectedFaceRects,
+                        rescueRegionRect = observation.regionRect
+                    )
+                } finally {
+                    if (maskedFrame !== frame) {
+                        maskedFrame.recycle()
+                    }
+                }
+            } finally {
+                frame.recycle()
+            }
+        }
+
+        recordDiagnostic(
+            "视频云端救援人物筛选: observations=${observations.size}, eligible=${eligible.size}, " +
+                "coveredByLocal=${observations.count { isRescueObservationCoveredByLocalPerson(it, localCandidates) }}, " +
+                "persons=${clusters.size}, selected=${rescueCandidates.size}, " +
+                "times=${selectedObservations.joinToString { observation ->
+                    "${observation.frameTimeMs}ms/skin=${"%.3f".format(Locale.ROOT, observation.skinRatio)}/" +
+                        "faces=${observation.localFaceCount}/masked=${observation.knownFaceRects.size}/" +
+                        "unmasked=${observation.unmaskedDetectedFaceCount}/" +
+                        "priority=${videoRescueObservationPriority(observation)}/" +
+                        "region=${observation.regionRect?.let {
+                            "%.2f,%.2f,%.2f,%.2f".format(
+                                Locale.ROOT,
+                                it.x,
+                                it.y,
+                                it.width,
+                                it.height
+                            )
+                        }}"
+                }}"
+        )
+        return rescueCandidates
+    }
+
+    private fun videoRescueObservationPriority(
+        observation: VideoRescueObservation
+    ): Int {
+        return when {
+            observation.unmaskedDetectedFaceCount > 0 -> 3
+            observation.localFaceCount > 0 -> 2
+            else -> 1
+        }
+    }
+
+    private fun analyzeVideoRescueRegion(
+        bitmap: Bitmap,
+        knownFaceRects: List<FaceRect>
+    ): VideoRescueRegionAnalysis {
+        val sample = resizeBitmapToMaxSide(bitmap, VIDEO_RESCUE_SKIN_SAMPLE_SIDE)
+        val width = sample.width
+        val height = sample.height
+        if (width <= 0 || height <= 0) {
+            return VideoRescueRegionAnalysis()
+        }
+        val pixels = IntArray(width * height)
+        sample.getPixels(pixels, 0, width, 0, 0, width, height)
+        val excludedFaceRects = knownFaceRects.map {
+            expandedNormalizedFaceRect(it, VIDEO_RESCUE_FACE_MASK_PADDING)
+        }
+        val skinMask = BooleanArray(pixels.size)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val normalizedX = x.toFloat() / width.toFloat()
+                val normalizedY = y.toFloat() / height.toFloat()
+                val excluded = excludedFaceRects.any { rect ->
+                    normalizedX >= rect.x &&
+                        normalizedX <= rect.x + rect.width &&
+                        normalizedY >= rect.y &&
+                        normalizedY <= rect.y + rect.height
+                }
+                if (!excluded && isLikelySkinColor(pixels[y * width + x])) {
+                    skinMask[y * width + x] = true
+                }
+            }
+        }
+
+        val visited = BooleanArray(skinMask.size)
+        val queue = IntArray(skinMask.size)
+        var bestCount = 0
+        var bestMinX = width
+        var bestMinY = height
+        var bestMaxX = -1
+        var bestMaxY = -1
+        for (startIndex in skinMask.indices) {
+            if (!skinMask[startIndex] || visited[startIndex]) {
+                continue
+            }
+            var head = 0
+            var tail = 0
+            queue[tail++] = startIndex
+            visited[startIndex] = true
+            var componentCount = 0
+            var minX = width
+            var minY = height
+            var maxX = -1
+            var maxY = -1
+            while (head < tail) {
+                val index = queue[head++]
+                val x = index % width
+                val y = index / width
+                componentCount += 1
+                minX = minOf(minX, x)
+                minY = minOf(minY, y)
+                maxX = maxOf(maxX, x)
+                maxY = maxOf(maxY, y)
+                val left = index - 1
+                val right = index + 1
+                val top = index - width
+                val bottom = index + width
+                if (x > 0 && skinMask[left] && !visited[left]) {
+                    visited[left] = true
+                    queue[tail++] = left
+                }
+                if (x + 1 < width && skinMask[right] && !visited[right]) {
+                    visited[right] = true
+                    queue[tail++] = right
+                }
+                if (y > 0 && skinMask[top] && !visited[top]) {
+                    visited[top] = true
+                    queue[tail++] = top
+                }
+                if (y + 1 < height && skinMask[bottom] && !visited[bottom]) {
+                    visited[bottom] = true
+                    queue[tail++] = bottom
+                }
+            }
+            if (componentCount > bestCount) {
+                bestCount = componentCount
+                bestMinX = minX
+                bestMinY = minY
+                bestMaxX = maxX
+                bestMaxY = maxY
+            }
+        }
+
+        val skinRatio = bestCount.toFloat() / pixels.size.coerceAtLeast(1).toFloat()
+        val regionRect = if (bestCount > 0 && bestMaxX >= bestMinX && bestMaxY >= bestMinY) {
+            FaceRect(
+                x = bestMinX.toFloat() / width.toFloat(),
+                y = bestMinY.toFloat() / height.toFloat(),
+                width = (bestMaxX - bestMinX + 1).toFloat() / width.toFloat(),
+                height = (bestMaxY - bestMinY + 1).toFloat() / height.toFloat()
+            )
+        } else {
+            null
+        }
+        val regionHash = regionRect
+            ?.toPixelRect(width, height)
+            ?.let { averageFaceHash(sample, it) }
+            ?: 0L
+        if (sample !== bitmap) {
+            sample.recycle()
+        }
+        return VideoRescueRegionAnalysis(
+            skinRatio = skinRatio,
+            regionHash = regionHash,
+            regionRect = regionRect,
+            regionCenterX = regionRect?.let { it.x + it.width / 2f } ?: 0.5f,
+            regionCenterY = regionRect?.let { it.y + it.height / 2f } ?: 0.5f,
+            regionAreaRatio = regionRect?.let { it.width * it.height } ?: 0f
+        )
+    }
+
+    private fun isLikelySkinColor(color: Int): Boolean {
+        val red = Color.red(color)
+        val green = Color.green(color)
+        val blue = Color.blue(color)
+        val maxChannel = maxOf(red, green, blue)
+        val minChannel = minOf(red, green, blue)
+        return red > 95 && green > 40 && blue > 20 &&
+            maxChannel - minChannel > 15 &&
+            abs(red - green) > 15 &&
+            red > green &&
+            red > blue
+    }
+
+    private fun expandedNormalizedFaceRect(rect: FaceRect, paddingRatio: Float): FaceRect {
+        val padX = rect.width * paddingRatio
+        val padY = rect.height * paddingRatio
+        val left = (rect.x - padX).coerceIn(0f, 1f)
+        val top = (rect.y - padY).coerceIn(0f, 1f)
+        val right = (rect.x + rect.width + padX).coerceIn(0f, 1f)
+        val bottom = (rect.y + rect.height + padY).coerceIn(0f, 1f)
+        return FaceRect(left, top, right - left, bottom - top)
+    }
+
+    private fun maskKnownFacesForVideoRescue(
+        bitmap: Bitmap,
+        knownFaceRects: List<FaceRect>
+    ): Bitmap {
+        if (knownFaceRects.isEmpty()) {
+            return bitmap
+        }
+        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(mutableBitmap)
+        val paint = Paint().apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+        }
+        knownFaceRects.forEach { rect ->
+            expandedNormalizedFaceRect(rect, VIDEO_RESCUE_FACE_MASK_PADDING)
+                .toPixelRect(mutableBitmap.width, mutableBitmap.height)
+                ?.let { canvas.drawRect(it, paint) }
+        }
+        return mutableBitmap
+    }
+
+    private fun mergeVideoLocalAndRescueCandidates(
+        localCandidates: List<VideoFaceCandidate>,
+        rescueCandidates: List<VideoFaceCandidate>
+    ): List<VideoFaceCandidate> {
+        val merged = localCandidates.toMutableList()
+        var replaced = 0
+        var skipped = 0
+        rescueCandidates.sortedByDescending { it.qualityScore }.forEach { rescue ->
+            val localIndex = merged.indexOfFirst { local ->
+                !local.isRescueFrame && sameVideoLocalAndRescuePerson(local, rescue)
+            }
+            if (localIndex < 0) {
+                merged.add(rescue)
+                return@forEach
+            }
+            val local = merged[localIndex]
+            val shouldUseRescue = abs(local.yaw) >= VIDEO_RESCUE_REPLACE_MIN_YAW &&
+                local.qualityScore < VIDEO_RESCUE_REPLACE_MAX_LOCAL_QUALITY
+            if (shouldUseRescue) {
+                merged[localIndex] = rescue
+                replaced += 1
+                recordDiagnostic(
+                    "视频救援候选替换本地侧脸: local=${local.frameTimeMs}ms/" +
+                        "q=${local.qualityScore}/yaw=${local.yaw.roundToInt()}, " +
+                        "rescue=${rescue.frameTimeMs}ms/q=${rescue.qualityScore}"
+                )
+            } else {
+                skipped += 1
+                recordDiagnostic(
+                    "视频救援候选与本地人物重复，保留本地: local=${local.frameTimeMs}ms/" +
+                        "q=${local.qualityScore}, rescue=${rescue.frameTimeMs}ms/q=${rescue.qualityScore}"
+                )
+            }
+        }
+        recordDiagnostic(
+            "视频本地与救援候选合并: local=${localCandidates.size}, rescue=${rescueCandidates.size}, " +
+                "replaced=$replaced, skipped=$skipped, result=${merged.size}"
+        )
+        return merged.sortedByDescending { it.qualityScore }
+    }
+
+    private fun sameVideoLocalAndRescuePerson(
+        local: VideoFaceCandidate,
+        rescue: VideoFaceCandidate
+    ): Boolean {
+        if (sameVideoTrackAndRescueSourceFace(local, rescue)) {
+            return true
+        }
+        if (local.personTrackSignatures.any { signature ->
+                sameVideoSignatureAndCandidate(signature, rescue)
+            }
+        ) {
+            return true
+        }
+        val timeGapMs = abs(local.frameTimeMs - rescue.frameTimeMs)
+        if (timeGapMs > VIDEO_RESCUE_LOCAL_COVERAGE_GAP_MS) {
+            return false
+        }
+        val dx = local.faceCenterX - rescue.faceCenterX
+        val dy = local.faceCenterY - rescue.faceCenterY
+        val centerDistance = kotlin.math.sqrt(dx * dx + dy * dy)
+        val sizeRatio = videoCandidateSizeRatio(local.faceAreaRatio, rescue.faceAreaRatio)
+        val dHashDistance = minOf(
+            hammingDistance(local.differenceHash, rescue.differenceHash),
+            hammingDistance(local.differenceHash, rescue.mirroredDifferenceHash),
+            hammingDistance(local.mirroredDifferenceHash, rescue.differenceHash)
+        )
+        return (
+            centerDistance <= VIDEO_RESCUE_LOCAL_MAX_CENTER_DISTANCE &&
+                sizeRatio <= VIDEO_RESCUE_LOCAL_MAX_SIZE_RATIO
+            ) || (
+            timeGapMs <= VIDEO_RESCUE_SIDE_REPLACEMENT_GAP_MS &&
+                abs(local.yaw) >= VIDEO_RESCUE_REPLACE_MIN_YAW &&
+                dHashDistance <= VIDEO_RESCUE_LOCAL_MAX_DHASH_DISTANCE
+            )
+    }
+
+    private fun sameVideoTrackAndRescueSourceFace(
+        local: VideoFaceCandidate,
+        rescue: VideoFaceCandidate
+    ): Boolean {
+        val rescueRegion = rescue.rescueRegionRect ?: return false
+        if (rescue.rescueSourceDetectedFaceRects.isEmpty()) {
+            return false
+        }
+        return local.personTrackSignatures.any { signature ->
+            val timeGapMs = abs(signature.frameTimeMs - rescue.frameTimeMs)
+            if (timeGapMs > VIDEO_RESCUE_SOURCE_TRACK_GAP_MS) {
+                return@any false
+            }
+            rescue.rescueSourceDetectedFaceRects.any { sourceFaceRect ->
+                val sourceCenterX = sourceFaceRect.x + sourceFaceRect.width / 2f
+                val sourceCenterY = sourceFaceRect.y + sourceFaceRect.height / 2f
+                val trackDx = signature.faceCenterX - sourceCenterX
+                val trackDy = signature.faceCenterY - sourceCenterY
+                val trackCenterDistance = kotlin.math.sqrt(
+                    trackDx * trackDx + trackDy * trackDy
+                )
+                val trackSizeRatio = videoCandidateSizeRatio(
+                    signature.faceAreaRatio,
+                    sourceFaceRect.width * sourceFaceRect.height
+                )
+                val rescueNearSourceFace = normalizedRectGap(
+                    rescueRegion,
+                    expandedNormalizedFaceRect(
+                        sourceFaceRect,
+                        VIDEO_RESCUE_SOURCE_PROXIMITY_PADDING
+                    )
+                ) <= VIDEO_RESCUE_SOURCE_MAX_REGION_GAP
+                trackCenterDistance <= VIDEO_RESCUE_SOURCE_MAX_TRACK_DISTANCE &&
+                    trackSizeRatio <= VIDEO_RESCUE_SOURCE_MAX_SIZE_RATIO &&
+                    rescueNearSourceFace
+            }
+        }
+    }
+
+    private fun normalizedRectGap(left: FaceRect, right: FaceRect): Float {
+        val leftRight = left.x + left.width
+        val leftBottom = left.y + left.height
+        val rightRight = right.x + right.width
+        val rightBottom = right.y + right.height
+        val horizontalGap = when {
+            leftRight < right.x -> right.x - leftRight
+            rightRight < left.x -> left.x - rightRight
+            else -> 0f
+        }
+        val verticalGap = when {
+            leftBottom < right.y -> right.y - leftBottom
+            rightBottom < left.y -> left.y - rightBottom
+            else -> 0f
+        }
+        return kotlin.math.sqrt(
+            horizontalGap * horizontalGap + verticalGap * verticalGap
+        )
+    }
+
+    private fun sameVideoSignatureAndCandidate(
+        signature: VideoPersonSignature,
+        candidate: VideoFaceCandidate
+    ): Boolean {
+        val timeGapMs = abs(signature.frameTimeMs - candidate.frameTimeMs)
+        if (timeGapMs > VIDEO_RESCUE_TRACK_SIGNATURE_GAP_MS) {
+            return false
+        }
+        val dx = signature.faceCenterX - candidate.faceCenterX
+        val dy = signature.faceCenterY - candidate.faceCenterY
+        val centerDistance = kotlin.math.sqrt(dx * dx + dy * dy)
+        val sizeRatio = videoCandidateSizeRatio(
+            signature.faceAreaRatio,
+            candidate.faceAreaRatio
+        )
+        val dHashDistance = minOf(
+            hammingDistance(signature.differenceHash, candidate.differenceHash),
+            hammingDistance(
+                signature.differenceHash,
+                candidate.mirroredDifferenceHash
+            ),
+            hammingDistance(
+                signature.mirroredDifferenceHash,
+                candidate.differenceHash
+            )
+        )
+        val histogramSimilarity = histogramCosineSimilarity(
+            signature.appearanceHistogram,
+            candidate.appearanceHistogram
+        )
+        return centerDistance <= VIDEO_RESCUE_TRACK_MAX_CENTER_DISTANCE &&
+            sizeRatio <= VIDEO_RESCUE_TRACK_MAX_SIZE_RATIO &&
+            (
+                dHashDistance <= VIDEO_RESCUE_TRACK_MAX_DHASH_DISTANCE ||
+                    histogramSimilarity >= VIDEO_RESCUE_TRACK_MIN_HISTOGRAM_SIMILARITY
+                )
+    }
+
+    private fun isRescueObservationCoveredByLocalPerson(
+        observation: VideoRescueObservation,
+        localCandidates: List<VideoFaceCandidate>
+    ): Boolean {
+        return localCandidates.any { local ->
+            val timeGapMs = abs(local.frameTimeMs - observation.frameTimeMs)
+            if (timeGapMs > VIDEO_RESCUE_LOCAL_COVERAGE_GAP_MS) {
+                return@any false
+            }
+            val dx = local.faceCenterX - observation.regionCenterX
+            val dy = local.faceCenterY - observation.regionCenterY
+            val centerDistance = kotlin.math.sqrt(dx * dx + dy * dy)
+            centerDistance <= VIDEO_RESCUE_LOCAL_MAX_CENTER_DISTANCE &&
+                videoCandidateSizeRatio(local.faceAreaRatio, observation.regionAreaRatio) <=
+                VIDEO_RESCUE_LOCAL_MAX_SIZE_RATIO
+        }
+    }
+
+    private fun videoRescuePersonMatchScore(
+        left: VideoRescueObservation,
+        right: VideoRescueObservation
+    ): Int {
+        val hashDistance = hammingDistance(left.regionHash, right.regionHash)
+        val timeGapMs = abs(left.frameTimeMs - right.frameTimeMs)
+        if (timeGapMs > VIDEO_RESCUE_CLUSTER_MAX_GAP_MS) {
+            return Int.MIN_VALUE
+        }
+        if (hashDistance <= VIDEO_RESCUE_STRONG_HASH_DISTANCE) {
+            return 90 - hashDistance
+        }
+        val dx = left.regionCenterX - right.regionCenterX
+        val dy = left.regionCenterY - right.regionCenterY
+        val centerDistance = kotlin.math.sqrt(dx * dx + dy * dy)
+        val sizeRatio = videoCandidateSizeRatio(left.regionAreaRatio, right.regionAreaRatio)
+        if (timeGapMs <= VIDEO_RESCUE_CONTINUITY_GAP_MS &&
+            centerDistance <= VIDEO_RESCUE_MAX_CENTER_DISTANCE &&
+            sizeRatio <= VIDEO_RESCUE_MAX_SIZE_RATIO
+        ) {
+            return 60 +
+                (VIDEO_RESCUE_RELAXED_HASH_DISTANCE - hashDistance).coerceAtLeast(0)
+        }
+        if (timeGapMs <= VIDEO_RESCUE_CONTINUITY_GAP_MS &&
+            hashDistance <= VIDEO_RESCUE_RELAXED_HASH_DISTANCE &&
+            centerDistance <= VIDEO_RESCUE_RELAXED_CENTER_DISTANCE &&
+            sizeRatio <= VIDEO_RESCUE_MAX_SIZE_RATIO
+        ) {
+            return 48 + (VIDEO_RESCUE_RELAXED_HASH_DISTANCE - hashDistance)
+        }
+        return Int.MIN_VALUE
     }
 
     private fun extractVideoFrame(
@@ -4085,9 +5095,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
-        // 过滤大角度侧脸（Yaw 偏角 > 25度 或 Pitch 偏角 > 20度），以防发送无效的云端核验导致人脸检测报错
+        // 仅过滤接近背脸或严重俯仰的候选；清晰侧脸保留给云端继续判断。
 
-        if (abs(face.headEulerAngleY) > 40f || abs(face.headEulerAngleX) > 35f) {
+        if (abs(face.headEulerAngleY) > VIDEO_MAX_CANDIDATE_YAW ||
+            abs(face.headEulerAngleX) > VIDEO_MAX_CANDIDATE_PITCH
+        ) {
 
             recordDiagnostic("视频候选被拒: 姿态角过大 (yaw=${face.headEulerAngleY}, pitch=${face.headEulerAngleX}), trackingId=${face.trackingId}")
 
@@ -4098,6 +5110,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val faceAreaRatio = faceRectOnDetection.width().toFloat() * faceRectOnDetection.height().toFloat() /
 
             (detectionBitmap.width.toFloat() * detectionBitmap.height.toFloat()).coerceAtLeast(1f)
+        val faceCenterX = faceRectOnDetection.centerX().toFloat() / detectionBitmap.width.toFloat()
+        val faceCenterY = faceRectOnDetection.centerY().toFloat() / detectionBitmap.height.toFloat()
 
         if (faceAreaRatio < VIDEO_MIN_FACE_AREA_RATIO) {
 
@@ -4142,6 +5156,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val quality = scoreVideoFaceCandidate(frame, face, faceRectOnFrame)
 
         val hash = averageFaceHash(frame, faceRectOnFrame)
+        val differenceHash = differenceFaceHash(frame, faceRectOnFrame, mirror = false)
+        val mirroredDifferenceHash = differenceFaceHash(frame, faceRectOnFrame, mirror = true)
+        val appearanceHistogram = faceAppearanceHistogram(frame, faceRectOnFrame)
 
         val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
 
@@ -4181,6 +5198,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             faceHash = hash,
 
+            differenceHash = differenceHash,
+
+            mirroredDifferenceHash = mirroredDifferenceHash,
+
+            appearanceHistogram = appearanceHistogram,
+
             originalBytes = null,
 
             originalBitmap = null, // 延迟到去重筛选后再从 retriever 取帧编码，避免同时驻留大量全帧 Bitmap
@@ -4197,6 +5220,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             localFaceRect = localRect,
 
             faceAreaRatio = faceAreaRatio,
+
+            faceCenterX = faceCenterX,
+
+            faceCenterY = faceCenterY,
 
             yaw = face.headEulerAngleY,
 
@@ -4280,9 +5307,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         // 只要偏角在合理范围内不扣分（Yaw在15度内，Roll在12度内，Pitch在12度内），超过该范围则线性惩罚扣分，防止因为正脸让模糊晃动脸胜出
 
-        val yawPenalty = if (abs(face.headEulerAngleY) > 15f) {
+        val yawPenalty = if (abs(face.headEulerAngleY) > VIDEO_YAW_FREE_ANGLE) {
 
-            ((abs(face.headEulerAngleY) - 15f) * 30f).roundToInt()
+            ((abs(face.headEulerAngleY) - VIDEO_YAW_FREE_ANGLE) * VIDEO_YAW_PENALTY_PER_DEGREE).roundToInt()
 
         } else 0
 
@@ -4448,12 +5475,114 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
-        small.recycle()
-
-        crop.recycle()
+        if (small !== crop) {
+            small.recycle()
+        }
+        if (crop !== bitmap) {
+            crop.recycle()
+        }
 
         return hash
 
+    }
+
+    private fun differenceFaceHash(
+        bitmap: Bitmap,
+        rect: Rect,
+        mirror: Boolean
+    ): Long {
+        val cropRect = expandRectToMinimumSide(
+            rect,
+            bitmap.width,
+            bitmap.height,
+            maxOf(rect.width(), rect.height()).coerceAtLeast(1)
+        )
+        val crop = Bitmap.createBitmap(
+            bitmap,
+            cropRect.left,
+            cropRect.top,
+            cropRect.width(),
+            cropRect.height()
+        )
+        val normalized = if (mirror) {
+            val matrix = Matrix().apply { preScale(-1f, 1f) }
+            Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, matrix, true)
+        } else {
+            crop
+        }
+        val small = Bitmap.createScaledBitmap(
+            normalized,
+            VIDEO_DHASH_WIDTH + 1,
+            VIDEO_DHASH_HEIGHT,
+            true
+        )
+        val pixels = IntArray((VIDEO_DHASH_WIDTH + 1) * VIDEO_DHASH_HEIGHT)
+        small.getPixels(
+            pixels,
+            0,
+            VIDEO_DHASH_WIDTH + 1,
+            0,
+            0,
+            VIDEO_DHASH_WIDTH + 1,
+            VIDEO_DHASH_HEIGHT
+        )
+        var hash = 0L
+        var bitIndex = 0
+        for (y in 0 until VIDEO_DHASH_HEIGHT) {
+            for (x in 0 until VIDEO_DHASH_WIDTH) {
+                val rowStart = y * (VIDEO_DHASH_WIDTH + 1)
+                if (luminance(pixels[rowStart + x]) >=
+                    luminance(pixels[rowStart + x + 1])
+                ) {
+                    hash = hash or (1L shl bitIndex)
+                }
+                bitIndex += 1
+            }
+        }
+        if (small !== normalized) {
+            small.recycle()
+        }
+        if (normalized !== crop) {
+            normalized.recycle()
+        }
+        crop.recycle()
+        return hash
+    }
+
+    private fun faceAppearanceHistogram(bitmap: Bitmap, rect: Rect): IntArray {
+        val cropRect = expandRectToMinimumSide(
+            rect,
+            bitmap.width,
+            bitmap.height,
+            maxOf(rect.width(), rect.height()).coerceAtLeast(1)
+        )
+        val crop = Bitmap.createBitmap(
+            bitmap,
+            cropRect.left,
+            cropRect.top,
+            cropRect.width(),
+            cropRect.height()
+        )
+        val sample = resizeBitmapToMaxSide(crop, VIDEO_APPEARANCE_SAMPLE_SIDE)
+        val pixels = IntArray(sample.width * sample.height)
+        sample.getPixels(pixels, 0, sample.width, 0, 0, sample.width, sample.height)
+        val histogram = IntArray(VIDEO_APPEARANCE_HUE_BINS * VIDEO_APPEARANCE_VALUE_BINS)
+        val hsv = FloatArray(3)
+        pixels.forEach { color ->
+            Color.RGBToHSV(Color.red(color), Color.green(color), Color.blue(color), hsv)
+            val hueBin = (hsv[0] / 360f * VIDEO_APPEARANCE_HUE_BINS)
+                .toInt()
+                .coerceIn(0, VIDEO_APPEARANCE_HUE_BINS - 1)
+            val valueBin = (hsv[2] * VIDEO_APPEARANCE_VALUE_BINS)
+                .toInt()
+                .coerceIn(0, VIDEO_APPEARANCE_VALUE_BINS - 1)
+            histogram[hueBin * VIDEO_APPEARANCE_VALUE_BINS + valueBin] += 1
+        }
+        if (sample !== crop) {
+            sample.recycle()
+        }
+        crop.recycle()
+        return histogram
     }
 
     private fun luminance(color: Int): Int {
@@ -4670,25 +5799,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         candidate: VideoFaceCandidate,
 
-        experts: List<ExpertInfo>,
-
-        seenExpertKeys: MutableSet<String>
+        experts: List<ExpertInfo>
 
     ): Int {
 
         var added = 0
 
         experts.forEachIndexed { index, expert ->
-
-            val key = expertIdentityKey(expert)
-
-            if (!seenExpertKeys.add(key)) {
-
-                recordDiagnostic("视频专家重复跳过: key=$key, name=${expert.name}, timeMs=${candidate.frameTimeMs}")
-
-                return@forEachIndexed
-
-            }
 
             val recordId = "${System.currentTimeMillis()}_${Random().nextInt(100000)}"
 
@@ -4805,20 +5922,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         return added
-
-    }
-
-    private fun expertIdentityKey(expert: ExpertInfo): String {
-
-        val idCard = expert.idCard?.trim().orEmpty()
-
-        if (idCard.isNotBlank() && idCard != "-") return "id:$idCard"
-
-        val phone = expert.phone.trim()
-
-        if (phone.isNotBlank() && phone != "-") return "phone:$phone"
-
-        return "name:${expert.name.trim()}|company:${expert.company.trim()}"
 
     }
 
@@ -10268,13 +11371,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val VIDEO_QUICK_SHORT_DURATION_MS = 15000L
 
-        private const val VIDEO_QUICK_SHORT_INTERVAL_MS = 100L
+        private const val VIDEO_QUICK_SHORT_INTERVAL_MS = 200L
 
         private const val VIDEO_QUICK_DENSE_DURATION_MS = 60000L
 
         private const val VIDEO_MAX_QUICK_SAMPLE_FRAMES = 180
 
+        private const val VIDEO_QUICK_DECODE_MAX_SIDE = 640
+
         private const val VIDEO_QUICK_PROCESS_MAX_SIDE = 960
+
+        private const val VIDEO_CODEC_DEQUEUE_TIMEOUT_US = 10_000L
+
+        private const val VIDEO_CODEC_MAX_IDLE_LOOPS = 2_000
 
         private const val VIDEO_FINE_SAMPLE_INTERVAL_MS = 150L
 
@@ -10294,17 +11403,153 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val VIDEO_MAX_CLOUD_UPLOADS = 10
 
-        private const val VIDEO_MAX_SAVED_EXPERTS = 10
-
-        private const val VIDEO_CLOUD_MAX_FACE_NUM = 3
+        private const val VIDEO_RESCUE_CLOUD_MAX_FACE_NUM = 3
 
         private const val VIDEO_MIN_FACE_AREA_RATIO = 0.0006f
+
+        private const val VIDEO_MIN_UPLOAD_QUALITY_SCORE = 250
+
+        private const val VIDEO_SIDE_PROFILE_MIN_YAW = 40f
+
+        private const val VIDEO_SIDE_PROFILE_MIN_UPLOAD_QUALITY_SCORE = 30
+
+        private const val VIDEO_PERSON_STRONG_HASH_DISTANCE = 7
+
+        private const val VIDEO_PERSON_RELAXED_HASH_DISTANCE = 14
+
+        private const val VIDEO_PERSON_TRACK_MAX_GAP_MS = 1100L
+
+        private const val VIDEO_PERSON_MAX_PREDICTION_RATIO = 2.0f
+
+        private const val VIDEO_PERSON_BASE_CENTER_DISTANCE = 0.14f
+
+        private const val VIDEO_PERSON_CENTER_DISTANCE_GROWTH = 0.20f
+
+        private const val VIDEO_PERSON_MAX_CENTER_DISTANCE = 0.34f
+
+        private const val VIDEO_PERSON_MAX_SIZE_RATIO = 4.0f
+
+        private const val VIDEO_PERSON_MATCH_MIN_SCORE = 45
+
+        private const val VIDEO_PERSON_BASE_MATCH_SCORE = 100
+
+        private const val VIDEO_PERSON_CENTER_PENALTY = 200f
+
+        private const val VIDEO_PERSON_TIME_PENALTY_DIVISOR_MS = 40L
+
+        private const val VIDEO_PERSON_SIZE_RATIO_PENALTY = 18f
+
+        private const val VIDEO_PERSON_TRACKING_ID_BONUS = 35
+
+        private const val VIDEO_PERSON_HASH_BONUS_PER_BIT = 2
+
+        private const val VIDEO_TRACKLET_MIN_NON_OVERLAP_MS = 100L
+
+        private const val VIDEO_TRACKLET_MAX_STITCH_GAP_MS = 8_000L
+
+        private const val VIDEO_TRACKLET_REPRESENTATIVE_COUNT = 3
+
+        private const val VIDEO_TRACKLET_DHASH_PENALTY = 2
+
+        private const val VIDEO_TRACKLET_AHASH_PENALTY = 1
+
+        private const val VIDEO_TRACKLET_HISTOGRAM_BONUS = 60f
+
+        private const val VIDEO_TRACKLET_MIN_APPEARANCE_SCORE = 78
+
+        private const val VIDEO_TRACKLET_GAP_PENALTY_DIVISOR_MS = 120L
+
+        private const val VIDEO_TRACKLET_STITCH_MIN_SCORE = 62
+
+        private const val VIDEO_MAX_CANDIDATE_YAW = 80f
+
+        private const val VIDEO_MAX_CANDIDATE_PITCH = 50f
+
+        private const val VIDEO_YAW_FREE_ANGLE = 15f
+
+        private const val VIDEO_YAW_PENALTY_PER_DEGREE = 12f
+
+        private const val VIDEO_MAX_RESCUE_UPLOADS = 5
+
+        private const val VIDEO_RESCUE_MIN_SKIN_RATIO = 0.004f
+
+        private const val VIDEO_RESCUE_SKIN_SCORE_WEIGHT = 12_000f
+
+        private const val VIDEO_RESCUE_SKIN_SAMPLE_SIDE = 240
+
+        private const val VIDEO_RESCUE_FACE_MASK_PADDING = 0.18f
+
+        private const val VIDEO_RESCUE_MASK_MIN_FACE_SIDE = 35
+
+        private const val VIDEO_RESCUE_MASK_MAX_YAW = 55f
+
+        private const val VIDEO_RESCUE_MASK_MAX_PITCH = 45f
+
+        private const val VIDEO_RESCUE_STRONG_HASH_DISTANCE = 8
+
+        private const val VIDEO_RESCUE_RELAXED_HASH_DISTANCE = 15
+
+        private const val VIDEO_RESCUE_CONTINUITY_GAP_MS = 1800L
+
+        private const val VIDEO_RESCUE_CLUSTER_MAX_GAP_MS = 1000L
+
+        private const val VIDEO_RESCUE_MAX_CENTER_DISTANCE = 0.24f
+
+        private const val VIDEO_RESCUE_RELAXED_CENTER_DISTANCE = 0.32f
+
+        private const val VIDEO_RESCUE_MAX_SIZE_RATIO = 4.5f
+
+        private const val VIDEO_RESCUE_PERSON_MATCH_MIN_SCORE = 48
+
+        private const val VIDEO_RESCUE_LOCAL_COVERAGE_GAP_MS = 1800L
+
+        private const val VIDEO_RESCUE_LOCAL_MAX_CENTER_DISTANCE = 0.28f
+
+        private const val VIDEO_RESCUE_LOCAL_MAX_SIZE_RATIO = 8.0f
+
+        private const val VIDEO_RESCUE_SIDE_REPLACEMENT_GAP_MS = 900L
+
+        private const val VIDEO_RESCUE_REPLACE_MIN_YAW = 40f
+
+        private const val VIDEO_RESCUE_REPLACE_MAX_LOCAL_QUALITY = 30
+
+        private const val VIDEO_RESCUE_LOCAL_MAX_DHASH_DISTANCE = 28
+
+        private const val VIDEO_RESCUE_TRACK_SIGNATURE_GAP_MS = 900L
+
+        private const val VIDEO_RESCUE_TRACK_MAX_CENTER_DISTANCE = 0.32f
+
+        private const val VIDEO_RESCUE_TRACK_MAX_SIZE_RATIO = 10.0f
+
+        private const val VIDEO_RESCUE_TRACK_MAX_DHASH_DISTANCE = 30
+
+        private const val VIDEO_RESCUE_TRACK_MIN_HISTOGRAM_SIMILARITY = 0.82f
+
+        private const val VIDEO_RESCUE_SOURCE_TRACK_GAP_MS = 800L
+
+        private const val VIDEO_RESCUE_SOURCE_MAX_TRACK_DISTANCE = 0.24f
+
+        private const val VIDEO_RESCUE_SOURCE_MAX_SIZE_RATIO = 6.0f
+
+        private const val VIDEO_RESCUE_SOURCE_PROXIMITY_PADDING = 0.12f
+
+        private const val VIDEO_RESCUE_SOURCE_MAX_REGION_GAP = 0.04f
 
         private const val VIDEO_FACE_HASH_DUP_DISTANCE = 5
 
         private const val VIDEO_CROSS_TRACK_HASH_DUP_DISTANCE = 5
 
         private const val VIDEO_HASH_SIZE = 8
+
+        private const val VIDEO_DHASH_WIDTH = 8
+
+        private const val VIDEO_DHASH_HEIGHT = 8
+
+        private const val VIDEO_APPEARANCE_SAMPLE_SIDE = 64
+
+        private const val VIDEO_APPEARANCE_HUE_BINS = 12
+
+        private const val VIDEO_APPEARANCE_VALUE_BINS = 4
 
         private const val VIDEO_SHARPNESS_SAMPLE_SIDE = 160
 
@@ -10602,6 +11847,12 @@ data class VideoFaceCandidate(
 
     val faceHash: Long,
 
+    val differenceHash: Long,
+
+    val mirroredDifferenceHash: Long,
+
+    val appearanceHistogram: IntArray,
+
     var originalBytes: ByteArray?,
 
     val originalBitmap: Bitmap?,
@@ -10620,11 +11871,97 @@ data class VideoFaceCandidate(
 
     val faceAreaRatio: Float,
 
+    val faceCenterX: Float,
+
+    val faceCenterY: Float,
+
     val yaw: Float,
 
     val roll: Float,
 
-    val trackingId: Int? = null
+    val trackingId: Int? = null,
+
+    val isRescueFrame: Boolean = false,
+
+    var personTrackSignatures: List<VideoPersonSignature> = emptyList(),
+
+    val rescueSourceDetectedFaceRects: List<FaceRect> = emptyList(),
+
+    val rescueRegionRect: FaceRect? = null
+
+)
+
+data class VideoRescueObservation(
+
+    val frameTimeMs: Long,
+
+    val qualityScore: Int,
+
+    val regionHash: Long,
+
+    val skinRatio: Float,
+
+    val localFaceCount: Int,
+
+    val knownFaceRects: List<FaceRect>,
+
+    val detectedFaceRects: List<FaceRect>,
+
+    val unmaskedDetectedFaceCount: Int,
+
+    val regionRect: FaceRect?,
+
+    val regionCenterX: Float,
+
+    val regionCenterY: Float,
+
+    val regionAreaRatio: Float
+
+)
+
+data class VideoRescueRegionAnalysis(
+
+    val skinRatio: Float = 0f,
+
+    val regionHash: Long = 0L,
+
+    val regionRect: FaceRect? = null,
+
+    val regionCenterX: Float = 0.5f,
+
+    val regionCenterY: Float = 0.5f,
+
+    val regionAreaRatio: Float = 0f
+
+)
+
+data class VideoCloudMatch(
+
+    val candidate: VideoFaceCandidate,
+
+    val expert: ExpertInfo
+
+)
+
+data class VideoPersonSignature(
+
+    val frameTimeMs: Long,
+
+    val qualityScore: Int,
+
+    val differenceHash: Long,
+
+    val mirroredDifferenceHash: Long,
+
+    val appearanceHistogram: IntArray,
+
+    val faceAreaRatio: Float,
+
+    val faceCenterX: Float,
+
+    val faceCenterY: Float,
+
+    val yaw: Float
 
 )
 
