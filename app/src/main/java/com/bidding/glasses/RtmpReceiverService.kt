@@ -175,6 +175,15 @@ class RtmpReceiverService : Service() {
     }
 
     private fun broadcastPreview(jpegBytes: ByteArray, width: Int, height: Int, decodedFrames: Long) {
+        val listener = onPreviewFrameListener
+        if (listener != null) {
+            try {
+                listener.invoke(jpegBytes, width, height, decodedFrames)
+                return
+            } catch (e: Exception) {
+                broadcastLog("预览帧内存回调失败，回退到广播传递", e)
+            }
+        }
         val intent = Intent(ACTION_PREVIEW).apply {
             setPackage(packageName)
             putExtra(EXTRA_PREVIEW_JPEG, jpegBytes)
@@ -281,5 +290,7 @@ class RtmpReceiverService : Service() {
         private const val PREVIEW_WATCHDOG_RESET_COOLDOWN_MS = 6_000L
 
         @Volatile var latestSnapshot: EmbeddedRtmpReceiver.Snapshot = EmbeddedRtmpReceiver.Snapshot()
+
+        @Volatile var onPreviewFrameListener: ((jpegBytes: ByteArray, width: Int, height: Int, decodedFrames: Long) -> Unit)? = null
     }
 }

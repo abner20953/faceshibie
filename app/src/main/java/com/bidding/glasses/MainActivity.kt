@@ -262,6 +262,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private var currentRtmpPreviewBitmap: Bitmap? = null
 
+    private var lastRealtimeFaceDetectAt = 0L
+
+    @Volatile private var isRtmpPreviewRenderRunning = false
+
+    @Volatile private var latestRealtimeOverlaySnapshot: RealtimeOverlaySnapshot? = null
+
     
 
     // Rokid CXR-L 核心链路管理器与最新视频帧缓存
@@ -3734,9 +3740,51 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return isRealtimeRecognitionPageActive && latestRtmpReceiverSnapshot.running
     }
 
+    private fun evaluateRealtimeFaces(
+        bitmap: Bitmap,
+        faces: List<Face>,
+        crowdModeForFrame: Boolean
+    ): Map<Face, RealtimeFaceEvaluation> {
+        if (faces.isEmpty()) {
+            return emptyMap()
+        }
+        val evaluations = IdentityHashMap<Face, RealtimeFaceEvaluation>(faces.size)
+        faces.forEach { face ->
+            val faceRect = clippedRect(Rect(face.boundingBox), bitmap.width, bitmap.height) ?: return@forEach
+            if (faceRect.width() < 12 || faceRect.height() < 12) {
+                return@forEach
+            }
+            val faceAreaRatio = faceRect.width().toFloat() * faceRect.height().toFloat() /
+                (bitmap.width.toFloat() * bitmap.height.toFloat()).coerceAtLeast(1f)
+            val quality = scoreVideoFaceCandidate(bitmap, face, faceRect)
+            evaluations[face] = RealtimeFaceEvaluation(
+                faceRect = faceRect,
+                qualityScore = quality,
+                canUpload = isUsableRealtimeCloudCandidate(
+                    faceAreaRatio = faceAreaRatio,
+                    quality = quality,
+                    yaw = face.headEulerAngleY,
+                    pitch = face.headEulerAngleX,
+                    crowdMode = crowdModeForFrame
+                ),
+                faceAreaRatio = faceAreaRatio,
+                faceCenterX = faceRect.centerX().toFloat() / bitmap.width.toFloat(),
+                faceCenterY = faceRect.centerY().toFloat() / bitmap.height.toFloat()
+            )
+        }
+        return evaluations
+    }
+
     private fun registerRtmpReceiverBroadcasts() {
         if (isRtmpReceiverBroadcastRegistered) {
             return
+        }
+        RtmpReceiverService.onPreviewFrameListener = { jpegBytes, _, _, decodedFrames ->
+            mainHandler.post {
+                if (!isFinishing && !isDestroyed) {
+                    handleRtmpPreviewFrame(jpegBytes, decodedFrames)
+                }
+            }
         }
         val filter = IntentFilter().apply {
             addAction(RtmpReceiverService.ACTION_STATUS)
@@ -3756,6 +3804,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun unregisterRtmpReceiverBroadcasts() {
         if (!isRtmpReceiverBroadcastRegistered) {
+            RtmpReceiverService.onPreviewFrameListener = null
             return
         }
         try {
@@ -3764,6 +3813,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             recordDiagnostic("RTMP 接收服务广播注销失败", e)
         }
         isRtmpReceiverBroadcastRegistered = false
+        RtmpReceiverService.onPreviewFrameListener = null
     }
 
     private fun rtmpSnapshotFromIntent(intent: Intent): EmbeddedRtmpReceiver.Snapshot {
@@ -3797,15 +3847,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         bitmap: Bitmap,
         faces: List<Face>,
         decodedFrames: Long,
-        frameBytes: ByteArray
+        frameBytes: ByteArray,
+        faceEvaluations: Map<Face, RealtimeFaceEvaluation>
     ) {
         val now = System.currentTimeMillis()
-        val crowdModeForFrame = faces.size >= REALTIME_CROWD_MODE_MIN_FACES || isRealtimeCrowdModeActive(now)
         synchronized(realtimeTrackLock) {
             realtimePersonTracks.removeAll { now - it.lastSeenAt > REALTIME_TRACK_STALE_MS }
         }
         faces.forEach { face ->
-            val candidate = buildRealtimeFaceCandidate(bitmap, face, decodedFrames, now, crowdModeForFrame, frameBytes) ?: return@forEach
+            val evaluation = faceEvaluations[face] ?: return@forEach
+            val candidate = buildRealtimeFaceCandidate(
+                bitmap = bitmap,
+                face = face,
+                evaluation = evaluation,
+                decodedFrames = decodedFrames,
+                now = now,
+                frameBytes = frameBytes
+            ) ?: return@forEach
             synchronized(realtimeTrackLock) {
                 val track = findOrCreateRealtimeTrackLocked(candidate, now)
                 track.lastSeenAt = now
@@ -3832,60 +3890,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun buildRealtimeFaceCandidate(
         bitmap: Bitmap,
         face: Face,
+        evaluation: RealtimeFaceEvaluation,
         decodedFrames: Long,
         now: Long,
-        crowdMode: Boolean,
         frameBytes: ByteArray
     ): RealtimeFaceCandidate? {
-        val faceRect = clippedRect(Rect(face.boundingBox), bitmap.width, bitmap.height) ?: return null
-        if (faceRect.width() < 12 || faceRect.height() < 12) {
+        if (!evaluation.canUpload) {
             return null
         }
-        val faceAreaRatio = faceRect.width().toFloat() * faceRect.height().toFloat() /
-            (bitmap.width.toFloat() * bitmap.height.toFloat()).coerceAtLeast(1f)
-        val faceCenterX = faceRect.centerX().toFloat() / bitmap.width.toFloat()
-        val faceCenterY = faceRect.centerY().toFloat() / bitmap.height.toFloat()
-        val quality = scoreVideoFaceCandidate(bitmap, face, faceRect)
+        val faceRect = evaluation.faceRect
         val yaw = face.headEulerAngleY
         val pitch = face.headEulerAngleX
-        if (!isUsableRealtimeCloudCandidate(faceAreaRatio, quality, yaw, pitch, crowdMode)) {
-            return null
-        }
         return try {
-            val uploadImage = buildSingleFaceUploadImageFromRect(bitmap, faceRect, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
-            val uploadBytes = bitmapToJpegBytes(uploadImage.bitmap, FACE_UPLOAD_JPEG_QUALITY)
-            val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
-                0f,
-                0f,
-                uploadImage.bitmap.width.toFloat(),
-                uploadImage.bitmap.height.toFloat()
-            )
-            val candidate = RealtimeFaceCandidate(
+            RealtimeFaceCandidate(
                 createdAt = now,
                 decodedFrames = decodedFrames,
-                qualityScore = quality,
+                qualityScore = evaluation.qualityScore,
                 frameBytes = frameBytes,
                 frameWidth = bitmap.width,
                 frameHeight = bitmap.height,
-                uploadBytes = uploadBytes,
-                uploadWidth = uploadImage.bitmap.width,
-                uploadHeight = uploadImage.bitmap.height,
-                localFaceRect = localRect,
-                faceAreaRatio = faceAreaRatio,
-                faceCenterX = faceCenterX,
-                faceCenterY = faceCenterY,
+                faceRectInFrame = Rect(faceRect),
+                faceAreaRatio = evaluation.faceAreaRatio,
+                faceCenterX = evaluation.faceCenterX,
+                faceCenterY = evaluation.faceCenterY,
                 yaw = yaw,
                 pitch = pitch,
                 roll = face.headEulerAngleZ,
                 trackingId = face.trackingId
             )
-            try {
-                uploadImage.bitmap.recycle()
-            } catch (_: Exception) {
-            }
-            candidate
         } catch (e: Exception) {
-            recordDiagnostic("实时视频候选裁剪失败: frame=$decodedFrames", e)
+            recordDiagnostic("实时视频候选创建失败: frame=$decodedFrames", e)
             null
         }
     }
@@ -4110,11 +4144,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun startRealtimeCloudRecognition(plan: RealtimeCloudUploadPlan) {
         val candidate = plan.candidate
         recordDiagnostic(
-            "实时云端识别候选采用: track=${plan.trackId}, reason=${plan.reason}, " +
+            "实时云端识别候选入队: track=${plan.trackId}, reason=${plan.reason}, " +
                 "mode=${if (plan.crowdMode) "crowd" else "normal"}, batch=${plan.batchIndex}, " +
                 "active=${plan.activeCountAtStart}/${plan.maxConcurrent}, frame=${candidate.decodedFrames}, " +
                 "q=${candidate.qualityScore}, area=${String.format(Locale.CHINA, "%.4f", candidate.faceAreaRatio)}, " +
-                "yaw=${candidate.yaw.roundToInt()}, upload=${candidate.uploadWidth}x${candidate.uploadHeight}, bytes=${candidate.uploadBytes.size}"
+                "yaw=${candidate.yaw.roundToInt()}"
         )
         runOnUiThread {
             if (::binding.isInitialized) {
@@ -4128,19 +4162,78 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         executeRealtimeCloudWorker("实时视频云端识别") {
             try {
-                val base64 = Base64.encodeToString(candidate.uploadBytes, Base64.NO_WRAP)
+                val upload = prepareRealtimeUploadPayload(candidate)
+                if (upload == null) {
+                    recordDiagnostic(
+                        "实时云端识别候选上传图生成失败: track=${plan.trackId}, frame=${candidate.decodedFrames}"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
+                recordDiagnostic(
+                    "实时云端识别候选采用: track=${plan.trackId}, reason=${plan.reason}, " +
+                        "frame=${candidate.decodedFrames}, q=${candidate.qualityScore}, " +
+                        "upload=${upload.uploadWidth}x${upload.uploadHeight}, bytes=${upload.uploadBytes.size}"
+                )
+                val base64 = Base64.encodeToString(upload.uploadBytes, Base64.NO_WRAP)
                 val result = searchFaceOnCloudSync(
                     "data:image/jpeg;base64,$base64",
                     1,
                     "实时视频 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}"
                 )
-                handleRealtimeCloudResult(plan.trackId, candidate, result)
+                handleRealtimeCloudResult(plan.trackId, candidate, upload, result)
             } finally {
                 synchronized(realtimeTrackLock) {
                     activeRealtimeCloudRequestCount = (activeRealtimeCloudRequestCount - 1).coerceAtLeast(0)
                     realtimePersonTracks.firstOrNull { it.id == plan.trackId }?.cloudRequestInFlight = false
                 }
                 maybeStartRealtimeCloudRecognition()
+            }
+        }
+    }
+
+    private fun prepareRealtimeUploadPayload(candidate: RealtimeFaceCandidate): RealtimeUploadPayload? {
+        val frameBitmap = BitmapFactory.decodeByteArray(candidate.frameBytes, 0, candidate.frameBytes.size)
+        if (frameBitmap == null) {
+            recordDiagnostic("实时上传图准备失败: 原始帧解码失败 frame=${candidate.decodedFrames}, bytes=${candidate.frameBytes.size}")
+            return null
+        }
+        return try {
+            val faceRect = clippedRect(Rect(candidate.faceRectInFrame), frameBitmap.width, frameBitmap.height)
+            if (faceRect == null) {
+                recordDiagnostic(
+                    "实时上传图准备失败: 人脸框越界 frame=${candidate.decodedFrames}, " +
+                        "rect=${candidate.faceRectInFrame}"
+                )
+                return null
+            }
+            val uploadImage = buildSingleFaceUploadImageFromRect(frameBitmap, faceRect, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
+            try {
+                val uploadBytes = bitmapToJpegBytes(uploadImage.bitmap, FACE_UPLOAD_JPEG_QUALITY)
+                val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
+                    0f,
+                    0f,
+                    uploadImage.bitmap.width.toFloat(),
+                    uploadImage.bitmap.height.toFloat()
+                )
+                RealtimeUploadPayload(
+                    uploadBytes = uploadBytes,
+                    uploadWidth = uploadImage.bitmap.width,
+                    uploadHeight = uploadImage.bitmap.height,
+                    localFaceRect = localRect
+                )
+            } finally {
+                try {
+                    uploadImage.bitmap.recycle()
+                } catch (_: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            recordDiagnostic("实时上传图准备异常: frame=${candidate.decodedFrames}", e)
+            null
+        } finally {
+            try {
+                frameBitmap.recycle()
+            } catch (_: Exception) {
             }
         }
     }
@@ -4175,6 +4268,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun handleRealtimeCloudResult(
         trackId: Long,
         candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload,
         result: CloudFaceSearchResult
     ) {
         if (result.experts.isEmpty()) {
@@ -4193,11 +4287,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 if (index == 0) {
                     recordDiagnostic(
                         "实时云端未返回人脸框，使用本地上传图人脸框: track=$trackId, " +
-                            "rect=${candidate.localFaceRect.x},${candidate.localFaceRect.y}," +
-                            "${candidate.localFaceRect.width},${candidate.localFaceRect.height}"
+                            "rect=${upload.localFaceRect.x},${upload.localFaceRect.y}," +
+                            "${upload.localFaceRect.width},${upload.localFaceRect.height}"
                     )
                 }
-                expert.copy(faceRect = candidate.localFaceRect)
+                expert.copy(faceRect = upload.localFaceRect)
             }
         }
         val names = expertsWithRects.joinToString("，") { it.name }
@@ -4205,7 +4299,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "实时云端识别成功: track=$trackId, experts=${expertsWithRects.size}, names=$names, " +
                 "frame=${candidate.decodedFrames}, q=${candidate.qualityScore}"
         )
-        saveRealtimeExpertRecords(trackId, candidate, expertsWithRects)
+        saveRealtimeExpertRecords(trackId, candidate, upload, expertsWithRects)
         synchronized(realtimeTrackLock) {
             realtimePersonTracks.firstOrNull { it.id == trackId }?.lastMatchedNames = names
         }
@@ -4217,8 +4311,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 recordDiagnostic("实时云端识别结果已忽略: track=$trackId, reason=page_inactive, names=$names")
                 return@runOnUiThread
             }
-            capturedFrameBytes = candidate.uploadBytes
-            lastLocalFaceCrop = BitmapFactory.decodeByteArray(candidate.uploadBytes, 0, candidate.uploadBytes.size)
+            capturedFrameBytes = upload.uploadBytes
+            lastLocalFaceCrop = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
             realtimeExpertsByTrack.remove(trackId)
             realtimeExpertsByTrack[trackId] = expertsWithRects
             while (realtimeExpertsByTrack.size > REALTIME_MAX_RESULT_TRACKS) {
@@ -4238,6 +4332,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun saveRealtimeExpertRecords(
         trackId: Long,
         candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload,
         experts: List<ExpertInfo>
     ): Int {
         val now = System.currentTimeMillis()
@@ -4248,10 +4343,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             } else {
                 recordDiagnostic(
                     "实时云端未返回人脸框，保存记录时使用本地上传图人脸框: track=$trackId, " +
-                        "name=${expert.name}, rect=${candidate.localFaceRect.x},${candidate.localFaceRect.y}," +
-                        "${candidate.localFaceRect.width},${candidate.localFaceRect.height}"
+                        "name=${expert.name}, rect=${upload.localFaceRect.x},${upload.localFaceRect.y}," +
+                        "${upload.localFaceRect.width},${upload.localFaceRect.height}"
                 )
-                expert.copy(faceRect = candidate.localFaceRect)
+                expert.copy(faceRect = upload.localFaceRect)
             }
             val dedupeKey = realtimeExpertDedupeKey(expertWithRect)
             if (!markRealtimeExpertRecordSaveAllowed(dedupeKey, now)) {
@@ -4271,18 +4366,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     statusText = "实时识别成功"
                 )
                 record.originalImagePath = saveHistoryImage(recordId, "original", candidate.frameBytes)
-                record.uploadImagePath = saveHistoryImage(recordId, "upload", candidate.uploadBytes)
+                record.uploadImagePath = saveHistoryImage(recordId, "upload", upload.uploadBytes)
                 record.originalWidth = candidate.frameWidth
                 record.originalHeight = candidate.frameHeight
-                record.uploadWidth = candidate.uploadWidth
-                record.uploadHeight = candidate.uploadHeight
-                record.localFaceRects.add(candidate.localFaceRect)
+                record.uploadWidth = upload.uploadWidth
+                record.uploadHeight = upload.uploadHeight
+                record.localFaceRects.add(upload.localFaceRect)
                 record.experts.add(expertWithRect)
 
                 val cropRect = expertWithRect.faceRect
                 if (cropRect != null) {
                     val crop = cropAndSaveBestFaceImage(
-                        candidate.uploadBytes,
+                        upload.uploadBytes,
                         candidate.frameBytes,
                         cropRect,
                         recordId
@@ -4378,8 +4473,67 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun handleRtmpPreviewFrame(intent: Intent) {
         val jpegBytes = intent.getByteArrayExtra(RtmpReceiverService.EXTRA_PREVIEW_JPEG) ?: return
         val decodedFrames = intent.getLongExtra(RtmpReceiverService.EXTRA_DECODED_FRAMES, 0L)
+        handleRtmpPreviewFrame(jpegBytes, decodedFrames)
+    }
+
+    private fun handleRtmpPreviewFrame(jpegBytes: ByteArray, decodedFrames: Long) {
         latestRtmpPreviewFrameIndex = decodedFrames
         val now = System.currentTimeMillis()
+        maybeStartRealtimePreviewDetection(jpegBytes, decodedFrames, now)
+        renderRealtimePreviewFrame(jpegBytes, decodedFrames)
+    }
+
+    private fun renderRealtimePreviewFrame(jpegBytes: ByteArray, decodedFrames: Long) {
+        if (isRtmpPreviewRenderRunning) {
+            return
+        }
+        isRtmpPreviewRenderRunning = true
+        executeWorker("实时视频画面预览") {
+            var decodedBitmap: Bitmap? = null
+            try {
+                val bitmap = BitmapFactory.decodeByteArray(
+                    jpegBytes,
+                    0,
+                    jpegBytes.size,
+                    BitmapFactory.Options().apply { inMutable = true }
+                )
+                if (bitmap == null) {
+                    recordDiagnostic("实时视频预览帧解码失败: bytes=${jpegBytes.size}")
+                    return@executeWorker
+                }
+                decodedBitmap = bitmap
+                val overlay = drawRealtimeOverlaySnapshot(bitmap, latestRealtimeOverlaySnapshot)
+                publishRealtimePreviewBitmap(
+                    overlay = overlay,
+                    statusText = latestRealtimeOverlaySnapshot
+                        ?.takeIf { System.currentTimeMillis() - it.createdAt <= REALTIME_OVERLAY_HOLD_MS }
+                        ?.statusText
+                )
+                if (overlay !== bitmap) {
+                    try {
+                        bitmap.recycle()
+                    } catch (_: Exception) {
+                    }
+                    decodedBitmap = null
+                }
+            } catch (e: Exception) {
+                recordDiagnostic("实时视频预览渲染异常: frame=$decodedFrames", e)
+            } finally {
+                if (decodedBitmap != null && !::binding.isInitialized) {
+                    try {
+                        decodedBitmap.recycle()
+                    } catch (_: Exception) {
+                    }
+                }
+                isRtmpPreviewRenderRunning = false
+            }
+        }
+    }
+
+    private fun maybeStartRealtimePreviewDetection(jpegBytes: ByteArray, decodedFrames: Long, now: Long) {
+        if (now - lastRealtimeFaceDetectAt < REALTIME_PREVIEW_DETECT_INTERVAL_MS) {
+            return
+        }
         if (isRtmpPreviewFaceDetectionRunning) {
             val startedAt = rtmpPreviewFaceDetectionStartedAt
             if (startedAt > 0L && now - startedAt > REALTIME_PREVIEW_PROCESS_STALL_MS) {
@@ -4395,18 +4549,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         isRtmpPreviewFaceDetectionRunning = true
         rtmpPreviewFaceDetectionStartedAt = now
+        lastRealtimeFaceDetectAt = now
         val detectionToken = rtmpPreviewFaceDetectionToken + 1L
         rtmpPreviewFaceDetectionToken = detectionToken
-        executeWorker("实时视频本地检脸预览") {
+        executeWorker("实时视频本地检脸") {
+            var bitmap: Bitmap? = null
             try {
-                val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                if (bitmap == null) {
+                val decodeOptions = BitmapFactory.Options().apply {
+                    inMutable = true
+                }
+                bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, decodeOptions)
+                val detectionBitmap = bitmap
+                if (detectionBitmap == null) {
                     recordDiagnostic("实时视频预览帧解码失败: bytes=${jpegBytes.size}")
                     return@executeWorker
                 }
                 val faces = try {
                     Tasks.await(
-                        getRealtimeFaceDetector().process(InputImage.fromBitmap(bitmap, 0)),
+                        getRealtimeFaceDetector().process(InputImage.fromBitmap(detectionBitmap, 0)),
                         REALTIME_PREVIEW_FACE_DETECT_TIMEOUT_MS,
                         TimeUnit.MILLISECONDS
                     )
@@ -4415,41 +4575,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     emptyList<Face>()
                 }
                 latestRealtimeFaceCount = faces.size
+                val crowdModeForFrame = faces.size >= REALTIME_CROWD_MODE_MIN_FACES ||
+                    isRealtimeCrowdModeActive(System.currentTimeMillis())
+                val faceEvaluations = evaluateRealtimeFaces(detectionBitmap, faces, crowdModeForFrame)
                 if (isRealtimeCloudRecognitionAllowed()) {
-                    updateRealtimeFaceCandidates(bitmap, faces, decodedFrames, jpegBytes)
+                    updateRealtimeFaceCandidates(
+                        bitmap = detectionBitmap,
+                        faces = faces,
+                        decodedFrames = decodedFrames,
+                        frameBytes = jpegBytes,
+                        faceEvaluations = faceEvaluations
+                    )
                 }
-                val overlay = drawRealtimeFaceOverlay(bitmap, faces)
-                val statusText = if (faces.isEmpty()) {
-                    "本地人脸 0 张"
-                } else {
-                    "本地人脸 ${faces.size} 张；蓝框可上云，红框质量不足"
-                }
+                val bitmapWidth = detectionBitmap.width
+                val bitmapHeight = detectionBitmap.height
+                val overlaySnapshot = buildRealtimeOverlaySnapshot(
+                    frameWidth = bitmapWidth,
+                    frameHeight = bitmapHeight,
+                    faces = faces,
+                    faceEvaluations = faceEvaluations,
+                    crowdModeForFrame = crowdModeForFrame
+                )
+                latestRealtimeOverlaySnapshot = overlaySnapshot
+                val statusText = overlaySnapshot.statusText
                 runOnUiThread {
                     if (::binding.isInitialized) {
-                        val old = currentRtmpPreviewBitmap
-                        currentRtmpPreviewBitmap = overlay
-                        binding.ivPreview.setImageBitmap(overlay)
                         binding.tvMainRealtimePreviewStatus.text = statusText
                         binding.tvMainRealtimeStatus.text = mainRealtimeStatusText(latestRtmpReceiverSnapshot)
                         if (binding.settingsPage.visibility == View.VISIBLE) {
-                            binding.ivRealtimeStreamPreview.setImageBitmap(overlay)
                             binding.tvRealtimeStreamStatus.text = statusText
                         }
-                        if (old != null && old !== overlay) {
-                            try {
-                                old.recycle()
-                            } catch (_: Exception) {}
-                        }
-                    } else {
-                        try {
-                            overlay.recycle()
-                        } catch (_: Exception) {}
-                    }
-                }
-                if (overlay !== bitmap) {
-                    try {
-                        bitmap.recycle()
-                    } catch (_: Exception) {
                     }
                 }
                 val nowForLog = System.currentTimeMillis()
@@ -4461,15 +4616,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     lastRealtimeLoggedFaceCount = faces.size
                     recordDiagnostic(
                         "实时视频本地检脸: decodedFrames=$decodedFrames, faces=${faces.size}, " +
-                            "bitmap=${bitmap.width}x${bitmap.height}, bytes=${jpegBytes.size}"
+                            "bitmap=${bitmapWidth}x$bitmapHeight, bytes=${jpegBytes.size}"
                     )
                 }
             } catch (e: Exception) {
                 recordDiagnostic("实时视频预览处理异常: frame=$decodedFrames", e)
             } finally {
+                try {
+                    bitmap?.recycle()
+                } catch (_: Exception) {
+                }
                 if (rtmpPreviewFaceDetectionToken == detectionToken) {
                     isRtmpPreviewFaceDetectionRunning = false
                     rtmpPreviewFaceDetectionStartedAt = 0L
+                }
+            }
+        }
+    }
+
+    private fun publishRealtimePreviewBitmap(overlay: Bitmap, statusText: String?) {
+        runOnUiThread {
+            if (!::binding.isInitialized || isFinishing || isDestroyed) {
+                try {
+                    overlay.recycle()
+                } catch (_: Exception) {
+                }
+                return@runOnUiThread
+            }
+            currentRtmpPreviewBitmap = overlay
+            binding.ivPreview.setImageBitmap(overlay)
+            statusText?.let {
+                binding.tvMainRealtimePreviewStatus.text = it
+            }
+            binding.tvMainRealtimeStatus.text = mainRealtimeStatusText(latestRtmpReceiverSnapshot)
+            if (binding.settingsPage.visibility == View.VISIBLE) {
+                binding.ivRealtimeStreamPreview.setImageBitmap(overlay)
+                statusText?.let {
+                    binding.tvRealtimeStreamStatus.text = it
                 }
             }
         }
@@ -4884,15 +5067,60 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun drawRealtimeFaceOverlay(bitmap: Bitmap, faces: List<Face>): Bitmap {
-        if (faces.isEmpty()) {
+    private fun buildRealtimeOverlaySnapshot(
+        frameWidth: Int,
+        frameHeight: Int,
+        faces: List<Face>,
+        faceEvaluations: Map<Face, RealtimeFaceEvaluation>,
+        crowdModeForFrame: Boolean
+    ): RealtimeOverlaySnapshot {
+        val boxes = faces.mapIndexedNotNull { index, face ->
+            val evaluation = faceEvaluations[face] ?: return@mapIndexedNotNull null
+            val boxColor = if (evaluation.canUpload) {
+                REALTIME_FACE_BOX_READY_COLOR
+            } else {
+                REALTIME_FACE_BOX_LOW_QUALITY_COLOR
+            }
+            val sideLabel = if (abs(face.headEulerAngleY) >= REALTIME_SIDE_PROFILE_MIN_YAW) "侧脸 " else ""
+            val label = "#${index + 1} ${if (evaluation.canUpload) "可上云" else "质量低"} " +
+                "${sideLabel}q=${evaluation.qualityScore}"
+            RealtimeOverlayBox(
+                rect = Rect(evaluation.faceRect),
+                color = boxColor,
+                label = label
+            )
+        }
+        val statusText = if (faces.isEmpty()) {
+            "本地人脸 0 张"
+        } else {
+            "本地人脸 ${faces.size} 张；蓝框可上云，红框质量不足" +
+                if (crowdModeForFrame) "；多人高峰模式" else ""
+        }
+        return RealtimeOverlaySnapshot(
+            boxes = boxes,
+            frameWidth = frameWidth,
+            frameHeight = frameHeight,
+            createdAt = System.currentTimeMillis(),
+            statusText = statusText
+        )
+    }
+
+    private fun drawRealtimeOverlaySnapshot(bitmap: Bitmap, snapshot: RealtimeOverlaySnapshot?): Bitmap {
+        if (snapshot == null ||
+            snapshot.boxes.isEmpty() ||
+            System.currentTimeMillis() - snapshot.createdAt > REALTIME_OVERLAY_HOLD_MS
+        ) {
             return bitmap
         }
         return try {
-            val overlay = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+            val overlay = if (bitmap.isMutable) {
+                bitmap
+            } else {
+                bitmap.copy(Bitmap.Config.ARGB_8888, true)
+            }
             val canvas = Canvas(overlay)
-            val now = System.currentTimeMillis()
-            val crowdMode = faces.size >= REALTIME_CROWD_MODE_MIN_FACES || isRealtimeCrowdModeActive(now)
+            val scaleX = overlay.width.toFloat() / snapshot.frameWidth.toFloat().coerceAtLeast(1f)
+            val scaleY = overlay.height.toFloat() / snapshot.frameHeight.toFloat().coerceAtLeast(1f)
             val rectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = maxOf(3f, minOf(overlay.width, overlay.height) / 180f)
@@ -4905,41 +5133,53 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 textSize = maxOf(18f, minOf(overlay.width, overlay.height) / 24f)
                 color = Color.WHITE
             }
-            faces.forEachIndexed { index, face ->
-                val rect = clippedRect(Rect(face.boundingBox), overlay.width, overlay.height) ?: return@forEachIndexed
-                val faceAreaRatio = rect.width().toFloat() * rect.height().toFloat() /
-                    (overlay.width.toFloat() * overlay.height.toFloat()).coerceAtLeast(1f)
-                val quality = scoreVideoFaceCandidate(bitmap, face, rect)
-                val canUpload = isUsableRealtimeCloudCandidate(
-                    faceAreaRatio = faceAreaRatio,
-                    quality = quality,
-                    yaw = face.headEulerAngleY,
-                    pitch = face.headEulerAngleX,
-                    crowdMode = crowdMode
+            snapshot.boxes.forEach { box ->
+                val rect = Rect(
+                    (box.rect.left * scaleX).roundToInt().coerceIn(0, overlay.width),
+                    (box.rect.top * scaleY).roundToInt().coerceIn(0, overlay.height),
+                    (box.rect.right * scaleX).roundToInt().coerceIn(0, overlay.width),
+                    (box.rect.bottom * scaleY).roundToInt().coerceIn(0, overlay.height)
                 )
-                val boxColor = if (canUpload) {
-                    REALTIME_FACE_BOX_READY_COLOR
-                } else {
-                    REALTIME_FACE_BOX_LOW_QUALITY_COLOR
+                if (rect.width() <= 0 || rect.height() <= 0) {
+                    return@forEach
                 }
-                rectPaint.color = boxColor
+                rectPaint.color = box.color
                 canvas.drawRect(rect, rectPaint)
-                val sideLabel = if (abs(face.headEulerAngleY) >= REALTIME_SIDE_PROFILE_MIN_YAW) "侧脸 " else ""
-                val label = "#${index + 1} ${if (canUpload) "可上云" else "质量低"} ${sideLabel}q=$quality"
                 val labelPadding = maxOf(4f, textPaint.textSize / 5f)
-                val labelWidth = textPaint.measureText(label) + labelPadding * 2f
+                val labelWidth = textPaint.measureText(box.label) + labelPadding * 2f
                 val labelHeight = textPaint.textSize + labelPadding * 2f
                 val labelLeft = rect.left.toFloat().coerceAtMost((overlay.width - labelWidth).coerceAtLeast(0f))
                 val labelTop = (rect.top.toFloat() - labelHeight).takeIf { it >= 0f } ?: rect.top.toFloat()
-                labelBgPaint.color = Color.argb(190, Color.red(boxColor), Color.green(boxColor), Color.blue(boxColor))
+                labelBgPaint.color = Color.argb(190, Color.red(box.color), Color.green(box.color), Color.blue(box.color))
                 canvas.drawRect(labelLeft, labelTop, labelLeft + labelWidth, labelTop + labelHeight, labelBgPaint)
-                canvas.drawText(label, labelLeft + labelPadding, labelTop + labelPadding + textPaint.textSize * 0.82f, textPaint)
+                canvas.drawText(
+                    box.label,
+                    labelLeft + labelPadding,
+                    labelTop + labelPadding + textPaint.textSize * 0.82f,
+                    textPaint
+                )
             }
             overlay
         } catch (e: Exception) {
             recordDiagnostic("实时流预览标注失败", e)
             bitmap
         }
+    }
+
+    private fun drawRealtimeFaceOverlay(
+        bitmap: Bitmap,
+        faces: List<Face>,
+        faceEvaluations: Map<Face, RealtimeFaceEvaluation>? = null,
+        crowdModeForFrame: Boolean? = null
+    ): Bitmap {
+        if (faces.isEmpty()) {
+            return bitmap
+        }
+        val crowdMode = crowdModeForFrame ?: (faces.size >= REALTIME_CROWD_MODE_MIN_FACES ||
+            isRealtimeCrowdModeActive(System.currentTimeMillis()))
+        val evaluations = faceEvaluations ?: evaluateRealtimeFaces(bitmap, faces, crowdMode)
+        val snapshot = buildRealtimeOverlaySnapshot(bitmap.width, bitmap.height, faces, evaluations, crowdMode)
+        return drawRealtimeOverlaySnapshot(bitmap, snapshot)
     }
 
     private fun maskStreamUrlForDiagnostics(rawUrl: String): String {
@@ -7015,25 +7255,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         val coreRect = clippedRect(Rect(coreLeft, coreTop, coreRight, coreBottom), bitmap.width, bitmap.height) ?: return 0
 
-        
-
-        val crop = Bitmap.createBitmap(bitmap, coreRect.left, coreRect.top, coreRect.width(), coreRect.height())
-
-        
-
         // 2. 限制五官核心区大图的最大边为 120 像素，避免过大分辨率或小分辨率带来的特征梯度失真，实现公平打分
 
-        val small = resizeBitmapToMaxSide(crop, 120)
+        val coreWidth = coreRect.width()
 
-        val sWidth = small.width
+        val coreHeight = coreRect.height()
 
-        val sHeight = small.height
+        val scale = minOf(1f, REALTIME_SHARPNESS_SAMPLE_MAX_SIDE.toFloat() / maxOf(coreWidth, coreHeight).toFloat())
+
+        val sWidth = (coreWidth * scale).roundToInt().coerceAtLeast(1)
+
+        val sHeight = (coreHeight * scale).roundToInt().coerceAtLeast(1)
 
         if (sWidth < 3 || sHeight < 3) {
-
-            if (small !== crop) small.recycle()
-
-            crop.recycle()
 
             return 0
 
@@ -7043,7 +7277,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         val pixels = IntArray(sWidth * sHeight)
 
-        small.getPixels(pixels, 0, sWidth, 0, 0, sWidth, sHeight)
+        for (sampleY in 0 until sHeight) {
+
+            val sourceY = (coreRect.top + ((sampleY + 0.5f) * coreHeight / sHeight).toInt())
+                .coerceIn(coreRect.top, coreRect.bottom - 1)
+
+            for (sampleX in 0 until sWidth) {
+
+                val sourceX = (coreRect.left + ((sampleX + 0.5f) * coreWidth / sWidth).toInt())
+                    .coerceIn(coreRect.left, coreRect.right - 1)
+
+                pixels[sampleY * sWidth + sampleX] = bitmap.getPixel(sourceX, sourceY)
+
+            }
+
+        }
 
         var gradientSum = 0L
 
@@ -7066,13 +7314,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
         }
-
-        if (small !== crop) small.recycle()
-
-        crop.recycle()
-
-        
-
         // 归一化平均差值，乘以 120 放大映射到 0~8000 区间，更保真地反映出五官对焦清晰度与防晃动程度
 
         val avgGradient = if (count == 0) 0f else (gradientSum.toFloat() / count.toFloat())
@@ -12953,8 +13194,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         unregisterRtmpReceiverBroadcasts()
 
-        currentRtmpPreviewBitmap?.recycle()
+        if (::binding.isInitialized) {
+            binding.ivPreview.setImageDrawable(null)
+            binding.ivRealtimeStreamPreview.setImageDrawable(null)
+        }
         currentRtmpPreviewBitmap = null
+        latestRealtimeOverlaySnapshot = null
 
         super.onDestroy()
 
@@ -13288,6 +13533,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val REALTIME_FACE_LOG_INTERVAL_MS = 3000L
 
         private const val REALTIME_PREVIEW_FACE_DETECT_TIMEOUT_MS = 1_800L
+
+        private const val REALTIME_PREVIEW_DETECT_INTERVAL_MS = 150L
+
+        private const val REALTIME_OVERLAY_HOLD_MS = 600L
+
+        private const val REALTIME_SHARPNESS_SAMPLE_MAX_SIDE = 120
 
         private const val REALTIME_PREVIEW_PROCESS_STALL_MS = 3_500L
 
@@ -13637,6 +13888,29 @@ data class FaceCropCandidate(
 
 )
 
+data class RealtimeFaceEvaluation(
+    val faceRect: Rect,
+    val qualityScore: Int,
+    val canUpload: Boolean,
+    val faceAreaRatio: Float,
+    val faceCenterX: Float,
+    val faceCenterY: Float
+)
+
+data class RealtimeOverlayBox(
+    val rect: Rect,
+    val color: Int,
+    val label: String
+)
+
+data class RealtimeOverlaySnapshot(
+    val boxes: List<RealtimeOverlayBox>,
+    val frameWidth: Int,
+    val frameHeight: Int,
+    val createdAt: Long,
+    val statusText: String
+)
+
 data class RealtimeFaceCandidate(
     val createdAt: Long,
     val decodedFrames: Long,
@@ -13644,10 +13918,7 @@ data class RealtimeFaceCandidate(
     val frameBytes: ByteArray,
     val frameWidth: Int,
     val frameHeight: Int,
-    val uploadBytes: ByteArray,
-    val uploadWidth: Int,
-    val uploadHeight: Int,
-    val localFaceRect: FaceRect,
+    val faceRectInFrame: Rect,
     val faceAreaRatio: Float,
     val faceCenterX: Float,
     val faceCenterY: Float,
@@ -13655,6 +13926,13 @@ data class RealtimeFaceCandidate(
     val pitch: Float,
     val roll: Float,
     val trackingId: Int?
+)
+
+data class RealtimeUploadPayload(
+    val uploadBytes: ByteArray,
+    val uploadWidth: Int,
+    val uploadHeight: Int,
+    val localFaceRect: FaceRect
 )
 
 data class RealtimePersonTrack(

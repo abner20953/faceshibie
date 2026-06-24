@@ -1,21 +1,23 @@
 package com.bidding.glasses
 
 import android.graphics.Bitmap
-import android.graphics.Color
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
-import kotlin.math.roundToInt
 
 /**
  * Low-rate H.264 preview decoder for the embedded RTMP receiver.
  *
  * This is deliberately a preview probe, not the final recognition pipeline:
  * it decodes all video access units to keep the codec state healthy, but only emits
- * a small JPEG frame every few hundred milliseconds for UI preview / local face boxes.
+ * a throttled JPEG frame for UI preview / local face boxes.
  */
 class RtmpAvcPreviewDecoder(
     private val callback: Callback
@@ -198,15 +200,156 @@ class RtmpAvcPreviewDecoder(
 
     private fun emitPreviewFrame(image: Image) {
         try {
-            val bitmap = yuvImageToScaledBitmap(image, PREVIEW_MAX_SIDE)
-            val bytes = ByteArrayOutputStream().use { output ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, PREVIEW_JPEG_QUALITY, output)
-                output.toByteArray()
-            }
-            callback.onPreviewFrame(bytes, bitmap.width, bitmap.height, decodedFrames)
-            bitmap.recycle()
+            val frame = imageToNativeJpegFrame(image)
+            callback.onPreviewFrame(frame.bytes, frame.width, frame.height, decodedFrames)
         } catch (e: Exception) {
             callback.onDecoderLog("RTMP 预览帧生成失败", e)
+        }
+    }
+
+    private fun imageToNativeJpegFrame(image: Image): PreviewFrame {
+        val crop = normalizedEvenCrop(image.cropRect, image.width, image.height)
+        val width = crop.width()
+        val height = crop.height()
+        require(width >= 2 && height >= 2) { "Invalid preview crop: $crop" }
+        val nv21 = yuv420ThreePlanesToNV21(image, crop, width, height)
+        val bytes = ByteArrayOutputStream((width * height / 6).coerceAtLeast(32 * 1024)).use { out ->
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val success = yuvImage.compressToJpeg(Rect(0, 0, width, height), PREVIEW_JPEG_QUALITY, out)
+            require(success) { "YuvImage.compressToJpeg failed: ${width}x$height" }
+            out.toByteArray()
+        }
+        return maybeScaleJpegFrame(bytes, width, height, PREVIEW_JPEG_MAX_SIDE)
+    }
+
+    private fun normalizedEvenCrop(rawCrop: Rect, imageWidth: Int, imageHeight: Int): Rect {
+        val left = rawCrop.left.coerceIn(0, (imageWidth - 2).coerceAtLeast(0)) and -2
+        val top = rawCrop.top.coerceIn(0, (imageHeight - 2).coerceAtLeast(0)) and -2
+        var right = rawCrop.right.coerceIn(left + 2, imageWidth)
+        var bottom = rawCrop.bottom.coerceIn(top + 2, imageHeight)
+        if ((right - left) % 2 != 0) {
+            right -= 1
+        }
+        if ((bottom - top) % 2 != 0) {
+            bottom -= 1
+        }
+        return Rect(left, top, right.coerceAtLeast(left + 2), bottom.coerceAtLeast(top + 2))
+    }
+
+    private fun yuv420ThreePlanesToNV21(image: Image, crop: Rect, width: Int, height: Int): ByteArray {
+        require(image.planes.size >= 3) { "Unsupported decoded image planes=${image.planes.size}" }
+        val planes = image.planes
+        val yPlaneSize = width * height
+        val nv21 = ByteArray(yPlaneSize + width * height / 2)
+        copyLumaPlaneToNv21(planes[0], crop, width, height, nv21)
+        copyChromaPlanesToNv21(
+            uPlane = planes[1],
+            vPlane = planes[2],
+            crop = crop,
+            width = width,
+            height = height,
+            output = nv21,
+            outputOffset = yPlaneSize
+        )
+        return nv21
+    }
+
+    private fun copyLumaPlaneToNv21(
+        plane: Image.Plane,
+        crop: Rect,
+        width: Int,
+        height: Int,
+        output: ByteArray
+    ) {
+        val buffer = plane.buffer.duplicate()
+        val basePosition = buffer.position()
+        val limit = buffer.limit()
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        for (row in 0 until height) {
+            val sourceRow = crop.top + row
+            val sourceIndex = basePosition + sourceRow * rowStride + crop.left * pixelStride
+            val outputIndex = row * width
+            if (pixelStride == 1 && sourceIndex >= basePosition && sourceIndex + width <= limit) {
+                buffer.position(sourceIndex)
+                buffer.get(output, outputIndex, width)
+            } else {
+                for (col in 0 until width) {
+                    output[outputIndex + col] = readPlaneByte(
+                        plane = plane,
+                        x = crop.left + col,
+                        y = sourceRow,
+                        fallback = 16
+                    )
+                }
+            }
+        }
+    }
+
+    private fun copyChromaPlanesToNv21(
+        uPlane: Image.Plane,
+        vPlane: Image.Plane,
+        crop: Rect,
+        width: Int,
+        height: Int,
+        output: ByteArray,
+        outputOffset: Int
+    ) {
+        val chromaWidth = width / 2
+        val chromaHeight = height / 2
+        val chromaLeft = crop.left / 2
+        val chromaTop = crop.top / 2
+        for (row in 0 until chromaHeight) {
+            val outputRow = outputOffset + row * width
+            val sourceY = chromaTop + row
+            for (col in 0 until chromaWidth) {
+                val sourceX = chromaLeft + col
+                val outputIndex = outputRow + col * 2
+                output[outputIndex] = readPlaneByte(vPlane, sourceX, sourceY, fallback = 128)
+                output[outputIndex + 1] = readPlaneByte(uPlane, sourceX, sourceY, fallback = 128)
+            }
+        }
+    }
+
+    private fun readPlaneByte(plane: Image.Plane, x: Int, y: Int, fallback: Int): Byte {
+        val buffer = plane.buffer
+        val index = buffer.position() + y * plane.rowStride + x * plane.pixelStride
+        return if (index >= buffer.position() && index < buffer.limit()) {
+            buffer.get(index)
+        } else {
+            fallback.toByte()
+        }
+    }
+
+    private fun maybeScaleJpegFrame(bytes: ByteArray, width: Int, height: Int, maxSide: Int): PreviewFrame {
+        val largestSide = maxOf(width, height)
+        if (largestSide <= maxSide) {
+            return PreviewFrame(bytes, width, height)
+        }
+        val scale = maxSide.toFloat() / largestSide.toFloat()
+        val targetWidth = (width * scale).toInt().coerceAtLeast(2)
+        val targetHeight = (height * scale).toInt().coerceAtLeast(2)
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: return PreviewFrame(bytes, width, height)
+        val scaled = try {
+            Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+        } finally {
+            try {
+                source.recycle()
+            } catch (_: Exception) {
+            }
+        }
+        return try {
+            val scaledBytes = ByteArrayOutputStream((targetWidth * targetHeight / 6).coerceAtLeast(32 * 1024)).use { out ->
+                scaled.compress(Bitmap.CompressFormat.JPEG, PREVIEW_JPEG_QUALITY, out)
+                out.toByteArray()
+            }
+            PreviewFrame(scaledBytes, targetWidth, targetHeight)
+        } finally {
+            try {
+                scaled.recycle()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -366,53 +509,7 @@ class RtmpAvcPreviewDecoder(
         return output.toByteArray()
     }
 
-    private fun yuvImageToScaledBitmap(image: Image, maxSide: Int): Bitmap {
-        require(image.planes.size >= 3) { "Unsupported decoded image planes=${image.planes.size}" }
-        val crop = image.cropRect
-        val sourceWidth = crop.width().coerceAtLeast(1)
-        val sourceHeight = crop.height().coerceAtLeast(1)
-        val scale = minOf(1f, maxSide.toFloat() / maxOf(sourceWidth, sourceHeight).toFloat())
-        val targetWidth = (sourceWidth * scale).roundToInt().coerceAtLeast(1)
-        val targetHeight = (sourceHeight * scale).roundToInt().coerceAtLeast(1)
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
-        val pixels = IntArray(targetWidth * targetHeight)
 
-        for (targetY in 0 until targetHeight) {
-            val sourceY = crop.top + (targetY * sourceHeight / targetHeight)
-            for (targetX in 0 until targetWidth) {
-                val sourceX = crop.left + (targetX * sourceWidth / targetWidth)
-                val yValue = readImagePlaneValue(yBuffer, yPlane, sourceX, sourceY)
-                val chromaX = sourceX / 2
-                val chromaY = sourceY / 2
-                val uValue = readImagePlaneValue(uBuffer, uPlane, chromaX, chromaY) - 128
-                val vValue = readImagePlaneValue(vBuffer, vPlane, chromaX, chromaY) - 128
-                val luminance = (yValue - 16).coerceAtLeast(0)
-                val red = ((298 * luminance + 409 * vValue + 128) shr 8).coerceIn(0, 255)
-                val green = ((298 * luminance - 100 * uValue - 208 * vValue + 128) shr 8).coerceIn(0, 255)
-                val blue = ((298 * luminance + 516 * uValue + 128) shr 8).coerceIn(0, 255)
-                pixels[targetY * targetWidth + targetX] = Color.rgb(red, green, blue)
-            }
-        }
-        return Bitmap.createBitmap(pixels, targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun readImagePlaneValue(
-        buffer: java.nio.ByteBuffer,
-        plane: Image.Plane,
-        x: Int,
-        y: Int
-    ): Int {
-        val index = buffer.position() + y * plane.rowStride + x * plane.pixelStride
-        if (index < buffer.position() || index >= buffer.limit()) {
-            return 128
-        }
-        return buffer.get(index).toInt() and 0xFF
-    }
 
     private fun readUInt16(data: ByteArray, offset: Int): Int {
         return ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
@@ -422,6 +519,12 @@ class RtmpAvcPreviewDecoder(
         val naluLengthSize: Int,
         val sps: ByteArray,
         val pps: ByteArray
+    )
+
+    private data class PreviewFrame(
+        val bytes: ByteArray,
+        val width: Int,
+        val height: Int
     )
 
     private class BitReader(private val data: ByteArray) {
@@ -464,8 +567,8 @@ class RtmpAvcPreviewDecoder(
     companion object {
         private val START_CODE = byteArrayOf(0, 0, 0, 1)
         private const val CODEC_DEQUEUE_TIMEOUT_US = 1_000L
-        private const val PREVIEW_EMIT_INTERVAL_MS = 350L
-        private const val PREVIEW_MAX_SIDE = 960
+        private const val PREVIEW_EMIT_INTERVAL_MS = 100L
+        private const val PREVIEW_JPEG_MAX_SIDE = 1280
         private const val PREVIEW_JPEG_QUALITY = 82
     }
 }
