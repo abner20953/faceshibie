@@ -4,6 +4,8 @@ import android.Manifest
 
 import android.app.Activity
 
+import android.content.BroadcastReceiver
+
 import android.content.ClipData
 
 import android.content.ClipboardManager
@@ -13,6 +15,8 @@ import android.content.ContentUris
 import android.content.Context
 
 import android.content.Intent
+
+import android.content.IntentFilter
 
 import android.content.pm.PackageManager
 
@@ -138,6 +142,9 @@ import java.io.ByteArrayInputStream
 import java.io.File
 
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.SocketException
 
 import java.text.SimpleDateFormat
 
@@ -178,6 +185,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var binding: ActivityMainBinding
 
     private lateinit var workExecutor: ExecutorService
+
+    private lateinit var realtimeCloudExecutor: ExecutorService
 
     private lateinit var thumbnailExecutor: ExecutorService
 
@@ -249,6 +258,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private var realtimeFaceDetector: FaceDetector? = null
+
+    private var currentRtmpPreviewBitmap: Bitmap? = null
+
     
 
     // Rokid CXR-L 核心链路管理器与最新视频帧缓存
@@ -307,6 +320,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private val matchedExpertsList = ArrayList<ExpertInfo>()
 
+    private val realtimeExpertsByTrack = linkedMapOf<Long, List<ExpertInfo>>()
+
+    private val realtimeRecordLock = Any()
+
+    private val realtimeSavedExpertAt = mutableMapOf<String, Long>()
+
     private var currentDisplayIndex = 0
 
     private val recognitionRecords = Collections.synchronizedList(mutableListOf<RecognitionRecord>())
@@ -360,6 +379,73 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var isVideoPulling = false
 
     @Volatile private var isVideoRefreshing = false
+
+    @Volatile private var isRealtimeStreamRunning = false
+
+    @Volatile private var isRealtimeRecognitionPageActive = false
+
+    @Volatile private var realtimeStreamStopRequested = false
+
+    @Volatile private var activeRealtimeStreamRunId = 0L
+
+    @Volatile private var latestRtmpReceiverSnapshot = EmbeddedRtmpReceiver.Snapshot()
+
+    private var isRtmpReceiverBroadcastRegistered = false
+
+    @Volatile private var isRtmpPreviewFaceDetectionRunning = false
+
+    @Volatile private var rtmpPreviewFaceDetectionStartedAt = 0L
+
+    @Volatile private var rtmpPreviewFaceDetectionToken = 0L
+
+    @Volatile private var latestRtmpPreviewFrameIndex = 0L
+
+    @Volatile private var latestRealtimeFaceCount = -1
+
+    private val realtimeTrackLock = Any()
+
+    private val realtimePersonTracks = mutableListOf<RealtimePersonTrack>()
+
+    private var realtimeTrackSequence = 0L
+
+    @Volatile private var activeRealtimeCloudRequestCount = 0
+
+    @Volatile private var lastRealtimeCloudRequestAt = 0L
+
+    @Volatile private var lastRealtimeCrowdModeAt = 0L
+
+    @Volatile private var lastRealtimeCrowdModeLogged = false
+
+    @Volatile private var latestRealtimeResultNames = ""
+
+    @Volatile private var latestRealtimeResultAt = 0L
+
+    @Volatile private var lastRealtimeFaceLogAt = 0L
+
+    @Volatile private var lastRealtimeLoggedFaceCount = -1
+
+    private val rtmpReceiverBroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                RtmpReceiverService.ACTION_STATUS -> {
+                    latestRtmpReceiverSnapshot = rtmpSnapshotFromIntent(intent)
+                    renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+                }
+                RtmpReceiverService.ACTION_LOG -> {
+                    val message = intent.getStringExtra(RtmpReceiverService.EXTRA_MESSAGE).orEmpty()
+                    val throwableText = intent.getStringExtra(RtmpReceiverService.EXTRA_THROWABLE).orEmpty()
+                    if (throwableText.isBlank()) {
+                        recordDiagnostic("RTMP接收验证: $message")
+                    } else {
+                        recordDiagnostic("RTMP接收验证: $message\n${throwableText.lineSequence().take(8).joinToString("\n")}")
+                    }
+                }
+                RtmpReceiverService.ACTION_PREVIEW -> {
+                    handleRtmpPreviewFrame(intent)
+                }
+            }
+        }
+    }
 
     // 网络请求与配置
 
@@ -447,11 +533,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         setContentView(binding.root)
 
+        isRealtimeRecognitionPageActive = binding.mainPage.visibility == View.VISIBLE
+
         // 初始化本地语音播报和线程池
 
         tts = TextToSpeech(this, this)
 
         workExecutor = Executors.newFixedThreadPool(MAX_PARALLEL_WORKERS)
+
+        realtimeCloudExecutor = Executors.newFixedThreadPool(REALTIME_CROWD_CLOUD_MAX_CONCURRENT_REQUESTS)
 
         thumbnailExecutor = Executors.newCachedThreadPool()
 
@@ -524,6 +614,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             recordDiagnostic("用户点击现场抓拍比对")
 
             takePhotoAndMatch()
+
+        }
+
+        binding.btnMainStartRtmpReceiver.setOnClickListener {
+
+            startEmbeddedRtmpReceiver()
+
+        }
+
+        binding.btnMainStopRtmpReceiver.setOnClickListener {
+
+            stopEmbeddedRtmpReceiver("用户在主页面停止实时视频")
+
+        }
+
+        binding.btnMainCopyRtmpPushAddress.setOnClickListener {
+
+            copyRtmpPushAddressToClipboard()
 
         }
 
@@ -605,6 +713,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
+        binding.btnStartRealtimeStreamTest.setOnClickListener {
+
+            startRealtimeStreamTest()
+
+        }
+
+        binding.btnStopRealtimeStreamTest.setOnClickListener {
+
+            stopRealtimeStreamTest("用户点击停止")
+
+        }
+
+        binding.btnStartRtmpReceiver.setOnClickListener {
+
+            restartEmbeddedRtmpReceiver()
+
+        }
+
+        binding.btnStopRtmpReceiver.setOnClickListener {
+
+            stopEmbeddedRtmpReceiver("用户点击停止")
+
+        }
+
+        binding.btnCopyRtmpPushAddress.setOnClickListener {
+
+            copyRtmpPushAddressToClipboard()
+
+        }
+
         binding.btnPickVideo.setOnClickListener {
 
             launchVideoPicker()
@@ -629,6 +767,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
+        updateRtmpReceiverAddressHint()
+
+        registerRtmpReceiverBroadcasts()
+
+        ensureRealtimeReceiverRunningForMainPage()
+
     }
 
     private var isActivityResumed = false
@@ -639,6 +783,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         isActivityResumed = true
 
+        latestRtmpReceiverSnapshot = RtmpReceiverService.latestSnapshot
+
+        updateRtmpReceiverAddressHint()
+
+        renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+
         recordDiagnostic("Activity 状态变更为: RESUMED")
 
     }
@@ -648,6 +798,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onPause()
 
         isActivityResumed = false
+
+        stopRealtimeStreamTest("Activity 暂停")
 
         recordDiagnostic("Activity 状态变更为: PAUSED")
 
@@ -681,6 +833,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         try {
 
+            isRealtimeRecognitionPageActive = false
+
+            updateRtmpReceiverAddressHint()
+
             binding.mainPage.visibility = View.GONE
 
             binding.galleryPage.visibility = View.GONE
@@ -706,6 +862,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun showGalleryPage() {
 
         try {
+
+            isRealtimeRecognitionPageActive = false
+
+            stopRealtimeStreamTest("切换到图库识别页面")
 
             binding.mainPage.visibility = View.GONE
 
@@ -735,6 +895,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         try {
 
+            isRealtimeRecognitionPageActive = false
+
+            stopRealtimeStreamTest("切换到视频识别页面")
+
             binding.mainPage.visibility = View.GONE
 
             binding.galleryPage.visibility = View.GONE
@@ -762,6 +926,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun showHistoryPage() {
 
         try {
+
+            isRealtimeRecognitionPageActive = false
+
+            stopRealtimeStreamTest("切换到识别记录页面")
 
             cleanupExpiredRecognitionRecords()
 
@@ -793,6 +961,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         try {
 
+            isRealtimeRecognitionPageActive = true
+
+            stopRealtimeStreamTest("返回识别主页面")
+
             binding.galleryPage.visibility = View.GONE
 
             binding.videoPage.visibility = View.GONE
@@ -804,6 +976,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             binding.mainPage.visibility = View.VISIBLE
 
             updateBottomNavSelection(PAGE_CAPTURE)
+
+            ensureRealtimeReceiverRunningForMainPage()
 
             recordDiagnostic("返回识别主页面")
 
@@ -868,6 +1042,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             binding.settingsPage.visibility = View.GONE
 
             binding.historyPage.visibility = View.GONE
+
+            stopRealtimeStreamTest("页面异常恢复")
 
             binding.mainPage.visibility = View.VISIBLE
 
@@ -3314,6 +3490,1474 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         Log.d(TAG, "Video status: $text")
 
+    }
+
+    private fun startEmbeddedRtmpReceiver() {
+        val existing = latestRtmpReceiverSnapshot
+        if (existing.running) {
+            Toast.makeText(this, "RTMP 接收服务已启动", Toast.LENGTH_SHORT).show()
+            updateRtmpReceiverAddressHint()
+            return
+        }
+        val streamKey = binding.etRtmpStreamKey.text.toString().trim().ifBlank { DEFAULT_RTMP_STREAM_KEY }
+        binding.etRtmpStreamKey.setText(streamKey)
+        stopRealtimeStreamTest("启动内置 RTMP 接收服务")
+        latestRtmpReceiverSnapshot = EmbeddedRtmpReceiver.Snapshot(
+            running = true,
+            listening = false,
+            port = RTMP_RECEIVER_PORT,
+            expectedStreamKey = streamKey,
+            message = "正在启动 RTMP 接收服务..."
+        )
+        renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+        updateRtmpReceiverAddressHint(streamKey)
+        recordDiagnostic(
+            "内置 RTMP 接收服务启动请求: port=$RTMP_RECEIVER_PORT, streamKey=$streamKey, " +
+                "addresses=${localIpv4Addresses().joinToString("|")}"
+        )
+        val serviceIntent = Intent(this, RtmpReceiverService::class.java).apply {
+            action = RtmpReceiverService.ACTION_START
+            putExtra(RtmpReceiverService.EXTRA_PORT, RTMP_RECEIVER_PORT)
+            putExtra(RtmpReceiverService.EXTRA_STREAM_KEY, streamKey)
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+    }
+
+    private fun ensureRealtimeReceiverRunningForMainPage() {
+        if (latestRtmpReceiverSnapshot.running) {
+            return
+        }
+        startEmbeddedRtmpReceiver()
+    }
+
+    private fun stopEmbeddedRtmpReceiver(reason: String) {
+        if (!latestRtmpReceiverSnapshot.running) {
+            latestRtmpReceiverSnapshot = latestRtmpReceiverSnapshot.copy(
+                running = false,
+                listening = false,
+                clientConnected = false,
+                message = "RTMP 接收服务未启动"
+            )
+            renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+            return
+        }
+        recordDiagnostic("内置 RTMP 接收服务停止请求: reason=$reason")
+        val serviceIntent = Intent(this, RtmpReceiverService::class.java).apply {
+            action = RtmpReceiverService.ACTION_STOP
+            putExtra(RtmpReceiverService.EXTRA_REASON, reason)
+        }
+        startService(serviceIntent)
+        latestRtmpReceiverSnapshot = latestRtmpReceiverSnapshot.copy(
+            running = false,
+            listening = false,
+            clientConnected = false,
+            message = "RTMP 接收服务正在停止..."
+        )
+        renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+    }
+
+    private fun restartEmbeddedRtmpReceiver() {
+        recordDiagnostic("用户请求重启内置 RTMP 接收服务")
+        val wasRunning = latestRtmpReceiverSnapshot.running
+        if (wasRunning) {
+            stopEmbeddedRtmpReceiver("用户重启实时接收服务")
+            mainHandler.postDelayed({
+                if (!isFinishing && !isDestroyed) {
+                    startEmbeddedRtmpReceiver()
+                }
+            }, RTMP_RECEIVER_RESTART_DELAY_MS)
+        } else {
+            startEmbeddedRtmpReceiver()
+        }
+    }
+
+    private fun copyRtmpPushAddressToClipboard() {
+        val text = buildRtmpPushAddressText(binding.etRtmpStreamKey.text.toString().trim().ifBlank { DEFAULT_RTMP_STREAM_KEY })
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Rokid RTMP push config", text))
+        Toast.makeText(this, "RTMP 推流填写信息已复制", Toast.LENGTH_SHORT).show()
+        recordDiagnostic("用户复制 RTMP 推流填写信息: chars=${text.length}")
+    }
+
+    private fun updateRtmpReceiverAddressHint(
+        streamKey: String = binding.etRtmpStreamKey.text.toString().trim().ifBlank { DEFAULT_RTMP_STREAM_KEY }
+    ) {
+        if (!::binding.isInitialized) {
+            return
+        }
+        val displayText = buildRtmpPushAddressDisplayText(streamKey)
+        binding.tvRtmpReceiverAddress.text = displayText
+        binding.tvMainRtmpPushAddress.text = buildRtmpPushAddressText(streamKey)
+    }
+
+    private fun buildRtmpPushAddressDisplayText(streamKey: String): String {
+        val addresses = localIpv4Addresses()
+        val firstAddress = addresses.firstOrNull() ?: "手机IP"
+        val pushUrl = "rtmp://$firstAddress:$RTMP_RECEIVER_PORT/$RTMP_PUSH_APP_NAME"
+        val fullUrl = "$pushUrl/$streamKey"
+        return buildString {
+            appendLine("乐奇 App 填写：")
+            appendLine("推流地址：$pushUrl")
+            appendLine("推流码：$streamKey")
+            appendLine("完整地址：$fullUrl")
+            if (firstAddress != "手机IP") {
+                appendLine(selectedRtmpAddressHint(firstAddress))
+            }
+            if (addresses.size > 1) {
+                appendLine("候选 IP 已自动按热点/同网段优先排序；如无法连接，请点“复制乐奇填写信息”查看全部候选。")
+            }
+        }.trim()
+    }
+
+    private fun buildRtmpPushAddressText(streamKey: String): String {
+        val addresses = localIpv4Addresses()
+        val firstAddress = addresses.firstOrNull() ?: "手机IP"
+        val pushUrl = "rtmp://$firstAddress:$RTMP_RECEIVER_PORT/$RTMP_PUSH_APP_NAME"
+        val pullUrl = "$pushUrl/$streamKey"
+        return buildString {
+            appendLine("乐奇 App 填写：")
+            appendLine("推流地址：$pushUrl")
+            appendLine("推流码：$streamKey")
+            appendLine("注意：推流地址必须带 rtmp://")
+            if (firstAddress != "手机IP") {
+                appendLine(selectedRtmpAddressHint(firstAddress))
+            }
+            appendLine()
+            appendLine("如果乐奇 App 要求完整地址，可填：")
+            appendLine(pullUrl)
+            appendLine()
+            appendLine("手机热点测试时优先使用 10.* 地址；眼镜列表里的 10.* 通常是眼镜自己的 IP，不要填眼镜 IP。")
+            if (addresses.isEmpty()) {
+                appendLine()
+                appendLine("未读到手机局域网 IP。请先让手机连接 Wi‑Fi，或打开手机热点后再点“复制填写”。")
+            } else if (addresses.size > 1) {
+                appendLine()
+                appendLine("候选手机 IP（已按同网段/热点优先排序）：")
+                addresses.forEachIndexed { index, ip ->
+                    val prefix = if (index == 0) "推荐 " else ""
+                    appendLine("$prefix rtmp://$ip:$RTMP_RECEIVER_PORT/$RTMP_PUSH_APP_NAME  推流码：$streamKey")
+                }
+            }
+        }.trim()
+    }
+
+    private fun selectedRtmpAddressHint(selectedIp: String): String {
+        val remoteIp = currentRtmpRemoteIp()
+        return when {
+            remoteIp != null && isSameIpv4CSubnet(selectedIp, remoteIp) ->
+                "自动选择：与眼镜连接同网段的手机地址（眼镜 $remoteIp）"
+            selectedIp.startsWith("10.") ->
+                "自动选择：热点常见 10.* 手机地址"
+            selectedIp.startsWith("192.168.") ->
+                "自动选择：局域网 192.168.* 手机地址"
+            isPrivate172Address(selectedIp) ->
+                "自动选择：局域网 172.16-31.* 手机地址"
+            else ->
+                "自动选择：当前可用手机地址"
+        }
+    }
+
+    private fun renderRtmpReceiverSnapshot(snapshot: EmbeddedRtmpReceiver.Snapshot) {
+        if (!::binding.isInitialized) {
+            return
+        }
+        updateRtmpReceiverAddressHint(snapshot.expectedStreamKey.ifBlank {
+            binding.etRtmpStreamKey.text.toString().trim().ifBlank { DEFAULT_RTMP_STREAM_KEY }
+        })
+        binding.tvRtmpReceiverStatus.text = buildRtmpReceiverUserStatus(snapshot)
+        binding.tvMainRealtimeStatus.text = mainRealtimeStatusText(snapshot)
+    }
+
+    private fun buildRtmpReceiverUserStatus(snapshot: EmbeddedRtmpReceiver.Snapshot): String {
+        val serviceText = when {
+            snapshot.listening -> "已启动"
+            snapshot.running -> "启动中"
+            else -> "未启动"
+        }
+        val pushText = when {
+            snapshot.clientConnected -> "已连接"
+            snapshot.listening -> "等待眼镜推流"
+            snapshot.running -> "等待服务就绪"
+            else -> "未连接"
+        }
+        val videoText = if (snapshot.videoTags > 0) {
+            "已收到视频画面"
+        } else {
+            "未收到视频画面"
+        }
+        return buildString {
+            appendLine("接收服务：$serviceText")
+            appendLine("眼镜推流：$pushText")
+            append("视频数据：$videoText")
+            if (snapshot.remoteAddress.isNotBlank() && snapshot.clientConnected) {
+                appendLine()
+                append("连接设备：${snapshot.remoteAddress}")
+            }
+        }
+    }
+
+    private fun mainRealtimeStatusText(snapshot: EmbeddedRtmpReceiver.Snapshot): String {
+        return when {
+            snapshot.videoTags > 0 -> {
+                val facePart = if (latestRealtimeFaceCount >= 0) {
+                    "，本地人脸 $latestRealtimeFaceCount 张"
+                } else {
+                    ""
+                }
+                val crowdPart = if (isRealtimeCrowdModeActive(System.currentTimeMillis())) {
+                    "，多人高峰模式"
+                } else {
+                    ""
+                }
+                val maxConcurrent = realtimeCloudMaxConcurrentRequests(System.currentTimeMillis())
+                val cloudPart = if (activeRealtimeCloudRequestCount > 0) {
+                    "，云端 $activeRealtimeCloudRequestCount/$maxConcurrent"
+                } else {
+                    ""
+                }
+                val recentResult = latestRealtimeResultNames.isNotBlank() &&
+                    System.currentTimeMillis() - latestRealtimeResultAt <= REALTIME_RESULT_STATUS_HOLD_MS
+                if (recentResult) {
+                    "实时识别：$latestRealtimeResultNames$facePart$crowdPart$cloudPart"
+                } else {
+                    "实时画面已连接，正在本地检测$facePart$crowdPart$cloudPart"
+                }
+            }
+            snapshot.clientConnected -> "眼镜已连接，正在等待实时画面..."
+            snapshot.listening -> "实时视频接收已启动，请在乐奇 App 开始推流"
+            snapshot.running -> "正在启动实时视频接收..."
+            else -> "等待眼镜实时画面。请先在设置页启动实时视频接收。"
+        }
+    }
+
+    private fun isRealtimeCloudRecognitionAllowed(): Boolean {
+        return isRealtimeRecognitionPageActive && latestRtmpReceiverSnapshot.running
+    }
+
+    private fun registerRtmpReceiverBroadcasts() {
+        if (isRtmpReceiverBroadcastRegistered) {
+            return
+        }
+        val filter = IntentFilter().apply {
+            addAction(RtmpReceiverService.ACTION_STATUS)
+            addAction(RtmpReceiverService.ACTION_LOG)
+            addAction(RtmpReceiverService.ACTION_PREVIEW)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(rtmpReceiverBroadcastReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(rtmpReceiverBroadcastReceiver, filter)
+        }
+        isRtmpReceiverBroadcastRegistered = true
+        latestRtmpReceiverSnapshot = RtmpReceiverService.latestSnapshot
+        renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
+    }
+
+    private fun unregisterRtmpReceiverBroadcasts() {
+        if (!isRtmpReceiverBroadcastRegistered) {
+            return
+        }
+        try {
+            unregisterReceiver(rtmpReceiverBroadcastReceiver)
+        } catch (e: Exception) {
+            recordDiagnostic("RTMP 接收服务广播注销失败", e)
+        }
+        isRtmpReceiverBroadcastRegistered = false
+    }
+
+    private fun rtmpSnapshotFromIntent(intent: Intent): EmbeddedRtmpReceiver.Snapshot {
+        return EmbeddedRtmpReceiver.Snapshot(
+            running = intent.getBooleanExtra(RtmpReceiverService.EXTRA_RUNNING, false),
+            listening = intent.getBooleanExtra(RtmpReceiverService.EXTRA_LISTENING, false),
+            clientConnected = intent.getBooleanExtra(RtmpReceiverService.EXTRA_CONNECTED, false),
+            port = intent.getIntExtra(RtmpReceiverService.EXTRA_PORT, RTMP_RECEIVER_PORT),
+            expectedStreamKey = intent.getStringExtra(RtmpReceiverService.EXTRA_STREAM_KEY).orEmpty()
+                .ifBlank { DEFAULT_RTMP_STREAM_KEY },
+            appName = intent.getStringExtra(RtmpReceiverService.EXTRA_APP_NAME).orEmpty(),
+            streamName = intent.getStringExtra(RtmpReceiverService.EXTRA_STREAM_NAME).orEmpty(),
+            remoteAddress = intent.getStringExtra(RtmpReceiverService.EXTRA_REMOTE).orEmpty(),
+            videoTags = intent.getLongExtra(RtmpReceiverService.EXTRA_VIDEO_TAGS, 0L),
+            audioTags = intent.getLongExtra(RtmpReceiverService.EXTRA_AUDIO_TAGS, 0L),
+            metadataTags = intent.getLongExtra(RtmpReceiverService.EXTRA_METADATA_TAGS, 0L),
+            totalPayloadBytes = intent.getLongExtra(RtmpReceiverService.EXTRA_BYTES, 0L),
+            keyframeCount = intent.getLongExtra(RtmpReceiverService.EXTRA_KEYFRAMES, 0L),
+            avcSequenceHeaderCount = intent.getLongExtra(RtmpReceiverService.EXTRA_AVC_SEQ, 0L),
+            lastVideoCodec = intent.getStringExtra(RtmpReceiverService.EXTRA_VIDEO_CODEC).orEmpty(),
+            lastAudioCodec = intent.getStringExtra(RtmpReceiverService.EXTRA_AUDIO_CODEC).orEmpty(),
+            firstVideoAtMs = intent.getLongExtra(RtmpReceiverService.EXTRA_FIRST_VIDEO_AT, 0L),
+            lastDataAtMs = intent.getLongExtra(RtmpReceiverService.EXTRA_LAST_DATA_AT, 0L),
+            message = intent.getStringExtra(RtmpReceiverService.EXTRA_MESSAGE).orEmpty().ifBlank {
+                "RTMP 接收服务状态已更新"
+            }
+        )
+    }
+
+    private fun updateRealtimeFaceCandidates(
+        bitmap: Bitmap,
+        faces: List<Face>,
+        decodedFrames: Long,
+        frameBytes: ByteArray
+    ) {
+        val now = System.currentTimeMillis()
+        val crowdModeForFrame = faces.size >= REALTIME_CROWD_MODE_MIN_FACES || isRealtimeCrowdModeActive(now)
+        synchronized(realtimeTrackLock) {
+            realtimePersonTracks.removeAll { now - it.lastSeenAt > REALTIME_TRACK_STALE_MS }
+        }
+        faces.forEach { face ->
+            val candidate = buildRealtimeFaceCandidate(bitmap, face, decodedFrames, now, crowdModeForFrame, frameBytes) ?: return@forEach
+            synchronized(realtimeTrackLock) {
+                val track = findOrCreateRealtimeTrackLocked(candidate, now)
+                track.lastSeenAt = now
+                track.trackingId = candidate.trackingId ?: track.trackingId
+                track.centerX = candidate.faceCenterX
+                track.centerY = candidate.faceCenterY
+                track.sizeRatio = candidate.faceAreaRatio
+                val oldBest = track.bestCandidate
+                if (oldBest == null || candidate.qualityScore > oldBest.qualityScore) {
+                    track.bestCandidate = candidate
+                }
+            }
+        }
+        val activeTrackCount = synchronized(realtimeTrackLock) {
+            realtimePersonTracks.count { track ->
+                now - track.lastSeenAt <= REALTIME_TRACK_STALE_MS &&
+                    (track.bestCandidate != null || track.cloudRequestInFlight)
+            }
+        }
+        updateRealtimeCrowdModeState(faces.size, activeTrackCount, now)
+        maybeStartRealtimeCloudRecognition()
+    }
+
+    private fun buildRealtimeFaceCandidate(
+        bitmap: Bitmap,
+        face: Face,
+        decodedFrames: Long,
+        now: Long,
+        crowdMode: Boolean,
+        frameBytes: ByteArray
+    ): RealtimeFaceCandidate? {
+        val faceRect = clippedRect(Rect(face.boundingBox), bitmap.width, bitmap.height) ?: return null
+        if (faceRect.width() < 12 || faceRect.height() < 12) {
+            return null
+        }
+        val faceAreaRatio = faceRect.width().toFloat() * faceRect.height().toFloat() /
+            (bitmap.width.toFloat() * bitmap.height.toFloat()).coerceAtLeast(1f)
+        val faceCenterX = faceRect.centerX().toFloat() / bitmap.width.toFloat()
+        val faceCenterY = faceRect.centerY().toFloat() / bitmap.height.toFloat()
+        val quality = scoreVideoFaceCandidate(bitmap, face, faceRect)
+        val yaw = face.headEulerAngleY
+        val pitch = face.headEulerAngleX
+        if (!isUsableRealtimeCloudCandidate(faceAreaRatio, quality, yaw, pitch, crowdMode)) {
+            return null
+        }
+        return try {
+            val uploadImage = buildSingleFaceUploadImageFromRect(bitmap, faceRect, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
+            val uploadBytes = bitmapToJpegBytes(uploadImage.bitmap, FACE_UPLOAD_JPEG_QUALITY)
+            val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
+                0f,
+                0f,
+                uploadImage.bitmap.width.toFloat(),
+                uploadImage.bitmap.height.toFloat()
+            )
+            val candidate = RealtimeFaceCandidate(
+                createdAt = now,
+                decodedFrames = decodedFrames,
+                qualityScore = quality,
+                frameBytes = frameBytes,
+                frameWidth = bitmap.width,
+                frameHeight = bitmap.height,
+                uploadBytes = uploadBytes,
+                uploadWidth = uploadImage.bitmap.width,
+                uploadHeight = uploadImage.bitmap.height,
+                localFaceRect = localRect,
+                faceAreaRatio = faceAreaRatio,
+                faceCenterX = faceCenterX,
+                faceCenterY = faceCenterY,
+                yaw = yaw,
+                pitch = pitch,
+                roll = face.headEulerAngleZ,
+                trackingId = face.trackingId
+            )
+            try {
+                uploadImage.bitmap.recycle()
+            } catch (_: Exception) {
+            }
+            candidate
+        } catch (e: Exception) {
+            recordDiagnostic("实时视频候选裁剪失败: frame=$decodedFrames", e)
+            null
+        }
+    }
+
+    private fun isUsableRealtimeCloudCandidate(
+        faceAreaRatio: Float,
+        quality: Int,
+        yaw: Float,
+        pitch: Float,
+        crowdMode: Boolean
+    ): Boolean {
+        val minAreaRatio = if (crowdMode) {
+            REALTIME_CROWD_MIN_FACE_AREA_RATIO
+        } else {
+            REALTIME_MIN_FACE_AREA_RATIO
+        }
+        if (faceAreaRatio < minAreaRatio) {
+            return false
+        }
+        if (abs(yaw) > REALTIME_MAX_UPLOAD_YAW || abs(pitch) > REALTIME_MAX_UPLOAD_PITCH) {
+            return false
+        }
+        val sideProfile = abs(yaw) >= REALTIME_SIDE_PROFILE_MIN_YAW
+        return if (sideProfile) {
+            quality >= if (crowdMode) REALTIME_CROWD_SIDE_PROFILE_MIN_UPLOAD_QUALITY else REALTIME_SIDE_PROFILE_MIN_UPLOAD_QUALITY
+        } else {
+            quality >= if (crowdMode) REALTIME_CROWD_MIN_UPLOAD_QUALITY else REALTIME_MIN_UPLOAD_QUALITY
+        }
+    }
+
+    private fun findOrCreateRealtimeTrackLocked(candidate: RealtimeFaceCandidate, now: Long): RealtimePersonTrack {
+        candidate.trackingId?.let { trackingId ->
+            realtimePersonTracks.firstOrNull {
+                it.trackingId == trackingId && now - it.lastSeenAt <= REALTIME_TRACK_STALE_MS
+            }?.let { return it }
+        }
+        val matched = realtimePersonTracks
+            .filter { now - it.lastSeenAt <= REALTIME_TRACK_MATCH_GAP_MS }
+            .minByOrNull { track ->
+                val distance = realtimeTrackDistance(track, candidate)
+                if (distance <= REALTIME_TRACK_MAX_CENTER_DISTANCE &&
+                    realtimeSizeRatio(track.sizeRatio, candidate.faceAreaRatio) <= REALTIME_TRACK_MAX_SIZE_RATIO
+                ) {
+                    distance
+                } else {
+                    Float.MAX_VALUE
+                }
+            }
+            ?.takeIf {
+                realtimeTrackDistance(it, candidate) <= REALTIME_TRACK_MAX_CENTER_DISTANCE &&
+                    realtimeSizeRatio(it.sizeRatio, candidate.faceAreaRatio) <= REALTIME_TRACK_MAX_SIZE_RATIO
+            }
+        if (matched != null) {
+            return matched
+        }
+        val track = RealtimePersonTrack(
+            id = ++realtimeTrackSequence,
+            trackingId = candidate.trackingId,
+            firstSeenAt = now,
+            lastSeenAt = now,
+            centerX = candidate.faceCenterX,
+            centerY = candidate.faceCenterY,
+            sizeRatio = candidate.faceAreaRatio
+        )
+        realtimePersonTracks.add(track)
+        return track
+    }
+
+    private fun realtimeTrackDistance(track: RealtimePersonTrack, candidate: RealtimeFaceCandidate): Float {
+        return kotlin.math.sqrt(
+            (track.centerX - candidate.faceCenterX) * (track.centerX - candidate.faceCenterX) +
+                (track.centerY - candidate.faceCenterY) * (track.centerY - candidate.faceCenterY)
+        )
+    }
+
+    private fun realtimeSizeRatio(left: Float, right: Float): Float {
+        val minValue = minOf(left, right).coerceAtLeast(0.0001f)
+        val maxValue = maxOf(left, right).coerceAtLeast(minValue)
+        return maxValue / minValue
+    }
+
+    private fun updateRealtimeCrowdModeState(currentFaceCount: Int, activeTrackCount: Int, now: Long) {
+        if (currentFaceCount >= REALTIME_CROWD_MODE_MIN_FACES ||
+            activeTrackCount >= REALTIME_CROWD_MODE_MIN_TRACKS
+        ) {
+            lastRealtimeCrowdModeAt = now
+        }
+        val active = isRealtimeCrowdModeActive(now)
+        if (active != lastRealtimeCrowdModeLogged) {
+            lastRealtimeCrowdModeLogged = active
+            val maxConcurrent = realtimeCloudMaxConcurrentRequests(now)
+            val collectWindow = realtimeCloudCollectWindowMs(now)
+            val dispatchInterval = realtimeCloudDispatchIntervalMs(now)
+            recordDiagnostic(
+                "实时多人高峰模式${if (active) "开启" else "关闭"}: " +
+                    "faces=$currentFaceCount, tracks=$activeTrackCount, " +
+                    "maxCloud=$maxConcurrent, collectMs=$collectWindow, dispatchMs=$dispatchInterval"
+            )
+        }
+    }
+
+    private fun isRealtimeCrowdModeActive(now: Long): Boolean {
+        return lastRealtimeCrowdModeAt > 0L && now - lastRealtimeCrowdModeAt <= REALTIME_CROWD_MODE_HOLD_MS
+    }
+
+    private fun realtimeCloudMaxConcurrentRequests(now: Long): Int {
+        return if (isRealtimeCrowdModeActive(now)) {
+            REALTIME_CROWD_CLOUD_MAX_CONCURRENT_REQUESTS
+        } else {
+            REALTIME_CLOUD_MAX_CONCURRENT_REQUESTS
+        }
+    }
+
+    private fun realtimeCloudCollectWindowMs(now: Long): Long {
+        return if (isRealtimeCrowdModeActive(now)) {
+            REALTIME_CROWD_CLOUD_COLLECT_WINDOW_MS
+        } else {
+            REALTIME_CLOUD_COLLECT_WINDOW_MS
+        }
+    }
+
+    private fun realtimeCloudDispatchIntervalMs(now: Long): Long {
+        return if (isRealtimeCrowdModeActive(now)) {
+            REALTIME_CROWD_CLOUD_DISPATCH_INTERVAL_MS
+        } else {
+            REALTIME_CLOUD_DISPATCH_INTERVAL_MS
+        }
+    }
+
+    private fun realtimeImmediateUploadQuality(now: Long): Int {
+        return if (isRealtimeCrowdModeActive(now)) {
+            REALTIME_CROWD_IMMEDIATE_UPLOAD_QUALITY
+        } else {
+            REALTIME_IMMEDIATE_UPLOAD_QUALITY
+        }
+    }
+
+    private fun maybeStartRealtimeCloudRecognition() {
+        if (!isRealtimeCloudRecognitionAllowed()) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        val plans = synchronized(realtimeTrackLock) {
+            val crowdMode = isRealtimeCrowdModeActive(now)
+            val maxConcurrent = realtimeCloudMaxConcurrentRequests(now)
+            val dispatchInterval = realtimeCloudDispatchIntervalMs(now)
+            val collectWindow = realtimeCloudCollectWindowMs(now)
+            val immediateQuality = realtimeImmediateUploadQuality(now)
+            if (activeRealtimeCloudRequestCount >= maxConcurrent) {
+                return
+            }
+            if (now - lastRealtimeCloudRequestAt < dispatchInterval) {
+                return
+            }
+            val availableSlots = (maxConcurrent - activeRealtimeCloudRequestCount).coerceAtLeast(0)
+            if (availableSlots <= 0) {
+                return
+            }
+            realtimePersonTracks
+                .mapNotNull { track ->
+                    if (track.cloudRequestInFlight) {
+                        return@mapNotNull null
+                    }
+                    val candidate = track.bestCandidate ?: return@mapNotNull null
+                    val oldEnough = now - track.firstSeenAt >= collectWindow ||
+                        candidate.qualityScore >= immediateQuality ||
+                        (crowdMode && now - track.lastSeenAt >= REALTIME_CROWD_LOST_FACE_UPLOAD_MS)
+                    val cooldownDone = now - track.lastCloudUploadAt >= REALTIME_CLOUD_PERSON_COOLDOWN_MS
+                    val qualityJump = isRealtimeQualityJumpCandidate(track, candidate, now)
+                    if (oldEnough && (cooldownDone || qualityJump)) {
+                        track to candidate
+                    } else {
+                        null
+                    }
+                }
+                .sortedWith(
+                    compareByDescending<Pair<RealtimePersonTrack, RealtimeFaceCandidate>> { it.second.qualityScore }
+                        .thenByDescending { it.second.faceAreaRatio }
+                )
+                .take(availableSlots)
+                .mapIndexed { index, (track, candidate) ->
+                    val reason = if (track.lastCloudUploadAt > 0L &&
+                        now - track.lastCloudUploadAt < REALTIME_CLOUD_PERSON_COOLDOWN_MS
+                    ) {
+                        "quality_jump(prevQ=${track.lastCloudUploadQuality})"
+                    } else if (crowdMode && now - track.lastSeenAt >= REALTIME_CROWD_LOST_FACE_UPLOAD_MS) {
+                        "crowd_lost_face"
+                    } else if (crowdMode) {
+                        "crowd_peak"
+                    } else {
+                        "cooldown_ready"
+                    }
+                    track.lastCloudUploadAt = now
+                    track.lastCloudUploadQuality = candidate.qualityScore
+                    track.bestCandidate = null
+                    track.cloudRequestInFlight = true
+                    activeRealtimeCloudRequestCount += 1
+                    RealtimeCloudUploadPlan(
+                        trackId = track.id,
+                        candidate = candidate,
+                        reason = reason,
+                        activeCountAtStart = activeRealtimeCloudRequestCount,
+                        maxConcurrent = maxConcurrent,
+                        crowdMode = crowdMode,
+                        batchIndex = index + 1
+                    )
+                }
+                .also {
+                    if (it.isNotEmpty()) {
+                        lastRealtimeCloudRequestAt = now
+                    }
+                }
+        }
+        if (plans.isEmpty()) {
+            return
+        }
+        plans.forEach { plan ->
+            startRealtimeCloudRecognition(plan)
+        }
+    }
+
+    private fun startRealtimeCloudRecognition(plan: RealtimeCloudUploadPlan) {
+        val candidate = plan.candidate
+        recordDiagnostic(
+            "实时云端识别候选采用: track=${plan.trackId}, reason=${plan.reason}, " +
+                "mode=${if (plan.crowdMode) "crowd" else "normal"}, batch=${plan.batchIndex}, " +
+                "active=${plan.activeCountAtStart}/${plan.maxConcurrent}, frame=${candidate.decodedFrames}, " +
+                "q=${candidate.qualityScore}, area=${String.format(Locale.CHINA, "%.4f", candidate.faceAreaRatio)}, " +
+                "yaw=${candidate.yaw.roundToInt()}, upload=${candidate.uploadWidth}x${candidate.uploadHeight}, bytes=${candidate.uploadBytes.size}"
+        )
+        runOnUiThread {
+            if (::binding.isInitialized) {
+                binding.tvMainRealtimeStatus.text =
+                    if (plan.crowdMode) {
+                        "多人高峰识别中... (${plan.activeCountAtStart}/${plan.maxConcurrent})"
+                    } else {
+                        "正在云端识别当前人脸... (${plan.activeCountAtStart}/${plan.maxConcurrent})"
+                    }
+            }
+        }
+        executeRealtimeCloudWorker("实时视频云端识别") {
+            try {
+                val base64 = Base64.encodeToString(candidate.uploadBytes, Base64.NO_WRAP)
+                val result = searchFaceOnCloudSync(
+                    "data:image/jpeg;base64,$base64",
+                    1,
+                    "实时视频 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}"
+                )
+                handleRealtimeCloudResult(plan.trackId, candidate, result)
+            } finally {
+                synchronized(realtimeTrackLock) {
+                    activeRealtimeCloudRequestCount = (activeRealtimeCloudRequestCount - 1).coerceAtLeast(0)
+                    realtimePersonTracks.firstOrNull { it.id == plan.trackId }?.cloudRequestInFlight = false
+                }
+                maybeStartRealtimeCloudRecognition()
+            }
+        }
+    }
+
+    private fun isRealtimeQualityJumpCandidate(
+        track: RealtimePersonTrack,
+        candidate: RealtimeFaceCandidate,
+        now: Long
+    ): Boolean {
+        if (track.lastCloudUploadAt <= 0L) {
+            return false
+        }
+        val previousQuality = track.lastCloudUploadQuality
+        if (previousQuality <= 0) {
+            return false
+        }
+        val absoluteGain = candidate.qualityScore - previousQuality
+        val relativeGain = candidate.qualityScore.toFloat() / previousQuality.toFloat().coerceAtLeast(1f)
+        val significant = absoluteGain >= REALTIME_QUALITY_JUMP_MIN_GAIN ||
+            relativeGain >= REALTIME_QUALITY_JUMP_MIN_RATIO
+        if (significant) {
+            recordDiagnostic(
+                "实时同人质量大幅提升，允许冷却期内二次识别: track=${track.id}, " +
+                    "prevQ=$previousQuality, newQ=${candidate.qualityScore}, " +
+                    "gain=$absoluteGain, ratio=${String.format(Locale.CHINA, "%.2f", relativeGain)}, " +
+                    "sinceLastMs=${now - track.lastCloudUploadAt}"
+            )
+        }
+        return significant
+    }
+
+    private fun handleRealtimeCloudResult(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        result: CloudFaceSearchResult
+    ) {
+        if (result.experts.isEmpty()) {
+            recordDiagnostic("实时云端识别未匹配: track=$trackId, message=${result.message}")
+            runOnUiThread {
+                if (::binding.isInitialized && matchedExpertsList.isEmpty()) {
+                    binding.tvMainRealtimeStatus.text = "本地检测到人脸，云端暂未匹配"
+                }
+            }
+            return
+        }
+        val expertsWithRects = result.experts.mapIndexed { index, expert ->
+            if (expert.faceRect != null) {
+                expert
+            } else {
+                if (index == 0) {
+                    recordDiagnostic(
+                        "实时云端未返回人脸框，使用本地上传图人脸框: track=$trackId, " +
+                            "rect=${candidate.localFaceRect.x},${candidate.localFaceRect.y}," +
+                            "${candidate.localFaceRect.width},${candidate.localFaceRect.height}"
+                    )
+                }
+                expert.copy(faceRect = candidate.localFaceRect)
+            }
+        }
+        val names = expertsWithRects.joinToString("，") { it.name }
+        recordDiagnostic(
+            "实时云端识别成功: track=$trackId, experts=${expertsWithRects.size}, names=$names, " +
+                "frame=${candidate.decodedFrames}, q=${candidate.qualityScore}"
+        )
+        saveRealtimeExpertRecords(trackId, candidate, expertsWithRects)
+        synchronized(realtimeTrackLock) {
+            realtimePersonTracks.firstOrNull { it.id == trackId }?.lastMatchedNames = names
+        }
+        runOnUiThread {
+            if (!::binding.isInitialized) {
+                return@runOnUiThread
+            }
+            if (!isRealtimeRecognitionPageActive) {
+                recordDiagnostic("实时云端识别结果已忽略: track=$trackId, reason=page_inactive, names=$names")
+                return@runOnUiThread
+            }
+            capturedFrameBytes = candidate.uploadBytes
+            lastLocalFaceCrop = BitmapFactory.decodeByteArray(candidate.uploadBytes, 0, candidate.uploadBytes.size)
+            realtimeExpertsByTrack.remove(trackId)
+            realtimeExpertsByTrack[trackId] = expertsWithRects
+            while (realtimeExpertsByTrack.size > REALTIME_MAX_RESULT_TRACKS) {
+                val firstKey = realtimeExpertsByTrack.keys.firstOrNull() ?: break
+                realtimeExpertsByTrack.remove(firstKey)
+            }
+            matchedExpertsList.clear()
+            matchedExpertsList.addAll(realtimeExpertsByTrack.values.flatten())
+            currentDisplayIndex = (matchedExpertsList.size - expertsWithRects.size).coerceAtLeast(0)
+            latestRealtimeResultNames = names
+            latestRealtimeResultAt = System.currentTimeMillis()
+            binding.tvMainRealtimeStatus.text = mainRealtimeStatusText(latestRtmpReceiverSnapshot)
+            showExpertInfoAt(currentDisplayIndex)
+        }
+    }
+
+    private fun saveRealtimeExpertRecords(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        experts: List<ExpertInfo>
+    ): Int {
+        val now = System.currentTimeMillis()
+        var added = 0
+        experts.forEachIndexed { index, expert ->
+            val expertWithRect = if (expert.faceRect != null) {
+                expert
+            } else {
+                recordDiagnostic(
+                    "实时云端未返回人脸框，保存记录时使用本地上传图人脸框: track=$trackId, " +
+                        "name=${expert.name}, rect=${candidate.localFaceRect.x},${candidate.localFaceRect.y}," +
+                        "${candidate.localFaceRect.width},${candidate.localFaceRect.height}"
+                )
+                expert.copy(faceRect = candidate.localFaceRect)
+            }
+            val dedupeKey = realtimeExpertDedupeKey(expertWithRect)
+            if (!markRealtimeExpertRecordSaveAllowed(dedupeKey, now)) {
+                recordDiagnostic(
+                    "实时识别记录保存跳过: track=$trackId, name=${expertWithRect.name}, " +
+                        "reason=同一专家${REALTIME_RECORD_DUPLICATE_WINDOW_MS / 1000}s内已保存"
+                )
+                return@forEachIndexed
+            }
+            try {
+                val recordId = "${now}_${Random().nextInt(100000)}"
+                val record = RecognitionRecord(
+                    id = recordId,
+                    createdAt = now - index * 10L,
+                    updatedAt = now,
+                    status = STATUS_SUCCESS,
+                    statusText = "实时识别成功"
+                )
+                record.originalImagePath = saveHistoryImage(recordId, "original", candidate.frameBytes)
+                record.uploadImagePath = saveHistoryImage(recordId, "upload", candidate.uploadBytes)
+                record.originalWidth = candidate.frameWidth
+                record.originalHeight = candidate.frameHeight
+                record.uploadWidth = candidate.uploadWidth
+                record.uploadHeight = candidate.uploadHeight
+                record.localFaceRects.add(candidate.localFaceRect)
+                record.experts.add(expertWithRect)
+
+                val cropRect = expertWithRect.faceRect
+                if (cropRect != null) {
+                    val crop = cropAndSaveBestFaceImage(
+                        candidate.uploadBytes,
+                        candidate.frameBytes,
+                        cropRect,
+                        recordId
+                    )
+                    if (crop != null) {
+                        record.uploadImagePath = crop.path
+                        record.uploadWidth = crop.width
+                        record.uploadHeight = crop.height
+                    }
+                }
+
+                synchronized(recognitionRecords) {
+                    recognitionRecords.add(0, record)
+                }
+                added += 1
+                recordDiagnostic(
+                    "实时识别结果已保存: track=$trackId, recordId=$recordId, " +
+                        "name=${expertWithRect.name}, score=${expertWithRect.score}, frame=${candidate.decodedFrames}"
+                )
+            } catch (e: Exception) {
+                synchronized(realtimeRecordLock) {
+                    realtimeSavedExpertAt.remove(dedupeKey)
+                }
+                recordDiagnostic(
+                    "实时识别记录保存异常: track=$trackId, name=${expertWithRect.name}",
+                    e
+                )
+            }
+        }
+        if (added > 0) {
+            saveRecognitionRecords()
+            runOnUiThread {
+                renderHistoryListIfVisible()
+            }
+        }
+        return added
+    }
+
+    private fun markRealtimeExpertRecordSaveAllowed(dedupeKey: String, now: Long): Boolean {
+        pruneRealtimeRecordDedupe(now)
+        val recentHistoryAt = synchronized(recognitionRecords) {
+            recognitionRecords
+                .asSequence()
+                .filter { record ->
+                    record.status == STATUS_SUCCESS &&
+                        now - record.createdAt in 0 until REALTIME_RECORD_DUPLICATE_WINDOW_MS
+                }
+                .filter { record ->
+                    record.experts.any { realtimeExpertDedupeKey(it) == dedupeKey }
+                }
+                .maxOfOrNull { it.createdAt } ?: 0L
+        }
+        synchronized(realtimeRecordLock) {
+            val recentRuntimeAt = realtimeSavedExpertAt[dedupeKey] ?: 0L
+            val recentAt = maxOf(recentRuntimeAt, recentHistoryAt)
+            if (recentAt > 0L && now - recentAt < REALTIME_RECORD_DUPLICATE_WINDOW_MS) {
+                realtimeSavedExpertAt[dedupeKey] = recentAt
+                return false
+            }
+            realtimeSavedExpertAt[dedupeKey] = now
+            return true
+        }
+    }
+
+    private fun pruneRealtimeRecordDedupe(now: Long) {
+        synchronized(realtimeRecordLock) {
+            val iterator = realtimeSavedExpertAt.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (now - entry.value > REALTIME_RECORD_DEDUPE_CACHE_MS) {
+                    iterator.remove()
+                }
+            }
+        }
+    }
+
+    private fun realtimeExpertDedupeKey(expert: ExpertInfo): String {
+        val idCard = expert.idCard.orEmpty().trim()
+        if (idCard.isNotBlank() && idCard != "-") {
+            return "id:$idCard"
+        }
+        val phone = expert.phone.trim()
+        if (phone.isNotBlank() && phone != "-") {
+            return "phone:$phone"
+        }
+        val photoPath = expert.photoPath.trim()
+        if (photoPath.isNotBlank()) {
+            return "photo:$photoPath"
+        }
+        return "name:${expert.name.trim()}|company:${expert.company.trim()}"
+    }
+
+    private fun handleRtmpPreviewFrame(intent: Intent) {
+        val jpegBytes = intent.getByteArrayExtra(RtmpReceiverService.EXTRA_PREVIEW_JPEG) ?: return
+        val decodedFrames = intent.getLongExtra(RtmpReceiverService.EXTRA_DECODED_FRAMES, 0L)
+        latestRtmpPreviewFrameIndex = decodedFrames
+        val now = System.currentTimeMillis()
+        if (isRtmpPreviewFaceDetectionRunning) {
+            val startedAt = rtmpPreviewFaceDetectionStartedAt
+            if (startedAt > 0L && now - startedAt > REALTIME_PREVIEW_PROCESS_STALL_MS) {
+                recordDiagnostic(
+                    "实时视频预览处理锁超时，释放并跳过旧帧: " +
+                        "runningMs=${now - startedAt}, latestFrame=$decodedFrames"
+                )
+                isRtmpPreviewFaceDetectionRunning = false
+                rtmpPreviewFaceDetectionStartedAt = 0L
+            } else {
+                return
+            }
+        }
+        isRtmpPreviewFaceDetectionRunning = true
+        rtmpPreviewFaceDetectionStartedAt = now
+        val detectionToken = rtmpPreviewFaceDetectionToken + 1L
+        rtmpPreviewFaceDetectionToken = detectionToken
+        executeWorker("实时视频本地检脸预览") {
+            try {
+                val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                if (bitmap == null) {
+                    recordDiagnostic("实时视频预览帧解码失败: bytes=${jpegBytes.size}")
+                    return@executeWorker
+                }
+                val faces = try {
+                    Tasks.await(
+                        getRealtimeFaceDetector().process(InputImage.fromBitmap(bitmap, 0)),
+                        REALTIME_PREVIEW_FACE_DETECT_TIMEOUT_MS,
+                        TimeUnit.MILLISECONDS
+                    )
+                } catch (e: Exception) {
+                    recordDiagnostic("实时视频本地人脸检测异常: frame=$decodedFrames", e)
+                    emptyList<Face>()
+                }
+                latestRealtimeFaceCount = faces.size
+                if (isRealtimeCloudRecognitionAllowed()) {
+                    updateRealtimeFaceCandidates(bitmap, faces, decodedFrames, jpegBytes)
+                }
+                val overlay = drawRealtimeFaceOverlay(bitmap, faces)
+                val statusText = if (faces.isEmpty()) {
+                    "本地人脸 0 张"
+                } else {
+                    "本地人脸 ${faces.size} 张；蓝框可上云，红框质量不足"
+                }
+                runOnUiThread {
+                    if (::binding.isInitialized) {
+                        val old = currentRtmpPreviewBitmap
+                        currentRtmpPreviewBitmap = overlay
+                        binding.ivPreview.setImageBitmap(overlay)
+                        binding.tvMainRealtimePreviewStatus.text = statusText
+                        binding.tvMainRealtimeStatus.text = mainRealtimeStatusText(latestRtmpReceiverSnapshot)
+                        if (binding.settingsPage.visibility == View.VISIBLE) {
+                            binding.ivRealtimeStreamPreview.setImageBitmap(overlay)
+                            binding.tvRealtimeStreamStatus.text = statusText
+                        }
+                        if (old != null && old !== overlay) {
+                            try {
+                                old.recycle()
+                            } catch (_: Exception) {}
+                        }
+                    } else {
+                        try {
+                            overlay.recycle()
+                        } catch (_: Exception) {}
+                    }
+                }
+                if (overlay !== bitmap) {
+                    try {
+                        bitmap.recycle()
+                    } catch (_: Exception) {
+                    }
+                }
+                val nowForLog = System.currentTimeMillis()
+                if (nowForLog - lastRealtimeFaceLogAt >= REALTIME_FACE_LOG_INTERVAL_MS ||
+                    faces.size != lastRealtimeLoggedFaceCount ||
+                    decodedFrames % REALTIME_MAIN_PREVIEW_LOG_EVERY_FRAMES == 0L
+                ) {
+                    lastRealtimeFaceLogAt = nowForLog
+                    lastRealtimeLoggedFaceCount = faces.size
+                    recordDiagnostic(
+                        "实时视频本地检脸: decodedFrames=$decodedFrames, faces=${faces.size}, " +
+                            "bitmap=${bitmap.width}x${bitmap.height}, bytes=${jpegBytes.size}"
+                    )
+                }
+            } catch (e: Exception) {
+                recordDiagnostic("实时视频预览处理异常: frame=$decodedFrames", e)
+            } finally {
+                if (rtmpPreviewFaceDetectionToken == detectionToken) {
+                    isRtmpPreviewFaceDetectionRunning = false
+                    rtmpPreviewFaceDetectionStartedAt = 0L
+                }
+            }
+        }
+    }
+
+    private fun localIpv4Addresses(): List<String> {
+        return localIpv4AddressCandidates(currentRtmpRemoteIp()).map { it.address }
+    }
+
+    private fun localIpv4AddressCandidates(peerIp: String? = null): List<LocalIpv4Candidate> {
+        return try {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { iface ->
+                    try {
+                        iface.isUp && !iface.isLoopback
+                    } catch (_: SocketException) {
+                        false
+                    }
+                }
+                .flatMap { iface ->
+                    val interfaceName = listOf(iface.name, iface.displayName)
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                        .joinToString("/")
+                    Collections.list(iface.inetAddresses)
+                        .filterIsInstance<Inet4Address>()
+                        .map { address ->
+                            LocalIpv4Candidate(
+                                address = address.hostAddress.orEmpty(),
+                                interfaceName = interfaceName
+                            )
+                        }
+                }
+                .filter { candidate ->
+                    candidate.address.isNotBlank() &&
+                        !candidate.address.startsWith("127.") &&
+                        !candidate.address.startsWith("169.254.") &&
+                        ipv4Octets(candidate.address) != null
+                }
+                .distinctBy { it.address }
+                .sortedWith(
+                    compareByDescending<LocalIpv4Candidate> {
+                        scoreRtmpLocalAddressCandidate(it, peerIp)
+                    }.thenBy { it.address }
+                )
+        } catch (e: Exception) {
+            recordDiagnostic("读取手机局域网 IP 失败", e)
+            emptyList()
+        }
+    }
+
+    private fun scoreRtmpLocalAddressCandidate(candidate: LocalIpv4Candidate, peerIp: String?): Int {
+        val ip = candidate.address
+        val interfaceName = candidate.interfaceName.lowercase(Locale.ROOT)
+        var score = 0
+        if (peerIp != null && isSameIpv4CSubnet(ip, peerIp)) {
+            score += 10_000
+        }
+        if (ip.startsWith("10.")) {
+            score += 600
+        } else if (ip.startsWith("192.168.")) {
+            score += 420
+        } else if (isPrivate172Address(ip)) {
+            score += 360
+        }
+        if (interfaceName.contains("wlan") ||
+            interfaceName.contains("ap") ||
+            interfaceName.contains("p2p") ||
+            interfaceName.contains("tether") ||
+            interfaceName.contains("hotspot")
+        ) {
+            score += 160
+        }
+        if (interfaceName.contains("tun") ||
+            interfaceName.contains("tap") ||
+            interfaceName.contains("vpn") ||
+            interfaceName.contains("ppp") ||
+            interfaceName.contains("wg") ||
+            interfaceName.contains("tailscale") ||
+            interfaceName.contains("zerotier")
+        ) {
+            score -= 900
+        }
+        return score
+    }
+
+    private fun currentRtmpRemoteIp(): String? {
+        return extractIpv4Address(latestRtmpReceiverSnapshot.remoteAddress)
+    }
+
+    private fun extractIpv4Address(text: String): String? {
+        return Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
+            .find(text)
+            ?.value
+            ?.takeIf { ipv4Octets(it) != null }
+    }
+
+    private fun isSameIpv4CSubnet(left: String, right: String): Boolean {
+        val leftOctets = ipv4Octets(left) ?: return false
+        val rightOctets = ipv4Octets(right) ?: return false
+        return leftOctets[0] == rightOctets[0] &&
+            leftOctets[1] == rightOctets[1] &&
+            leftOctets[2] == rightOctets[2]
+    }
+
+    private fun isPrivate172Address(ip: String): Boolean {
+        val octets = ipv4Octets(ip) ?: return false
+        return octets[0] == 172 && octets[1] in 16..31
+    }
+
+    private fun ipv4Octets(ip: String): IntArray? {
+        val parts = ip.split(".")
+        if (parts.size != 4) {
+            return null
+        }
+        val octets = IntArray(4)
+        parts.forEachIndexed { index, part ->
+            val value = part.toIntOrNull() ?: return null
+            if (value !in 0..255) {
+                return null
+            }
+            octets[index] = value
+        }
+        return octets
+    }
+
+    private fun formatByteCount(bytes: Long): String {
+        if (bytes < 1024L) {
+            return "${bytes}B"
+        }
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) {
+            return String.format(Locale.CHINA, "%.1fKB", kb)
+        }
+        val mb = kb / 1024.0
+        if (mb < 1024.0) {
+            return String.format(Locale.CHINA, "%.2fMB", mb)
+        }
+        return String.format(Locale.CHINA, "%.2fGB", mb / 1024.0)
+    }
+
+    private fun startRealtimeStreamTest() {
+        if (isRealtimeStreamRunning) {
+            Toast.makeText(this, "实时流测试正在运行", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isVideoRecognitionRunning || isGalleryBatchRunning || isMatchingRequestRunning || pendingGlassCapture) {
+            Toast.makeText(this, "当前有识别任务正在运行，请结束后再测试实时流", Toast.LENGTH_SHORT).show()
+            recordDiagnostic(
+                "实时流测试启动被拦截: video=$isVideoRecognitionRunning, " +
+                    "gallery=$isGalleryBatchRunning, matching=$isMatchingRequestRunning, capture=$pendingGlassCapture"
+            )
+            return
+        }
+
+        val streamUrl = binding.etRealtimeStreamUrl.text.toString().trim()
+        val scheme = try {
+            Uri.parse(streamUrl).scheme?.lowercase(Locale.ROOT)
+        } catch (_: Exception) {
+            null
+        }
+        if (streamUrl.isBlank() || scheme !in setOf("rtmp", "rtsp", "http", "https")) {
+            Toast.makeText(this, "请填写 rtmp/rtsp/http/https 视频流地址", Toast.LENGTH_SHORT).show()
+            updateRealtimeStreamStatus("请先填写有效的视频流地址")
+            return
+        }
+
+        val runId = System.currentTimeMillis()
+        activeRealtimeStreamRunId = runId
+        realtimeStreamStopRequested = false
+        isRealtimeStreamRunning = true
+        updateRealtimeStreamStatus("正在打开实时流...")
+        recordDiagnostic(
+            "实时流测试启动: runId=$runId, url=${maskStreamUrlForDiagnostics(streamUrl)}, " +
+                "cloud=false, saveRecord=false, detector=local"
+        )
+
+        executeWorker("实时流本地检脸测试") {
+            runRealtimeStreamDecodeProbe(streamUrl, runId)
+        }
+    }
+
+    private fun stopRealtimeStreamTest(reason: String) {
+        if (!isRealtimeStreamRunning && !realtimeStreamStopRequested) {
+            return
+        }
+        realtimeStreamStopRequested = true
+        recordDiagnostic("实时流测试停止请求: runId=$activeRealtimeStreamRunId, reason=$reason")
+        updateRealtimeStreamStatus("正在停止实时流测试...")
+    }
+
+    private fun finishRealtimeStreamTest(runId: Long, message: String) {
+        if (activeRealtimeStreamRunId != runId) {
+            return
+        }
+        isRealtimeStreamRunning = false
+        realtimeStreamStopRequested = false
+        updateRealtimeStreamStatus(message)
+        recordDiagnostic("实时流测试结束: runId=$runId, message=$message")
+    }
+
+    private fun updateRealtimeStreamStatus(text: String) {
+        Log.d(TAG, "Realtime stream status: $text")
+        runOnUiThread {
+            if (::binding.isInitialized) {
+                binding.tvRealtimeStreamStatus.text = text
+            }
+        }
+    }
+
+    private fun getRealtimeFaceDetector(): FaceDetector {
+        realtimeFaceDetector?.let { return it }
+        val detector = FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+                .setMinFaceSize(0.04f)
+                .enableTracking()
+                .build()
+        )
+        realtimeFaceDetector = detector
+        return detector
+    }
+
+    private fun runRealtimeStreamDecodeProbe(streamUrl: String, runId: Long) {
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        var decodedFrames = 0
+        var inspectedFrames = 0
+        var faceHitFrames = 0
+        val startedAt = System.currentTimeMillis()
+
+        try {
+            updateRealtimeStreamStatus("正在连接流: ${maskStreamUrlForDiagnostics(streamUrl)}")
+            extractor.setDataSource(streamUrl, emptyMap<String, String>())
+
+            var videoTrack = -1
+            var format: MediaFormat? = null
+            for (trackIndex in 0 until extractor.trackCount) {
+                val candidate = extractor.getTrackFormat(trackIndex)
+                val mime = candidate.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (mime.startsWith("video/")) {
+                    videoTrack = trackIndex
+                    format = candidate
+                    break
+                }
+            }
+            if (videoTrack < 0 || format == null) {
+                finishRealtimeStreamTest(runId, "实时流未找到视频轨道")
+                return
+            }
+
+            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+            val width = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else 0
+            val height = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else 0
+            val rotationDegrees = if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                format.getInteger(MediaFormat.KEY_ROTATION)
+            } else {
+                0
+            }
+            recordDiagnostic(
+                "实时流视频轨道: runId=$runId, mime=$mime, size=${width}x$height, rotation=$rotationDegrees"
+            )
+
+            format.setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+            )
+            extractor.selectTrack(videoTrack)
+            codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+            var idleLoops = 0
+            var lastInspectAt = 0L
+            val detector = getRealtimeFaceDetector()
+
+            while (!outputDone &&
+                !realtimeStreamStopRequested &&
+                activeRealtimeStreamRunId == runId &&
+                idleLoops < REALTIME_STREAM_MAX_IDLE_LOOPS &&
+                inspectedFrames < REALTIME_STREAM_MAX_INSPECTED_FRAMES &&
+                System.currentTimeMillis() - startedAt < REALTIME_STREAM_MAX_TEST_DURATION_MS
+            ) {
+                var madeProgress = false
+
+                if (!inputDone) {
+                    val inputIndex = codec.dequeueInputBuffer(REALTIME_STREAM_CODEC_TIMEOUT_US)
+                    if (inputIndex >= 0) {
+                        val inputBuffer = codec.getInputBuffer(inputIndex)
+                        val sampleSize = if (inputBuffer != null) {
+                            extractor.readSampleData(inputBuffer, 0)
+                        } else {
+                            -1
+                        }
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(
+                                inputIndex,
+                                0,
+                                0,
+                                0L,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(
+                                inputIndex,
+                                0,
+                                sampleSize,
+                                extractor.sampleTime.coerceAtLeast(0L),
+                                0
+                            )
+                            extractor.advance()
+                        }
+                        madeProgress = true
+                    }
+                }
+
+                when (val outputIndex = codec.dequeueOutputBuffer(bufferInfo, REALTIME_STREAM_CODEC_TIMEOUT_US)) {
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        recordDiagnostic("实时流解码输出格式: ${codec.outputFormat}")
+                        madeProgress = true
+                    }
+                    else -> if (outputIndex >= 0) {
+                        madeProgress = true
+                        decodedFrames += 1
+                        val now = System.currentTimeMillis()
+                        val shouldInspect = bufferInfo.size > 0 &&
+                            now - lastInspectAt >= REALTIME_STREAM_DETECT_INTERVAL_MS
+                        if (shouldInspect) {
+                            val image = codec.getOutputImage(outputIndex)
+                            if (image != null) {
+                                image.use {
+                                    var bitmap = yuvImageToScaledBitmap(it, REALTIME_STREAM_PREVIEW_MAX_SIDE)
+                                    bitmap = applyVideoRotation(bitmap, rotationDegrees)
+                                    val faces = try {
+                                        Tasks.await(detector.process(InputImage.fromBitmap(bitmap, 0)))
+                                    } catch (e: Exception) {
+                                        recordDiagnostic("实时流本地人脸检测异常: runId=$runId", e)
+                                        emptyList<Face>()
+                                    }
+                                    inspectedFrames += 1
+                                    lastInspectAt = now
+                                    if (faces.isNotEmpty()) {
+                                        faceHitFrames += 1
+                                    }
+                                    val preview = drawRealtimeFaceOverlay(bitmap, faces)
+                                    runOnUiThread {
+                                        if (activeRealtimeStreamRunId == runId && ::binding.isInitialized) {
+                                            binding.ivRealtimeStreamPreview.setImageBitmap(preview)
+                                            binding.tvRealtimeStreamStatus.text =
+                                                "解码 $decodedFrames 帧，检测 $inspectedFrames 帧，人脸帧 $faceHitFrames，当前 ${faces.size} 张脸"
+                                        }
+                                    }
+                                    if (faces.isNotEmpty() || inspectedFrames % REALTIME_STREAM_LOG_EVERY_INSPECTIONS == 0) {
+                                        recordDiagnostic(
+                                            "实时流本地检测: runId=$runId, decoded=$decodedFrames, " +
+                                                "inspected=$inspectedFrames, currentFaces=${faces.size}, " +
+                                                "faceHitFrames=$faceHitFrames, bitmap=${bitmap.width}x${bitmap.height}"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        outputDone = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                        codec.releaseOutputBuffer(outputIndex, false)
+                    }
+                }
+
+                idleLoops = if (madeProgress) 0 else idleLoops + 1
+            }
+
+            val elapsedMs = System.currentTimeMillis() - startedAt
+            val reason = when {
+                realtimeStreamStopRequested -> "已停止"
+                inspectedFrames >= REALTIME_STREAM_MAX_INSPECTED_FRAMES -> "达到测试帧数上限"
+                elapsedMs >= REALTIME_STREAM_MAX_TEST_DURATION_MS -> "达到测试时长上限"
+                outputDone -> "流已结束"
+                idleLoops >= REALTIME_STREAM_MAX_IDLE_LOOPS -> "解码等待超时"
+                else -> "测试结束"
+            }
+            finishRealtimeStreamTest(
+                runId,
+                "$reason：解码 $decodedFrames 帧，检测 $inspectedFrames 帧，人脸帧 $faceHitFrames"
+            )
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时流原生解码失败: runId=$runId, url=${maskStreamUrlForDiagnostics(streamUrl)}；" +
+                    "若 VLC/服务器可播放但这里失败，下一步需接入专用 RTMP/FFmpeg/ExoPlayer 扩展",
+                e
+            )
+            finishRealtimeStreamTest(runId, "实时流打开失败，已记录诊断日志")
+        } finally {
+            try {
+                codec?.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                codec?.release()
+            } catch (_: Exception) {
+            }
+            try {
+                extractor.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun drawRealtimeFaceOverlay(bitmap: Bitmap, faces: List<Face>): Bitmap {
+        if (faces.isEmpty()) {
+            return bitmap
+        }
+        return try {
+            val overlay = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+            val canvas = Canvas(overlay)
+            val now = System.currentTimeMillis()
+            val crowdMode = faces.size >= REALTIME_CROWD_MODE_MIN_FACES || isRealtimeCrowdModeActive(now)
+            val rectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = maxOf(3f, minOf(overlay.width, overlay.height) / 180f)
+            }
+            val labelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+            }
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                textSize = maxOf(18f, minOf(overlay.width, overlay.height) / 24f)
+                color = Color.WHITE
+            }
+            faces.forEachIndexed { index, face ->
+                val rect = clippedRect(Rect(face.boundingBox), overlay.width, overlay.height) ?: return@forEachIndexed
+                val faceAreaRatio = rect.width().toFloat() * rect.height().toFloat() /
+                    (overlay.width.toFloat() * overlay.height.toFloat()).coerceAtLeast(1f)
+                val quality = scoreVideoFaceCandidate(bitmap, face, rect)
+                val canUpload = isUsableRealtimeCloudCandidate(
+                    faceAreaRatio = faceAreaRatio,
+                    quality = quality,
+                    yaw = face.headEulerAngleY,
+                    pitch = face.headEulerAngleX,
+                    crowdMode = crowdMode
+                )
+                val boxColor = if (canUpload) {
+                    REALTIME_FACE_BOX_READY_COLOR
+                } else {
+                    REALTIME_FACE_BOX_LOW_QUALITY_COLOR
+                }
+                rectPaint.color = boxColor
+                canvas.drawRect(rect, rectPaint)
+                val sideLabel = if (abs(face.headEulerAngleY) >= REALTIME_SIDE_PROFILE_MIN_YAW) "侧脸 " else ""
+                val label = "#${index + 1} ${if (canUpload) "可上云" else "质量低"} ${sideLabel}q=$quality"
+                val labelPadding = maxOf(4f, textPaint.textSize / 5f)
+                val labelWidth = textPaint.measureText(label) + labelPadding * 2f
+                val labelHeight = textPaint.textSize + labelPadding * 2f
+                val labelLeft = rect.left.toFloat().coerceAtMost((overlay.width - labelWidth).coerceAtLeast(0f))
+                val labelTop = (rect.top.toFloat() - labelHeight).takeIf { it >= 0f } ?: rect.top.toFloat()
+                labelBgPaint.color = Color.argb(190, Color.red(boxColor), Color.green(boxColor), Color.blue(boxColor))
+                canvas.drawRect(labelLeft, labelTop, labelLeft + labelWidth, labelTop + labelHeight, labelBgPaint)
+                canvas.drawText(label, labelLeft + labelPadding, labelTop + labelPadding + textPaint.textSize * 0.82f, textPaint)
+            }
+            overlay
+        } catch (e: Exception) {
+            recordDiagnostic("实时流预览标注失败", e)
+            bitmap
+        }
+    }
+
+    private fun maskStreamUrlForDiagnostics(rawUrl: String): String {
+        return try {
+            val uri = Uri.parse(rawUrl)
+            val scheme = uri.scheme ?: "stream"
+            val host = uri.host ?: return rawUrl.take(24) + if (rawUrl.length > 24) "..." else ""
+            val port = if (uri.port > 0) ":${uri.port}" else ""
+            val segments = uri.pathSegments.orEmpty()
+            val safePath = if (segments.isEmpty()) {
+                ""
+            } else {
+                "/" + segments.take(2).joinToString("/") + if (segments.size > 2) "/***" else ""
+            }
+            "$scheme://$host$port$safePath"
+        } catch (_: Exception) {
+            rawUrl.take(24) + if (rawUrl.length > 24) "..." else ""
+        }
     }
 
     private fun updateVideoProgress(
@@ -6222,6 +7866,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         } catch (e: RejectedExecutionException) {
 
             Log.w(TAG, "Worker task rejected after shutdown: $taskName", e)
+
+        }
+
+    }
+
+    private fun executeRealtimeCloudWorker(taskName: String, block: () -> Unit) {
+
+        if (!::realtimeCloudExecutor.isInitialized ||
+            realtimeCloudExecutor.isShutdown ||
+            realtimeCloudExecutor.isTerminated
+        ) {
+
+            Log.w(TAG, "Skip realtime cloud task after shutdown: $taskName")
+
+            return
+
+        }
+
+        try {
+
+            realtimeCloudExecutor.execute {
+
+                try {
+
+                    block()
+
+                } catch (e: Exception) {
+
+                    recordDiagnostic("$taskName 执行异常", e)
+
+                }
+
+            }
+
+        } catch (e: RejectedExecutionException) {
+
+            Log.w(TAG, "Realtime cloud task rejected after shutdown: $taskName", e)
 
         }
 
@@ -10752,6 +12433,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             appendLine("captureParams=${captureParamsBrief()}")
 
+            val rtmpSnapshot = latestRtmpReceiverSnapshot
+
+            appendLine(
+                "embeddedRtmpReceiver=running:${rtmpSnapshot.running},listening:${rtmpSnapshot.listening}," +
+                    "connected:${rtmpSnapshot.clientConnected},port:${rtmpSnapshot.port},stream:${rtmpSnapshot.streamName}," +
+                    "video:${rtmpSnapshot.videoTags},bytes:${rtmpSnapshot.totalPayloadBytes}"
+            )
+
+            appendLine("realtimeStreamRunning=$isRealtimeStreamRunning")
+
+            val realtimeNow = System.currentTimeMillis()
+            appendLine(
+                "activeRealtimeCloudRequests=$activeRealtimeCloudRequestCount/${realtimeCloudMaxConcurrentRequests(realtimeNow)}," +
+                    "crowdMode=${isRealtimeCrowdModeActive(realtimeNow)}"
+            )
+
             appendLine("activeCaptureRequest=${activeCaptureRequestWidth}x$activeCaptureRequestHeight q=$activeCaptureRequestQuality timeoutMs=$activeCaptureTimeoutMs startedAt=$activeCaptureRequestStartedAt")
 
             appendLine("runtimePermissions=${runtimePermissionStatus()}")
@@ -11250,6 +12947,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         recordDiagnostic("Activity销毁: service=$isCxrServiceConnected, glass=$isGlassWirelessConnected")
 
+        stopEmbeddedRtmpReceiver("Activity 销毁")
+
+        stopRealtimeStreamTest("Activity 销毁")
+
+        unregisterRtmpReceiverBroadcasts()
+
+        currentRtmpPreviewBitmap?.recycle()
+        currentRtmpPreviewBitmap = null
+
         super.onDestroy()
 
         cxrLink?.disconnect()
@@ -11262,7 +12968,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         videoFaceDetector.close()
 
+        realtimeFaceDetector?.close()
+
         workExecutor.shutdown()
+
+        if (::realtimeCloudExecutor.isInitialized) realtimeCloudExecutor.shutdown()
 
         if (::thumbnailExecutor.isInitialized) thumbnailExecutor.shutdown()
 
@@ -11559,6 +13269,104 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val VIDEO_PULL_REFRESH_DISTANCE_DP = 72
 
+        private const val REALTIME_STREAM_PREVIEW_MAX_SIDE = 720
+
+        private const val REALTIME_STREAM_DETECT_INTERVAL_MS = 700L
+
+        private const val REALTIME_STREAM_CODEC_TIMEOUT_US = 10_000L
+
+        private const val REALTIME_STREAM_MAX_IDLE_LOOPS = 3_000
+
+        private const val REALTIME_STREAM_MAX_INSPECTED_FRAMES = 600
+
+        private const val REALTIME_STREAM_MAX_TEST_DURATION_MS = 5L * 60L * 1000L
+
+        private const val REALTIME_STREAM_LOG_EVERY_INSPECTIONS = 10
+
+        private const val REALTIME_MAIN_PREVIEW_LOG_EVERY_FRAMES = 60L
+
+        private const val REALTIME_FACE_LOG_INTERVAL_MS = 3000L
+
+        private const val REALTIME_PREVIEW_FACE_DETECT_TIMEOUT_MS = 1_800L
+
+        private const val REALTIME_PREVIEW_PROCESS_STALL_MS = 3_500L
+
+        private const val REALTIME_RESULT_STATUS_HOLD_MS = 12_000L
+
+        private const val REALTIME_MAX_RESULT_TRACKS = 8
+
+        private const val REALTIME_RECORD_DUPLICATE_WINDOW_MS = 30_000L
+
+        private const val REALTIME_RECORD_DEDUPE_CACHE_MS = 2L * 60L * 1000L
+
+        private val REALTIME_FACE_BOX_READY_COLOR = Color.rgb(33, 150, 243)
+
+        private val REALTIME_FACE_BOX_LOW_QUALITY_COLOR = Color.rgb(244, 67, 54)
+
+        private const val REALTIME_TRACK_STALE_MS = 8_000L
+
+        private const val REALTIME_TRACK_MATCH_GAP_MS = 2_500L
+
+        private const val REALTIME_TRACK_MAX_CENTER_DISTANCE = 0.22f
+
+        private const val REALTIME_TRACK_MAX_SIZE_RATIO = 4.0f
+
+        private const val REALTIME_MIN_FACE_AREA_RATIO = 0.003f
+
+        private const val REALTIME_MIN_UPLOAD_QUALITY = 250
+
+        private const val REALTIME_IMMEDIATE_UPLOAD_QUALITY = 900
+
+        private const val REALTIME_SIDE_PROFILE_MIN_YAW = 35f
+
+        private const val REALTIME_SIDE_PROFILE_MIN_UPLOAD_QUALITY = 70
+
+        private const val REALTIME_MAX_UPLOAD_YAW = 80f
+
+        private const val REALTIME_MAX_UPLOAD_PITCH = 55f
+
+        private const val REALTIME_CLOUD_COLLECT_WINDOW_MS = 1_200L
+
+        private const val REALTIME_CLOUD_PERSON_COOLDOWN_MS = 30_000L
+
+        private const val REALTIME_CLOUD_MAX_CONCURRENT_REQUESTS = 2
+
+        private const val REALTIME_CLOUD_DISPATCH_INTERVAL_MS = 600L
+
+        private const val REALTIME_CROWD_MODE_MIN_FACES = 4
+
+        private const val REALTIME_CROWD_MODE_MIN_TRACKS = 4
+
+        private const val REALTIME_CROWD_MODE_HOLD_MS = 4_000L
+
+        private const val REALTIME_CROWD_CLOUD_MAX_CONCURRENT_REQUESTS = 3
+
+        private const val REALTIME_CROWD_CLOUD_DISPATCH_INTERVAL_MS = 200L
+
+        private const val REALTIME_CROWD_CLOUD_COLLECT_WINDOW_MS = 600L
+
+        private const val REALTIME_CROWD_LOST_FACE_UPLOAD_MS = 450L
+
+        private const val REALTIME_CROWD_IMMEDIATE_UPLOAD_QUALITY = 650
+
+        private const val REALTIME_CROWD_MIN_FACE_AREA_RATIO = 0.002f
+
+        private const val REALTIME_CROWD_MIN_UPLOAD_QUALITY = 180
+
+        private const val REALTIME_CROWD_SIDE_PROFILE_MIN_UPLOAD_QUALITY = 50
+
+        private const val REALTIME_QUALITY_JUMP_MIN_GAIN = 350
+
+        private const val REALTIME_QUALITY_JUMP_MIN_RATIO = 1.5f
+
+        private const val RTMP_RECEIVER_PORT = 1935
+
+        private const val RTMP_RECEIVER_RESTART_DELAY_MS = 300L
+
+        private const val RTMP_PUSH_APP_NAME = "live"
+
+        private const val DEFAULT_RTMP_STREAM_KEY = "rokid"
+
         private const val DEFAULT_CLOUD_MAX_FACE_NUM = 5
 
         private const val CLOUD_MAX_FACE_NUM = 10
@@ -11827,6 +13635,56 @@ data class FaceCropCandidate(
 
     val bitmap: Bitmap
 
+)
+
+data class RealtimeFaceCandidate(
+    val createdAt: Long,
+    val decodedFrames: Long,
+    val qualityScore: Int,
+    val frameBytes: ByteArray,
+    val frameWidth: Int,
+    val frameHeight: Int,
+    val uploadBytes: ByteArray,
+    val uploadWidth: Int,
+    val uploadHeight: Int,
+    val localFaceRect: FaceRect,
+    val faceAreaRatio: Float,
+    val faceCenterX: Float,
+    val faceCenterY: Float,
+    val yaw: Float,
+    val pitch: Float,
+    val roll: Float,
+    val trackingId: Int?
+)
+
+data class RealtimePersonTrack(
+    val id: Long,
+    var trackingId: Int?,
+    val firstSeenAt: Long,
+    var lastSeenAt: Long,
+    var centerX: Float,
+    var centerY: Float,
+    var sizeRatio: Float,
+    var bestCandidate: RealtimeFaceCandidate? = null,
+    var lastCloudUploadAt: Long = 0L,
+    var lastCloudUploadQuality: Int = 0,
+    var cloudRequestInFlight: Boolean = false,
+    var lastMatchedNames: String = ""
+)
+
+data class RealtimeCloudUploadPlan(
+    val trackId: Long,
+    val candidate: RealtimeFaceCandidate,
+    val reason: String,
+    val activeCountAtStart: Int,
+    val maxConcurrent: Int,
+    val crowdMode: Boolean,
+    val batchIndex: Int
+)
+
+data class LocalIpv4Candidate(
+    val address: String,
+    val interfaceName: String
 )
 
 data class SavedFaceCrop(

@@ -3,7 +3,7 @@
     <string name="title_config">远程服务</string>
     <string name="hint_server_ip">如：http://82.157.244.174</string>
     <string name="btn_save_config">保存并连接</string>
-    <string name="status_ready">准备就绪，可进行现场抓拍比对</string>
+    <string name="status_ready">准备就绪，可启动实时视频识别</string>
     <string name="btn_take_photo">现场抓拍比对</string>
     <string name="status_uploading">⏳ 正在上传图片进行人脸匹配...</string>
     <string name="status_match_success">✅ 比对匹配成功！</string>
@@ -13,7 +13,7 @@
     <string name="diagnostics_empty">等待诊断信息...</string>
     <string name="title_main">乐奇眼镜识别</string>
     <string name="subtitle_main">无线抓拍 · 本地筛脸 · 云端核验</string>
-    <string name="title_live_view">现场画面</string>
+    <string name="title_live_view">实时画面</string>
     <string name="btn_settings">设置</string>
     <string name="btn_history">记录</string>
     <string name="btn_back">返回</string>
@@ -34,7 +34,7 @@
     <string name="btn_pick_video">选择视频</string>
     <string name="btn_pick_image">选择图片</string>
     <string name="btn_video_recognize">识别视频</string>
-    <string name="nav_capture">拍照</string>
+    <string name="nav_capture">实时</string>
     <string name="nav_gallery">图库</string>
     <string name="nav_video">视频</string>
     <string name="nav_history">记录</string>
