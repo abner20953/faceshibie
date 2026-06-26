@@ -525,7 +525,11 @@ class EmbeddedRtmpReceiver(
             avcSequenceHeaderCount = avcSeq,
             lastVideoCodec = codec,
             firstVideoAtMs = firstVideoAt,
-            message = "正在接收推流：video=${snapshot.videoTags + 1}, codec=$codec"
+            message = if (codec != snapshot.lastVideoCodec || !snapshot.message.startsWith("正在接收推流")) {
+                "正在接收推流：codec=$codec"
+            } else {
+                snapshot.message
+            }
         )
         if (snapshot.videoTags <= 3 || snapshot.videoTags % 60L == 0L) {
             callback.onLog(

@@ -17,6 +17,8 @@ class RtmpReceiverService : Service() {
     private var lastVideoTagAtMs = 0L
     private var lastPreviewFrameAtMs = 0L
     private var lastPreviewWatchdogResetAtMs = 0L
+    private var lastNotificationUpdateAtMs = 0L
+    private var lastNotificationStateKey = ""
 
     override fun onCreate() {
         super.onCreate()
@@ -64,6 +66,8 @@ class RtmpReceiverService : Service() {
         lastVideoTagAtMs = 0L
         lastPreviewFrameAtMs = 0L
         lastPreviewWatchdogResetAtMs = 0L
+        lastNotificationUpdateAtMs = 0L
+        lastNotificationStateKey = ""
         broadcastSnapshot(latestSnapshot)
         previewDecoder?.release()
         previewDecoder = RtmpAvcPreviewDecoder(
@@ -139,6 +143,8 @@ class RtmpReceiverService : Service() {
         lastVideoTagAtMs = 0L
         lastPreviewFrameAtMs = 0L
         lastPreviewWatchdogResetAtMs = 0L
+        lastNotificationUpdateAtMs = 0L
+        lastNotificationStateKey = ""
         latestSnapshot = latestSnapshot.copy(
             running = false,
             listening = false,
@@ -204,6 +210,31 @@ class RtmpReceiverService : Service() {
     }
 
     private fun updateNotification(snapshot: EmbeddedRtmpReceiver.Snapshot) {
+        val now = System.currentTimeMillis()
+        val stateKey = buildString {
+            append(snapshot.running)
+            append('|')
+            append(snapshot.listening)
+            append('|')
+            append(snapshot.clientConnected)
+            append('|')
+            append(snapshot.port)
+            append('|')
+            append(snapshot.expectedStreamKey)
+            append('|')
+            append(snapshot.streamName)
+            append('|')
+            append(snapshot.lastVideoCodec)
+            append('|')
+            append(snapshot.message)
+        }
+        if (stateKey == lastNotificationStateKey &&
+            now - lastNotificationUpdateAtMs < NOTIFICATION_UPDATE_INTERVAL_MS
+        ) {
+            return
+        }
+        lastNotificationStateKey = stateKey
+        lastNotificationUpdateAtMs = now
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(
             NOTIFICATION_ID,
@@ -285,6 +316,7 @@ class RtmpReceiverService : Service() {
         private const val NOTIFICATION_ID = 1935
         private const val DEFAULT_PORT = 1935
         private const val DEFAULT_STREAM_KEY = "rokid"
+        private const val NOTIFICATION_UPDATE_INTERVAL_MS = 2_000L
         private const val FIRST_PREVIEW_TIMEOUT_MS = 5_000L
         private const val PREVIEW_STALL_TIMEOUT_MS = 4_000L
         private const val PREVIEW_WATCHDOG_RESET_COOLDOWN_MS = 6_000L
