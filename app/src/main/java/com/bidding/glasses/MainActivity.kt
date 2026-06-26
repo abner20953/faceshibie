@@ -4876,7 +4876,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     val cooldownMs = realtimeCloudCooldownMs(track)
                     val cooldownDone = now - track.lastCloudUploadAt >= cooldownMs
                     val qualityJump = isRealtimeQualityJumpCandidate(track, candidate, now)
-                    if (oldEnough && (cooldownDone || qualityJump)) {
+                    val canUploadPlan = if (lostFaceFlush) true else (cooldownDone || qualityJump)
+                    if (oldEnough && canUploadPlan) {
                         track to candidate
                     } else {
                         val collectBlocked = !oldEnough
@@ -5130,13 +5131,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         upload: RealtimeUploadPayload,
         result: CloudFaceSearchResult
     ): Boolean {
-        if (upload.cropMode != "wide_retry" || isNoFaceCloudResult(result) || result.experts.isNotEmpty()) {
+        if (upload.cropMode != "wide_retry" || result.experts.isNotEmpty()) {
             return false
         }
         val minSide = minOf(candidate.faceRectInFrame.width(), candidate.faceRectInFrame.height())
+        val isNoFace = isNoFaceCloudResult(result)
+        if (isNoFace && minSide < REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_FACE_SIDE_PX) {
+            return false
+        }
+        val minQualityLimit = if (isNoFace) 250 else REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_QUALITY
+        val minDispatchLimit = if (isNoFace) 400 else REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_DISPATCH_SCORE
         return minSide >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_FACE_SIDE_PX &&
-            (candidate.qualityScore >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_QUALITY ||
-                candidate.dispatchScore >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_DISPATCH_SCORE)
+            (candidate.qualityScore >= minQualityLimit || candidate.dispatchScore >= minDispatchLimit)
     }
 
     private fun startRealtimeCloudRecognition(plan: RealtimeCloudUploadPlan) {
