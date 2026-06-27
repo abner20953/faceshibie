@@ -71,6 +71,10 @@ import android.provider.OpenableColumns
 
 import android.speech.tts.TextToSpeech
 
+import android.text.Editable
+
+import android.text.TextWatcher
+
 import android.util.Base64
 
 import android.util.Log
@@ -145,6 +149,7 @@ import java.io.IOException
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.SocketException
+import java.net.URLEncoder
 
 import java.text.SimpleDateFormat
 
@@ -340,6 +345,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var currentDisplayIndex = 0
 
     private val recognitionRecords = Collections.synchronizedList(mutableListOf<RecognitionRecord>())
+
+    private val sharedRecognitionRecords = Collections.synchronizedList(mutableListOf<SharedRecognitionRecord>())
+
+    private val deletedSharedRecordIds = Collections.synchronizedSet(mutableSetOf<String>())
+
+    private val deletedSharedRecordTimestamps = Collections.synchronizedMap(mutableMapOf<String, Long>())
 
     private var galleryPreviewPhotos: List<GalleryPhoto> = emptyList()
 
@@ -558,6 +569,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private var soundPromptEnabled = true
 
+    private var recordShareEnabled = true
+
+    private var shareNickname = ""
+
+    private var shareDeviceId = ""
+
+    @Volatile private var sharedRecordSyncRunning = false
+
+    @Volatile private var sharedRecordSyncInFlight = false
+
+    @Volatile private var sharedRecordSyncCursor = 0L
+
     
 
     // 语音播报 TTS
@@ -622,6 +645,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private val sharedRecordSyncRunnable = object : Runnable {
+
+        override fun run() {
+
+            if (!sharedRecordSyncRunning || !recordShareEnabled || !isActivityResumed) {
+
+                return
+
+            }
+
+            fetchSharedRecognitionRecords(initialFetch = false)
+
+            mainHandler.postDelayed(this, SHARED_RECORD_POLL_MS)
+
+        }
+
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
 
         super.onCreate(savedInstanceState)
@@ -656,9 +697,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         loadSoundSettings()
 
+        loadShareSettings()
+
+        loadSharedRecognitionRecords()
+
         setupCaptureParamControls()
 
         setupSoundSettingsControls()
+
+        setupShareSettingsControls()
 
         renderHistoryList()
 
@@ -888,6 +935,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         renderRtmpReceiverSnapshot(latestRtmpReceiverSnapshot)
 
+        startSharedRecordSync()
+
         recordDiagnostic("Activity 状态变更为: RESUMED")
 
     }
@@ -897,6 +946,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onPause()
 
         isActivityResumed = false
+
+        stopSharedRecordSync()
 
         stopRealtimeStreamTest("Activity 暂停")
 
@@ -1233,6 +1284,222 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             recordDiagnostic("声音提示开关已变更: enabled=$isChecked")
 
         }
+
+    }
+
+    private fun loadShareSettings() {
+
+        val prefs = getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+        recordShareEnabled = prefs.getBoolean(SHARE_PREF_ENABLED, true)
+
+        shareNickname = prefs.getString(SHARE_PREF_NICKNAME, "")?.trim().orEmpty()
+
+        shareDeviceId = prefs.getString(SHARE_PREF_DEVICE_ID, "")?.trim().orEmpty()
+
+        if (shareDeviceId.isBlank()) {
+
+            shareDeviceId = UUID.randomUUID().toString()
+
+            prefs.edit().putString(SHARE_PREF_DEVICE_ID, shareDeviceId).apply()
+
+        }
+
+        val deletedIds = prefs.getStringSet(SHARE_PREF_DELETED_IDS, emptySet()) ?: emptySet()
+
+        val now = System.currentTimeMillis()
+
+        val activeDeletedIds = mutableSetOf<String>()
+
+        val activeDeletedTimestamps = mutableMapOf<String, Long>()
+
+        var shouldRewriteDeletedIds = false
+
+        deletedIds.forEach { entry ->
+
+            val separatorIndex = entry.lastIndexOf(':')
+
+            val shareId = if (separatorIndex > 0) entry.substring(0, separatorIndex) else entry
+
+            if (separatorIndex <= 0) {
+
+                shouldRewriteDeletedIds = true
+
+            }
+
+            val deletedAt = if (separatorIndex > 0) {
+
+                entry.substring(separatorIndex + 1).toLongOrNull() ?: now
+
+            } else {
+
+                now
+
+            }
+
+            if (shareId.isNotBlank() && now - deletedAt <= SHARED_DELETED_ID_RETENTION_MS) {
+
+                activeDeletedIds.add(shareId)
+
+                activeDeletedTimestamps[shareId] = deletedAt
+
+            } else if (shareId.isNotBlank()) {
+
+                shouldRewriteDeletedIds = true
+
+            }
+
+        }
+
+        synchronized(deletedSharedRecordIds) {
+
+            deletedSharedRecordIds.clear()
+
+            deletedSharedRecordIds.addAll(activeDeletedIds)
+
+        }
+
+        synchronized(deletedSharedRecordTimestamps) {
+
+            deletedSharedRecordTimestamps.clear()
+
+            deletedSharedRecordTimestamps.putAll(activeDeletedTimestamps)
+
+        }
+
+        if (shouldRewriteDeletedIds) {
+
+            saveDeletedSharedRecordIds()
+
+        }
+
+    }
+
+    private fun setupShareSettingsControls() {
+
+        binding.switchRecordSharing.isChecked = recordShareEnabled
+
+        binding.etShareNickname.setText(shareNickname)
+
+        binding.switchRecordSharing.setOnCheckedChangeListener { _, isChecked ->
+
+            recordShareEnabled = isChecked
+
+            getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+                .edit()
+
+                .putBoolean(SHARE_PREF_ENABLED, isChecked)
+
+                .apply()
+
+            if (isChecked) {
+
+                startSharedRecordSync()
+
+            } else {
+
+                stopSharedRecordSync()
+
+            }
+
+            val text = if (isChecked) "记录共享已开启" else "记录共享已关闭"
+
+            Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("记录共享开关已变更: enabled=$isChecked")
+
+        }
+
+        binding.etShareNickname.addTextChangedListener(object : TextWatcher {
+
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+
+            override fun afterTextChanged(s: Editable?) {
+
+                shareNickname = s?.toString()?.trim().orEmpty()
+
+                getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+                    .edit()
+
+                    .putString(SHARE_PREF_NICKNAME, shareNickname)
+
+                    .apply()
+
+            }
+
+        })
+
+    }
+
+    private fun shareDisplayNickname(): String {
+
+        return shareNickname.trim().ifBlank { DEFAULT_SHARE_NICKNAME }
+
+    }
+
+    private fun saveDeletedSharedRecordIds() {
+
+        pruneDeletedSharedRecordIds()
+
+        val snapshot = synchronized(deletedSharedRecordTimestamps) {
+
+            deletedSharedRecordTimestamps
+
+                .map { (shareId, deletedAt) -> "$shareId:$deletedAt" }
+
+                .toSet()
+
+        }
+
+        getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .edit()
+
+            .putStringSet(SHARE_PREF_DELETED_IDS, snapshot)
+
+            .apply()
+
+    }
+
+    private fun pruneDeletedSharedRecordIds(now: Long = System.currentTimeMillis()): Boolean {
+
+        val expiredIds = mutableListOf<String>()
+
+        synchronized(deletedSharedRecordTimestamps) {
+
+            val iterator = deletedSharedRecordTimestamps.entries.iterator()
+
+            while (iterator.hasNext()) {
+
+                val entry = iterator.next()
+
+                if (now - entry.value > SHARED_DELETED_ID_RETENTION_MS) {
+
+                    expiredIds.add(entry.key)
+
+                    iterator.remove()
+
+                }
+
+            }
+
+        }
+
+        if (expiredIds.isNotEmpty()) {
+
+            synchronized(deletedSharedRecordIds) {
+
+                deletedSharedRecordIds.removeAll(expiredIds.toSet())
+
+            }
+
+        }
+
+        return expiredIds.isNotEmpty()
 
     }
 
@@ -4876,12 +5143,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     val cooldownMs = realtimeCloudCooldownMs(track)
                     val cooldownDone = now - track.lastCloudUploadAt >= cooldownMs
                     val qualityJump = isRealtimeQualityJumpCandidate(track, candidate, now)
-                    val canUploadPlan = if (lostFaceFlush) true else (cooldownDone || qualityJump)
+                    val lostFaceCooldownBypass = isRealtimeLostFaceCooldownBypassAllowed(track, candidate, now)
+                    val canUploadPlan = cooldownDone || qualityJump || lostFaceCooldownBypass
                     if (oldEnough && canUploadPlan) {
                         track to candidate
                     } else {
                         val collectBlocked = !oldEnough
-                        val cooldownBlocked = !cooldownDone && !qualityJump
+                        val cooldownBlocked = !cooldownDone && !qualityJump && !lostFaceCooldownBypass
                         when {
                             collectBlocked && cooldownBlocked -> blockedBoth += 1
                             collectBlocked -> blockedCollectWindow += 1
@@ -4932,8 +5200,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     val inCooldown = track.lastCloudUploadAt > 0L &&
                         now - track.lastCloudUploadAt < realtimeCloudCooldownMs(track)
                     val lostFaceFlush = now - track.lastSeenAt >= REALTIME_LOST_FACE_FLUSH_MS
+                    val lostFaceCooldownBypass = isRealtimeLostFaceCooldownBypassAllowed(track, candidate, now)
                     val crowdLostFace = crowdMode && now - track.lastSeenAt >= REALTIME_CROWD_LOST_FACE_UPLOAD_MS
                     val reason = when {
+                        lostFaceFlush && inCooldown && lostFaceCooldownBypass ->
+                            "lost_face_flush_cooldown_bypass(prevQ=${track.lastCloudUploadQuality})"
                         lostFaceFlush && inCooldown -> "lost_face_flush_quality_jump(prevQ=${track.lastCloudUploadQuality})"
                         lostFaceFlush -> "lost_face_flush"
                         crowdLostFace && inCooldown -> "crowd_lost_face_quality_jump(prevQ=${track.lastCloudUploadQuality})"
@@ -5545,6 +5816,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return (track.lastCloudUploadAt + cooldownMs - now).coerceAtLeast(0L)
     }
 
+    private fun isRealtimeLostFaceCooldownBypassAllowed(
+        track: RealtimePersonTrack,
+        candidate: RealtimeFaceCandidate,
+        now: Long
+    ): Boolean {
+        if (now - track.lastSeenAt < REALTIME_LOST_FACE_FLUSH_MS) {
+            return false
+        }
+        if (track.lastCloudUploadAt <= 0L || realtimeCloudCooldownLeftMs(track, now) <= 0L) {
+            return false
+        }
+        if (track.lastCloudUploadMatched || track.lastCloudUploadNoFace) {
+            return false
+        }
+        val minSide = minOf(candidate.faceRectInFrame.width(), candidate.faceRectInFrame.height())
+        if (minSide < REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_SIDE_PX) {
+            return false
+        }
+        return candidate.cloudGateQuality >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_GATE_QUALITY ||
+            candidate.dispatchScore >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_DISPATCH_SCORE ||
+            candidate.qualityScore >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_QUALITY
+    }
+
     private fun isRealtimeQualityOrSizeJumpCandidate(
         track: RealtimePersonTrack,
         candidate: RealtimeFaceCandidate,
@@ -5856,6 +6150,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 synchronized(recognitionRecords) {
                     recognitionRecords.add(0, record)
                 }
+                publishRecognitionRecordIfNeeded(record, "实时识别")
                 added += 1
                 recordDiagnostic(
                     "实时识别结果已保存: track=$trackId, recordId=$recordId, " +
@@ -9909,6 +10204,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             }
 
+            publishRecognitionRecordIfNeeded(record, "视频识别")
+
             added += 1
 
             recordDiagnostic(
@@ -10170,6 +10467,806 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 recordDiagnostic("后台保存识别记录异常", e)
 
             }
+
+        }
+
+    }
+
+    private fun loadSharedRecognitionRecords() {
+
+        val json = getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+            .getString(SHARE_PREF_RECORDS, "[]")
+
+        val type = object : TypeToken<MutableList<SharedRecognitionRecord>>() {}.type
+
+        val loaded = try {
+
+            Gson().fromJson<MutableList<SharedRecognitionRecord>>(json, type) ?: mutableListOf()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("读取共享识别记录失败，将重置共享缓存", e)
+
+            mutableListOf()
+
+        }
+
+        val now = System.currentTimeMillis()
+
+        if (pruneDeletedSharedRecordIds(now)) {
+
+            saveDeletedSharedRecordIds()
+
+        }
+
+        val hiddenIds = synchronized(deletedSharedRecordIds) { deletedSharedRecordIds.toSet() }
+
+        synchronized(sharedRecognitionRecords) {
+
+            sharedRecognitionRecords.clear()
+
+            sharedRecognitionRecords.addAll(
+
+                loaded
+
+                    .filter { it.expiresAt > now && it.shareId !in hiddenIds }
+
+                    .sortedByDescending { it.createdAt }
+
+            )
+
+        }
+
+    }
+
+    private fun saveSharedRecognitionRecords() {
+
+        val snapshot = synchronized(sharedRecognitionRecords) {
+
+            sharedRecognitionRecords
+
+                .filter { it.expiresAt > System.currentTimeMillis() }
+
+                .sortedByDescending { it.createdAt }
+
+        }
+
+        executeWorker("保存共享识别记录") {
+
+            try {
+
+                val json = Gson().toJson(snapshot)
+
+                getSharedPreferences(SHARE_PREFS_NAME, Context.MODE_PRIVATE)
+
+                    .edit()
+
+                    .putString(SHARE_PREF_RECORDS, json)
+
+                    .apply()
+
+            } catch (e: Exception) {
+
+                recordDiagnostic("后台保存共享识别记录异常", e)
+
+            }
+
+        }
+
+    }
+
+    private fun cleanupExpiredSharedRecognitionRecords() {
+
+        val now = System.currentTimeMillis()
+
+        var changed = false
+
+        synchronized(sharedRecognitionRecords) {
+
+            val iterator = sharedRecognitionRecords.iterator()
+
+            while (iterator.hasNext()) {
+
+                if (iterator.next().expiresAt <= now) {
+
+                    iterator.remove()
+
+                    changed = true
+
+                }
+
+            }
+
+        }
+
+        if (changed) {
+
+            saveSharedRecognitionRecords()
+
+            recordDiagnostic("已清理过期共享记录")
+
+        }
+
+    }
+
+    private fun startSharedRecordSync() {
+
+        if (!recordShareEnabled || !isActivityResumed) {
+
+            return
+
+        }
+
+        sharedRecordSyncRunning = true
+
+        sharedRecordSyncCursor = 0L
+
+        mainHandler.removeCallbacks(sharedRecordSyncRunnable)
+
+        fetchSharedRecognitionRecords(initialFetch = true)
+
+        mainHandler.postDelayed(sharedRecordSyncRunnable, SHARED_RECORD_POLL_MS)
+
+    }
+
+    private fun stopSharedRecordSync() {
+
+        sharedRecordSyncRunning = false
+
+        mainHandler.removeCallbacks(sharedRecordSyncRunnable)
+
+    }
+
+    private fun fetchSharedRecognitionRecords(initialFetch: Boolean) {
+
+        if (!recordShareEnabled || sharedRecordSyncInFlight) {
+
+            return
+
+        }
+
+        val since = if (initialFetch) 0L else sharedRecordSyncCursor
+
+        val requestUrl = serverBaseUrl.trimEnd('/') +
+
+            "/dlsgzs/api/shared-records/recent?since=$since&device_id=${urlEncode(shareDeviceId)}"
+
+        val request = try {
+
+            Request.Builder().url(requestUrl).get().build()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("共享记录同步请求构建失败: url=$requestUrl", e)
+
+            return
+
+        }
+
+        sharedRecordSyncInFlight = true
+
+        okHttpClient.newCall(request).enqueue(object : Callback {
+
+            override fun onFailure(call: Call, e: IOException) {
+
+                sharedRecordSyncInFlight = false
+
+                recordDiagnostic("共享记录同步网络失败: url=$requestUrl", e)
+
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+
+                response.use {
+
+                    try {
+
+                        val bodyString = it.body?.string().orEmpty()
+
+                        if (!it.isSuccessful || bodyString.isBlank()) {
+
+                            recordDiagnostic(
+
+                                "共享记录同步 HTTP 失败: code=${it.code}, bodyPreview=${bodyString.take(160)}"
+
+                            )
+
+                            return
+
+                        }
+
+                        val obj = Gson().fromJson(bodyString, JsonObject::class.java)
+
+                        if (obj.get("success")?.asBoolean != true) {
+
+                            recordDiagnostic("共享记录同步业务失败: bodyPreview=${bodyString.take(160)}")
+
+                            return
+
+                        }
+
+                        val items = obj.getAsJsonArray("items")
+
+                        val parsedRecords = mutableListOf<SharedRecognitionRecord>()
+
+                        if (items != null) {
+
+                            for (i in 0 until items.size()) {
+
+                                val itemObj = items.get(i).takeIf { item -> item.isJsonObject }?.asJsonObject ?: continue
+
+                                parseSharedRecognitionRecord(itemObj)?.let { record ->
+
+                                    parsedRecords.add(record)
+
+                                }
+
+                            }
+
+                        }
+
+                        val nextCursor = obj.get("next_cursor")?.takeIf { cursor -> !cursor.isJsonNull }?.asLong
+
+                            ?: System.currentTimeMillis()
+
+                        if (!recordShareEnabled || !sharedRecordSyncRunning) {
+
+                            recordDiagnostic("共享记录同步响应已忽略: sharingEnabled=$recordShareEnabled, running=$sharedRecordSyncRunning")
+
+                            return
+
+                        }
+
+                        sharedRecordSyncCursor = maxOf(sharedRecordSyncCursor, nextCursor)
+
+                        if (parsedRecords.isNotEmpty()) {
+
+                            mergeSharedRecognitionRecords(parsedRecords)
+
+                            recordDiagnostic(
+
+                                "共享记录同步完成: received=${parsedRecords.size}, cursor=$sharedRecordSyncCursor"
+
+                            )
+
+                        } else if (initialFetch) {
+
+                            cleanupExpiredSharedRecognitionRecords()
+
+                        }
+
+                    } catch (e: Exception) {
+
+                        recordDiagnostic("共享记录同步响应解析异常", e)
+
+                    } finally {
+
+                        sharedRecordSyncInFlight = false
+
+                    }
+
+                }
+
+            }
+
+        })
+
+    }
+
+    private fun mergeSharedRecognitionRecords(newRecords: List<SharedRecognitionRecord>) {
+
+        if (pruneDeletedSharedRecordIds()) {
+
+            saveDeletedSharedRecordIds()
+
+        }
+
+        val hiddenIds = synchronized(deletedSharedRecordIds) { deletedSharedRecordIds.toSet() }
+
+        var changed = false
+
+        synchronized(sharedRecognitionRecords) {
+
+            newRecords
+
+                .filter { it.expiresAt > System.currentTimeMillis() && it.shareId !in hiddenIds }
+
+                .forEach { incoming ->
+
+                    val existingIndex = sharedRecognitionRecords.indexOfFirst { it.shareId == incoming.shareId }
+
+                    if (existingIndex >= 0) {
+
+                        sharedRecognitionRecords[existingIndex] = incoming
+
+                    } else {
+
+                        sharedRecognitionRecords.add(incoming)
+
+                    }
+
+                    changed = true
+
+                }
+
+            if (changed) {
+
+                sharedRecognitionRecords.sortByDescending { it.createdAt }
+
+            }
+
+        }
+
+        if (changed) {
+
+            saveSharedRecognitionRecords()
+
+            runOnUiThread {
+
+                renderHistoryListIfVisible()
+
+            }
+
+        }
+
+    }
+
+    private fun parseSharedRecognitionRecord(itemObj: JsonObject): SharedRecognitionRecord? {
+
+        val shareId = jsonString(itemObj, "share_id").ifBlank { return null }
+
+        val metadata = firstJsonObject(itemObj, "metadata") ?: return null
+
+        val recordObj = firstJsonObject(metadata, "record") ?: return null
+
+        val expertObj = firstJsonObject(recordObj, "expert") ?: return null
+
+        val expert = ExpertInfo(
+
+            name = jsonString(expertObj, "name", "-"),
+
+            company = jsonString(expertObj, "company", "无工作单位"),
+
+            major = jsonString(expertObj, "major", "未填写"),
+
+            phone = jsonString(expertObj, "phone", "-"),
+
+            idCard = jsonString(expertObj, "id_card", "-"),
+
+            score = jsonFloat(recordObj, "score") ?: jsonFloat(expertObj, "score") ?: 0f,
+
+            photoPath = jsonString(expertObj, "photo_path", ""),
+
+            faceRect = parseFaceRect(recordObj)
+
+        )
+
+        return SharedRecognitionRecord(
+
+            shareId = shareId,
+
+            clientRecordId = jsonString(itemObj, "client_record_id"),
+
+            deviceId = jsonString(itemObj, "device_id"),
+
+            nickname = jsonString(itemObj, "nickname", DEFAULT_SHARE_NICKNAME).ifBlank { DEFAULT_SHARE_NICKNAME },
+
+            source = jsonString(itemObj, "source"),
+
+            capturedAt = jsonLong(itemObj, "captured_at") ?: jsonLong(metadata, "captured_at") ?: 0L,
+
+            createdAt = jsonLong(itemObj, "created_at") ?: System.currentTimeMillis(),
+
+            expiresAt = jsonLong(itemObj, "expires_at") ?: (System.currentTimeMillis() + SHARED_RECORD_RETENTION_MS),
+
+            originalUrl = jsonString(itemObj, "original_url"),
+
+            faceUrl = jsonString(itemObj, "face_url"),
+
+            originalWidth = jsonInt(recordObj, "original_width") ?: 0,
+
+            originalHeight = jsonInt(recordObj, "original_height") ?: 0,
+
+            uploadWidth = jsonInt(recordObj, "upload_width") ?: 0,
+
+            uploadHeight = jsonInt(recordObj, "upload_height") ?: 0,
+
+            expert = expert
+
+        )
+
+    }
+
+    private fun urlEncode(value: String): String {
+
+        return try {
+
+            URLEncoder.encode(value, "UTF-8")
+
+        } catch (_: Exception) {
+
+            value
+
+        }
+
+    }
+
+    private fun publishRecognitionRecordIfNeeded(recordId: String?, sourceLabel: String) {
+
+        val record = findRecognitionRecord(recordId) ?: return
+
+        publishRecognitionRecordIfNeeded(record, sourceLabel)
+
+    }
+
+    private fun publishRecognitionRecordIfNeeded(record: RecognitionRecord, sourceLabel: String) {
+
+        if (!recordShareEnabled) {
+
+            return
+
+        }
+
+        val snapshot = synchronized(recognitionRecords) {
+
+            val current = recognitionRecords.firstOrNull { it.id == record.id } ?: return
+
+            if (current.status != STATUS_SUCCESS || current.experts.isEmpty()) {
+
+                return
+
+            }
+
+            if (current.sharePending || current.sharedAt > 0L || !current.sharedShareId.isNullOrBlank()) {
+
+                return
+
+            }
+
+            current.sharePending = true
+
+            current.copy(
+
+                localFaceRects = current.localFaceRects.toMutableList(),
+
+                experts = current.experts.toMutableList()
+
+            )
+
+        }
+
+        saveRecognitionRecords()
+
+        executeWorker("发布共享识别记录") {
+
+            postSharedRecognitionRecord(snapshot, sourceLabel)
+
+        }
+
+    }
+
+    private fun postSharedRecognitionRecord(record: RecognitionRecord, sourceLabel: String) {
+
+        val expert = record.experts.firstOrNull()
+
+        if (expert == null) {
+
+            markSharedRecordPublishFinished(record.id, null, false)
+
+            return
+
+        }
+
+        val originalBytes = loadHistoryBytes(record.originalImagePath)
+
+        if (originalBytes == null || originalBytes.isEmpty()) {
+
+            recordDiagnostic("共享记录发布延后: 原图未保存, id=${record.id}, source=$sourceLabel")
+
+            scheduleSharedRecordPublishRetry(record.id, sourceLabel, "original_not_saved")
+
+            return
+
+        }
+
+        val faceBytes = loadHistoryBytes(record.uploadImagePath)
+
+        val metadata = buildSharedRecordMetadata(record, expert, sourceLabel)
+
+        val multipart = MultipartBody.Builder()
+
+            .setType(MultipartBody.FORM)
+
+            .addFormDataPart("metadata", metadata.toString())
+
+            .addFormDataPart(
+
+                "original_image",
+
+                "${record.id}_original.jpg",
+
+                originalBytes.toRequestBody("image/jpeg".toMediaTypeOrNull())
+
+            )
+
+        if (faceBytes != null && faceBytes.isNotEmpty()) {
+
+            multipart.addFormDataPart(
+
+                "face_image",
+
+                "${record.id}_face.jpg",
+
+                faceBytes.toRequestBody("image/jpeg".toMediaTypeOrNull())
+
+            )
+
+        }
+
+        val requestUrl = "${serverBaseUrl.trimEnd('/')}/dlsgzs/api/shared-records"
+
+        val request = try {
+
+            Request.Builder()
+
+                .url(requestUrl)
+
+                .post(multipart.build())
+
+                .build()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("共享记录发布请求构建失败: id=${record.id}, url=$requestUrl", e)
+
+            scheduleSharedRecordPublishRetry(record.id, sourceLabel, "request_build_failed")
+
+            return
+
+        }
+
+        try {
+
+            okHttpClient.newCall(request).execute().use { response ->
+
+                val bodyString = response.body?.string().orEmpty()
+
+                if (!response.isSuccessful || bodyString.isBlank()) {
+
+                    recordDiagnostic(
+
+                        "共享记录发布 HTTP 失败: id=${record.id}, code=${response.code}, bodyPreview=${bodyString.take(160)}"
+
+                    )
+
+                    if (bodyString.isBlank() || shouldRetrySharedRecordPublish(response.code)) {
+
+                        scheduleSharedRecordPublishRetry(record.id, sourceLabel, "http_${response.code}")
+
+                    } else {
+
+                        markSharedRecordPublishFinished(record.id, null, false)
+
+                    }
+
+                    return
+
+                }
+
+                val bodyObj = Gson().fromJson(bodyString, JsonObject::class.java)
+
+                val success = bodyObj.get("success")?.asBoolean ?: false
+
+                if (!success) {
+
+                    recordDiagnostic("共享记录发布业务失败: id=${record.id}, bodyPreview=${bodyString.take(160)}")
+
+                    markSharedRecordPublishFinished(record.id, null, false)
+
+                    return
+
+                }
+
+                val shareId = bodyObj.get("share_id")?.takeIf { !it.isJsonNull }?.asString
+
+                markSharedRecordPublishFinished(record.id, shareId, true)
+
+                recordDiagnostic(
+
+                    "共享记录发布成功: id=${record.id}, shareId=${shareId ?: "-"}, source=${sharedSourceType(sourceLabel)}, " +
+
+                        "originalBytes=${originalBytes.size}, faceBytes=${faceBytes?.size ?: 0}, nickname=${shareDisplayNickname()}"
+
+                )
+
+            }
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("共享记录发布网络异常: id=${record.id}, url=$requestUrl", e)
+
+            scheduleSharedRecordPublishRetry(record.id, sourceLabel, "network_exception")
+
+        }
+
+    }
+
+    private fun shouldRetrySharedRecordPublish(httpCode: Int): Boolean {
+
+        return httpCode == 0 || httpCode == 408 || httpCode == 429 || httpCode >= 500
+
+    }
+
+    private fun buildSharedRecordMetadata(record: RecognitionRecord, expert: ExpertInfo, sourceLabel: String): JsonObject {
+
+        val expertObj = JsonObject().apply {
+
+            addProperty("name", expert.name)
+
+            addProperty("company", expert.company)
+
+            addProperty("major", expert.major)
+
+            addProperty("phone", expert.phone)
+
+            addProperty("id_card", expert.idCard ?: "-")
+
+            addProperty("photo_path", expert.photoPath)
+
+            addProperty("score", expert.score)
+
+        }
+
+        val recordObj = JsonObject().apply {
+
+            addProperty("status", record.status)
+
+            addProperty("status_text", record.statusText)
+
+            addProperty("score", expert.score)
+
+            add("expert", expertObj)
+
+            expert.faceRect?.let { add("face_rect", faceRectToJson(it)) }
+
+            record.uploadSourceRect?.let { add("upload_source_rect", faceRectToJson(it)) }
+
+            addProperty("original_width", record.originalWidth)
+
+            addProperty("original_height", record.originalHeight)
+
+            addProperty("upload_width", record.uploadWidth)
+
+            addProperty("upload_height", record.uploadHeight)
+
+            addProperty("face_rect_image_width", record.faceRectImageWidth)
+
+            addProperty("face_rect_image_height", record.faceRectImageHeight)
+
+        }
+
+        return JsonObject().apply {
+
+            addProperty("client_record_id", record.id)
+
+            addProperty("device_id", shareDeviceId)
+
+            addProperty("nickname", shareDisplayNickname())
+
+            addProperty("source", sharedSourceType(sourceLabel))
+
+            addProperty("captured_at", record.createdAt)
+
+            add("record", recordObj)
+
+        }
+
+    }
+
+    private fun faceRectToJson(rect: FaceRect): JsonObject {
+
+        return JsonObject().apply {
+
+            addProperty("x", rect.x)
+
+            addProperty("y", rect.y)
+
+            addProperty("width", rect.width)
+
+            addProperty("height", rect.height)
+
+        }
+
+    }
+
+    private fun sharedSourceType(sourceLabel: String): String {
+
+        return when {
+
+            sourceLabel.contains("图库") -> "gallery"
+
+            sourceLabel.contains("视频") -> "video"
+
+            sourceLabel.contains("实时") -> "realtime"
+
+            else -> "glasses"
+
+        }
+
+    }
+
+    private fun markSharedRecordPublishFinished(recordId: String, shareId: String?, success: Boolean) {
+
+        synchronized(recognitionRecords) {
+
+            val record = recognitionRecords.firstOrNull { it.id == recordId } ?: return@synchronized
+
+            record.sharePending = false
+
+            if (success) {
+
+                record.sharedAt = System.currentTimeMillis()
+
+                record.sharedShareId = shareId
+
+                record.shareRetryCount = 0
+
+            }
+
+        }
+
+        saveRecognitionRecords()
+
+    }
+
+    private fun scheduleSharedRecordPublishRetry(recordId: String, sourceLabel: String, reason: String) {
+
+        var retryIndex = -1
+
+        synchronized(recognitionRecords) {
+
+            val record = recognitionRecords.firstOrNull { it.id == recordId } ?: return@synchronized
+
+            record.sharePending = false
+
+            if (record.shareRetryCount < SHARE_PUBLISH_MAX_RETRIES) {
+
+                record.shareRetryCount += 1
+
+                retryIndex = record.shareRetryCount
+
+            }
+
+        }
+
+        saveRecognitionRecords()
+
+        if (retryIndex > 0) {
+
+            val delayMs = SHARE_PUBLISH_RETRY_DELAY_MS * retryIndex
+
+            mainHandler.postDelayed(
+
+                {
+
+                    publishRecognitionRecordIfNeeded(recordId, sourceLabel)
+
+                },
+
+                delayMs
+
+            )
+
+            recordDiagnostic(
+
+                "共享记录发布计划重试: id=$recordId, retry=$retryIndex, delayMs=$delayMs, reason=$reason"
+
+            )
+
+        } else {
+
+            recordDiagnostic("共享记录发布放弃: id=$recordId, reason=$reason")
 
         }
 
@@ -10544,6 +11641,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
                 updateRecognitionRecord(recordId) {
 
+                    resetSharedPublishState(it)
+
                     it.status = STATUS_UPLOADING
 
                     it.statusText = "正在重新上传识别"
@@ -10563,6 +11662,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             originalBytes != null -> {
 
                 updateRecognitionRecord(recordId) {
+
+                    resetSharedPublishState(it)
 
                     it.status = STATUS_LOCAL_PROCESSING
 
@@ -10598,9 +11699,131 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private fun resetSharedPublishState(record: RecognitionRecord) {
+
+        record.sharePending = false
+
+        record.shareRetryCount = 0
+
+        record.sharedAt = 0L
+
+        record.sharedShareId = null
+
+    }
+
+    private fun deleteSharedRecognitionRecord(shareId: String) {
+
+        val removed = synchronized(sharedRecognitionRecords) {
+
+            val record = sharedRecognitionRecords.firstOrNull { it.shareId == shareId }
+
+            if (record != null) {
+
+                sharedRecognitionRecords.remove(record)
+
+            }
+
+            record
+
+        }
+
+        if (removed != null) {
+
+            synchronized(deletedSharedRecordIds) {
+
+                deletedSharedRecordIds.add(shareId)
+
+            }
+
+            synchronized(deletedSharedRecordTimestamps) {
+
+                deletedSharedRecordTimestamps[shareId] = System.currentTimeMillis()
+
+            }
+
+            saveDeletedSharedRecordIds()
+
+            saveSharedRecognitionRecords()
+
+            renderHistoryList()
+
+            recordDiagnostic("本机删除共享识别记录: shareId=$shareId, from=${removed.nickname}")
+
+        }
+
+    }
+
+    private fun loadSharedThumbnail(record: SharedRecognitionRecord, imageView: ImageView) {
+
+        val imageUrl = (record.faceUrl.ifBlank { record.originalUrl }).ifBlank { return }
+
+        val requestUrl = expertPhotoUrl(imageUrl)
+
+        val request = try {
+
+            Request.Builder().url(requestUrl).get().build()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("共享缩略图请求构建失败: shareId=${record.shareId}, url=$requestUrl", e)
+
+            return
+
+        }
+
+        okHttpClient.newCall(request).enqueue(object : Callback {
+
+            override fun onFailure(call: Call, e: IOException) {
+
+                recordDiagnostic("共享缩略图加载失败: shareId=${record.shareId}, url=$requestUrl", e)
+
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+
+                response.use {
+
+                    if (!it.isSuccessful) {
+
+                        recordDiagnostic("共享缩略图 HTTP 失败: shareId=${record.shareId}, code=${it.code}")
+
+                        return
+
+                    }
+
+                    val bytes = it.body?.bytes()
+
+                    if (bytes == null || bytes.isEmpty()) {
+
+                        return
+
+                    }
+
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+
+                    runOnUiThread {
+
+                        if (imageView.tag == record.shareId) {
+
+                            imageView.setImageBitmap(bitmap)
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        })
+
+    }
+
     private fun renderHistoryList() {
 
         if (!::binding.isInitialized) return
+
+        cleanupExpiredSharedRecognitionRecords()
 
         val records = synchronized(recognitionRecords) {
 
@@ -10608,19 +11831,61 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
-        binding.historyList.removeAllViews()
+        val sharedRecords = synchronized(sharedRecognitionRecords) {
 
-        binding.tvHistoryEmpty.visibility = if (records.isEmpty()) View.VISIBLE else View.GONE
+            sharedRecognitionRecords
+
+                .filter { it.expiresAt > System.currentTimeMillis() }
+
+                .sortedByDescending { it.createdAt }
+
+        }
+
+        val items = mutableListOf<HistoryRecordItem>()
 
         records.forEach { record ->
 
+            items.add(HistoryRecordItem(createdAt = record.createdAt, localRecord = record))
+
+        }
+
+        sharedRecords.forEach { record ->
+
+            items.add(HistoryRecordItem(createdAt = record.createdAt, sharedRecord = record))
+
+        }
+
+        items.sortByDescending { it.createdAt }
+
+        binding.historyList.removeAllViews()
+
+        binding.tvHistoryEmpty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+
+        items.forEach { item ->
+
             try {
 
-                binding.historyList.addView(createHistoryRecordView(record))
+                val localRecord = item.localRecord
+
+                val sharedRecord = item.sharedRecord
+
+                when {
+
+                    localRecord != null -> binding.historyList.addView(createHistoryRecordView(localRecord))
+
+                    sharedRecord != null -> binding.historyList.addView(createSharedHistoryRecordView(sharedRecord))
+
+                }
 
             } catch (e: Exception) {
 
-                recordDiagnostic("渲染识别记录异常: id=${record.id}, status=${record.status}", e)
+                recordDiagnostic(
+
+                    "渲染识别记录异常: local=${item.localRecord?.id}, shared=${item.sharedRecord?.shareId}",
+
+                    e
+
+                )
 
             }
 
@@ -10954,6 +12219,284 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private fun createSharedHistoryRecordView(record: SharedRecognitionRecord): View {
+
+        val card = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_page_panel)
+
+        }
+
+        card.layoutParams = LinearLayout.LayoutParams(
+
+            LinearLayout.LayoutParams.MATCH_PARENT,
+
+            LinearLayout.LayoutParams.WRAP_CONTENT
+
+        ).apply {
+
+            bottomMargin = dp(12)
+
+        }
+
+        val topRow = LinearLayout(this).apply {
+
+            orientation = LinearLayout.HORIZONTAL
+
+            gravity = android.view.Gravity.CENTER_VERTICAL
+
+        }
+
+        val thumb = ImageView(this).apply {
+
+            setLayoutParams(
+
+                LinearLayout.LayoutParams(dp(68), dp(88)).apply {
+
+                    setMargins(0, 0, dp(12), 0)
+
+                }
+
+            )
+
+            scaleType = ImageView.ScaleType.CENTER_CROP
+
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_preview_panel)
+
+            tag = record.shareId
+
+        }
+
+        loadSharedThumbnail(record, thumb)
+
+        val textBox = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        }
+
+        val expert = record.expert
+
+        val headerRow = LinearLayout(this).apply {
+
+            orientation = LinearLayout.HORIZONTAL
+
+            gravity = android.view.Gravity.CENTER_VERTICAL
+
+        }
+
+        headerRow.addView(TextView(this).apply {
+
+            text = historyTimeFormat.format(Date(record.createdAt))
+
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+            textSize = 12f
+
+        })
+
+        headerRow.addView(TextView(this).apply {
+
+            text = String.format(Locale.getDefault(), "  相似度 %.1f%%", expert.score)
+
+            if (expert.score >= 85.0) {
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_error_red))
+
+            } else {
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_aurora_green))
+
+            }
+
+            textSize = 12f
+
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+
+        })
+
+        textBox.addView(headerRow)
+
+        textBox.addView(TextView(this).apply {
+
+            text = "由「${record.nickname.ifBlank { DEFAULT_SHARE_NICKNAME }}」共享"
+
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_aurora_green))
+
+            textSize = 12f
+
+            setPadding(0, dp(2), 0, dp(2))
+
+        })
+
+        textBox.addView(TextView(this).apply {
+
+            text = expert.name
+
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+
+            textSize = 17f
+
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+
+            setPadding(0, dp(2), 0, dp(4))
+
+        })
+
+        val detailLines = listOf(
+
+            "身份证：" to (expert.idCard?.takeIf { it.isNotBlank() } ?: "-"),
+
+            "手机号：" to expert.phone,
+
+            "单　位：" to expert.company,
+
+            "专　业：" to expert.major
+
+        )
+
+        detailLines.forEach { (label, value) ->
+
+            val lineLayout = LinearLayout(this).apply {
+
+                orientation = LinearLayout.HORIZONTAL
+
+                setPadding(0, dp(1), 0, dp(1))
+
+            }
+
+            lineLayout.addView(TextView(this).apply {
+
+                text = label
+
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+
+                textSize = 12f
+
+            })
+
+            lineLayout.addView(TextView(this).apply {
+
+                text = value
+
+                if (label == "手机号：" && value != "-" && value.isNotBlank()) {
+
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent_aurora_green))
+
+                    paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+
+                    setOnClickListener {
+
+                        try {
+
+                            val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+
+                            val clip = android.content.ClipData.newPlainText("phone", value)
+
+                            clipboard.setPrimaryClip(clip)
+
+                            Toast.makeText(this@MainActivity, "已复制手机号：$value", Toast.LENGTH_SHORT).show()
+
+                        } catch (e: Exception) {
+
+                            Toast.makeText(this@MainActivity, "复制失败", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                    }
+
+                } else {
+
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+
+                }
+
+                textSize = 12f
+
+            })
+
+            textBox.addView(lineLayout)
+
+        }
+
+        topRow.addView(thumb)
+
+        topRow.addView(textBox)
+
+        card.addView(topRow)
+
+        val actionBox = LinearLayout(this).apply {
+
+            orientation = LinearLayout.VERTICAL
+
+            setPadding(0, dp(10), 0, 0)
+
+        }
+
+        val actionButtons = mutableListOf(
+
+            createHistoryActionButton("原图", R.color.accent_aurora_green) {
+
+                showSharedOriginalImage(record)
+
+            }
+
+        )
+
+        if (record.expert.photoPath.isNotBlank()) {
+
+            actionButtons.add(
+
+                createHistoryActionButton("专家照", R.color.button_gradient_start) {
+
+                    showExpertOriginalImage(
+
+                        RecognitionRecord(
+
+                            id = record.shareId,
+
+                            createdAt = record.createdAt,
+
+                            status = STATUS_SUCCESS,
+
+                            statusText = "共享识别成功",
+
+                            experts = mutableListOf(record.expert)
+
+                        )
+
+                    )
+
+                }
+
+            )
+
+        }
+
+        actionButtons.add(
+
+            createHistoryActionButton("删除", R.color.accent_warning_orange) {
+
+                deleteSharedRecognitionRecord(record.shareId)
+
+            }
+
+        )
+
+        addHistoryActionRows(actionBox, actionButtons)
+
+        card.addView(actionBox)
+
+        return card
+
+    }
+
     private fun createHistoryActionButton(textValue: String, colorRes: Int, onClick: () -> Unit): Button {
 
         return Button(this).apply {
@@ -11196,6 +12739,134 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 "faceRectImage=${record.faceRectImageWidth}x${record.faceRectImageHeight}, " +
                 "uploadSource=${record.uploadSourceRect?.let { "${it.x},${it.y},${it.width},${it.height}" } ?: "null"}"
         )
+
+    }
+
+    private fun showSharedOriginalImage(record: SharedRecognitionRecord) {
+
+        if (record.originalUrl.isBlank()) {
+
+            Toast.makeText(this, "这条共享记录没有原图", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("查看共享原图失败: originalUrl为空, shareId=${record.shareId}")
+
+            return
+
+        }
+
+        val url = expertPhotoUrl(record.originalUrl)
+
+        Toast.makeText(this, "正在加载共享原图...", Toast.LENGTH_SHORT).show()
+
+        recordDiagnostic("开始查看共享原图: shareId=${record.shareId}, from=${record.nickname}, url=$url")
+
+        val request = try {
+
+            Request.Builder().url(url).get().build()
+
+        } catch (e: Exception) {
+
+            Toast.makeText(this, "共享原图地址无效", Toast.LENGTH_SHORT).show()
+
+            recordDiagnostic("共享原图请求构建失败: shareId=${record.shareId}, url=$url", e)
+
+            return
+
+        }
+
+        okHttpClient.newCall(request).enqueue(object : Callback {
+
+            override fun onFailure(call: Call, e: IOException) {
+
+                recordDiagnostic("查看共享原图网络失败: shareId=${record.shareId}, url=$url", e)
+
+                runOnUiThread {
+
+                    Toast.makeText(this@MainActivity, "共享原图加载失败", Toast.LENGTH_SHORT).show()
+
+                }
+
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+
+                response.use {
+
+                    if (!it.isSuccessful) {
+
+                        recordDiagnostic("查看共享原图 HTTP 失败: shareId=${record.shareId}, code=${it.code}, url=$url")
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "共享原图加载失败: HTTP ${it.code}", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    val bytes = it.body?.bytes()
+
+                    if (bytes == null || bytes.isEmpty()) {
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "共享原图为空", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+                    if (bitmap == null) {
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "共享原图无法打开", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                        return
+
+                    }
+
+                    runOnUiThread {
+
+                        showBitmapDialog(
+
+                            title = "查看共享原图",
+
+                            summary = "由「${record.nickname.ifBlank { DEFAULT_SHARE_NICKNAME }}」共享  ${bitmap.width}x${bitmap.height}  %.1f KB".format(
+
+                                Locale.getDefault(),
+
+                                bytes.size / 1024f
+
+                            ),
+
+                            bitmap = bitmap
+
+                        )
+
+                    }
+
+                    recordDiagnostic(
+
+                        "查看共享原图: shareId=${record.shareId}, from=${record.nickname}, " +
+
+                            "size=${bitmap.width}x${bitmap.height}, bytes=${bytes.size}"
+
+                    )
+
+                }
+
+            }
+
+        })
 
     }
 
@@ -13895,6 +15566,94 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     }
 
+    private fun jsonString(parent: JsonObject, name: String, defaultValue: String = ""): String {
+
+        val element = parent.get(name)
+
+        if (element == null || element.isJsonNull) {
+
+            return defaultValue
+
+        }
+
+        return try {
+
+            element.asString ?: defaultValue
+
+        } catch (_: Exception) {
+
+            defaultValue
+
+        }
+
+    }
+
+    private fun jsonLong(parent: JsonObject, name: String): Long? {
+
+        val element = parent.get(name)
+
+        if (element == null || element.isJsonNull) {
+
+            return null
+
+        }
+
+        return try {
+
+            element.asLong
+
+        } catch (_: Exception) {
+
+            null
+
+        }
+
+    }
+
+    private fun jsonInt(parent: JsonObject, name: String): Int? {
+
+        val element = parent.get(name)
+
+        if (element == null || element.isJsonNull) {
+
+            return null
+
+        }
+
+        return try {
+
+            element.asInt
+
+        } catch (_: Exception) {
+
+            null
+
+        }
+
+    }
+
+    private fun jsonFloat(parent: JsonObject, name: String): Float? {
+
+        val element = parent.get(name)
+
+        if (element == null || element.isJsonNull) {
+
+            return null
+
+        }
+
+        return try {
+
+            element.asFloat
+
+        } catch (_: Exception) {
+
+            null
+
+        }
+
+    }
+
     /**
 
      * 6. 网络中转请求：将抓拍上传至您的云服务器进行人脸检索，支持抓取定位框与系统头像
@@ -14272,6 +16031,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                         }
 
                                     }
+
+                                }
+
+                                cropTargets.forEach { (targetRecordId, _) ->
+
+                                    publishRecognitionRecordIfNeeded(targetRecordId, sourceLabel)
 
                                 }
 
@@ -15800,6 +17565,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         mainHandler.removeCallbacks(glassCaptureTimeoutRunnable)
 
+        mainHandler.removeCallbacks(sharedRecordSyncRunnable)
+
     }
 
     companion object {
@@ -16355,6 +18122,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val REALTIME_LOST_FACE_COOLDOWN_BREAK_MIN_AREA = 0.004f
 
+        private const val REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_SIDE_PX = 60
+
+        private const val REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_QUALITY = 350
+
+        private const val REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_GATE_QUALITY = 400
+
+        private const val REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_DISPATCH_SCORE = 500
+
         private const val RTMP_RECEIVER_PORT = 1935
 
         private const val RTMP_RECEIVER_RESTART_DELAY_MS = 300L
@@ -16398,6 +18173,30 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val SOUND_PREFS_NAME = "sound_settings"
 
         private const val SOUND_PREF_ENABLED = "sound_prompt_enabled"
+
+        private const val SHARE_PREFS_NAME = "share_settings"
+
+        private const val SHARE_PREF_ENABLED = "share_enabled"
+
+        private const val SHARE_PREF_NICKNAME = "share_nickname"
+
+        private const val SHARE_PREF_DEVICE_ID = "share_device_id"
+
+        private const val SHARE_PREF_RECORDS = "share_records"
+
+        private const val SHARE_PREF_DELETED_IDS = "share_deleted_ids"
+
+        private const val DEFAULT_SHARE_NICKNAME = "未命名设备"
+
+        private const val SHARED_RECORD_POLL_MS = 5_000L
+
+        private const val SHARED_RECORD_RETENTION_MS = 60L * 60L * 1000L
+
+        private const val SHARED_DELETED_ID_RETENTION_MS = SHARED_RECORD_RETENTION_MS + 5L * 60L * 1000L
+
+        private const val SHARE_PUBLISH_MAX_RETRIES = 3
+
+        private const val SHARE_PUBLISH_RETRY_DELAY_MS = 1_500L
 
         private const val HISTORY_RETENTION_MS = 3L * 24L * 60L * 60L * 1000L
 
@@ -16463,7 +18262,59 @@ data class RecognitionRecord(
 
     var localFaceRects: MutableList<FaceRect> = mutableListOf(),
 
+    var sharePending: Boolean = false,
+
+    var shareRetryCount: Int = 0,
+
+    var sharedAt: Long = 0L,
+
+    var sharedShareId: String? = null,
+
     var experts: MutableList<ExpertInfo> = mutableListOf()
+
+)
+
+data class SharedRecognitionRecord(
+
+    var shareId: String = "",
+
+    var clientRecordId: String = "",
+
+    var deviceId: String = "",
+
+    var nickname: String = "",
+
+    var source: String = "",
+
+    var capturedAt: Long = 0L,
+
+    var createdAt: Long = 0L,
+
+    var expiresAt: Long = 0L,
+
+    var originalUrl: String = "",
+
+    var faceUrl: String = "",
+
+    var originalWidth: Int = 0,
+
+    var originalHeight: Int = 0,
+
+    var uploadWidth: Int = 0,
+
+    var uploadHeight: Int = 0,
+
+    var expert: ExpertInfo = ExpertInfo("-", "无工作单位", "未填写", "-", "-", 0f, "", null)
+
+)
+
+data class HistoryRecordItem(
+
+    val createdAt: Long,
+
+    val localRecord: RecognitionRecord? = null,
+
+    val sharedRecord: SharedRecognitionRecord? = null
 
 )
 
