@@ -352,6 +352,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private val deletedSharedRecordTimestamps = Collections.synchronizedMap(mutableMapOf<String, Long>())
 
+    private val sharedOriginalCacheInFlight = Collections.synchronizedSet(mutableSetOf<String>())
+
     private var galleryPreviewPhotos: List<GalleryPhoto> = emptyList()
 
     private val selectedGalleryPhotoKeys = Collections.synchronizedSet(mutableSetOf<String>())
@@ -10562,15 +10564,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         var changed = false
 
+        val expiredShareIds = mutableListOf<String>()
+
         synchronized(sharedRecognitionRecords) {
 
             val iterator = sharedRecognitionRecords.iterator()
 
             while (iterator.hasNext()) {
 
-                if (iterator.next().expiresAt <= now) {
+                val record = iterator.next()
+
+                if (record.expiresAt <= now) {
 
                     iterator.remove()
+
+                    expiredShareIds.add(record.shareId)
 
                     changed = true
 
@@ -10583,6 +10591,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (changed) {
 
             saveSharedRecognitionRecords()
+
+            expiredShareIds.forEach { deleteSharedOriginalCacheFile(it) }
+
+            cleanupSharedOriginalCache()
 
             recordDiagnostic("已清理过期共享记录")
 
@@ -10802,6 +10814,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             saveSharedRecognitionRecords()
 
+            prefetchRecentSharedOriginalImages()
+
             runOnUiThread {
 
                 renderHistoryListIfVisible()
@@ -10871,6 +10885,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             uploadWidth = jsonInt(recordObj, "upload_width") ?: 0,
 
             uploadHeight = jsonInt(recordObj, "upload_height") ?: 0,
+
+            faceRectImageWidth = jsonInt(recordObj, "face_rect_image_width") ?: 0,
+
+            faceRectImageHeight = jsonInt(recordObj, "face_rect_image_height") ?: 0,
+
+            uploadSourceRect = parseNamedFaceRect(recordObj, "upload_source_rect", "uploadSourceRect"),
 
             expert = expert
 
@@ -11742,6 +11762,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             saveDeletedSharedRecordIds()
+
+            deleteSharedOriginalCacheFile(shareId)
 
             saveSharedRecognitionRecords()
 
@@ -12756,9 +12778,131 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         val url = expertPhotoUrl(record.originalUrl)
 
-        Toast.makeText(this, "正在加载共享原图...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "正在打开共享原图...", Toast.LENGTH_SHORT).show()
 
         recordDiagnostic("开始查看共享原图: shareId=${record.shareId}, from=${record.nickname}, url=$url")
+
+        executeWorker("打开共享原图") {
+
+            val cachedBytes = loadSharedOriginalCacheBytes(record)
+
+            if (cachedBytes != null) {
+
+                renderSharedOriginalImage(record, cachedBytes, fromCache = true)
+
+                return@executeWorker
+
+            }
+
+            val downloadedBytes = downloadSharedOriginalImageBytes(record, url, reportUserErrors = true)
+
+                ?: return@executeWorker
+
+            saveSharedOriginalCacheBytes(record, downloadedBytes)
+
+            renderSharedOriginalImage(record, downloadedBytes, fromCache = false)
+
+        }
+
+    }
+
+    private fun renderSharedOriginalImage(record: SharedRecognitionRecord, bytes: ByteArray, fromCache: Boolean) {
+
+        val decodedBitmap = BitmapFactory.decodeByteArray(
+            bytes,
+            0,
+            bytes.size,
+            BitmapFactory.Options().apply {
+                inMutable = true
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+        )
+
+        if (decodedBitmap == null) {
+
+            runOnUiThread {
+
+                Toast.makeText(this@MainActivity, "共享原图无法打开", Toast.LENGTH_SHORT).show()
+
+            }
+
+            recordDiagnostic("共享原图解码失败: shareId=${record.shareId}, bytes=${bytes.size}, fromCache=$fromCache")
+
+            return
+
+        }
+
+        val bitmap = if (decodedBitmap.isMutable) {
+
+            decodedBitmap
+
+        } else {
+
+            decodedBitmap.copy(Bitmap.Config.ARGB_8888, true) ?: decodedBitmap
+
+        }
+
+        val originalFaceBoxes = originalFaceBoxesForRecord(
+
+            sharedRecordToRecognitionRecordForFaceBoxes(record),
+
+            bitmap.width,
+
+            bitmap.height
+
+        )
+
+        if (originalFaceBoxes.isNotEmpty()) {
+
+            drawOriginalFaceBoxes(bitmap, originalFaceBoxes)
+
+        }
+
+        runOnUiThread {
+
+            showBitmapDialog(
+
+                title = "查看共享原图",
+
+                summary = "由「${record.nickname.ifBlank { DEFAULT_SHARE_NICKNAME }}」共享  ${bitmap.width}x${bitmap.height}  %.1f KB%s%s".format(
+
+                    Locale.getDefault(),
+
+                    bytes.size / 1024f,
+
+                    if (originalFaceBoxes.isNotEmpty()) "  已用绿框标出对应人脸" else "",
+
+                    if (fromCache) "  本机缓存" else ""
+
+                ),
+
+                bitmap = bitmap
+
+            )
+
+        }
+
+        recordDiagnostic(
+
+            "查看共享原图: shareId=${record.shareId}, from=${record.nickname}, " +
+
+                "size=${bitmap.width}x${bitmap.height}, bytes=${bytes.size}, fromCache=$fromCache, " +
+
+                "faceBoxes=${originalFaceBoxes.size}, " +
+
+                "faceRectImage=${record.faceRectImageWidth}x${record.faceRectImageHeight}, " +
+
+                "uploadSource=${record.uploadSourceRect?.let { "${it.x},${it.y},${it.width},${it.height}" } ?: "null"}"
+
+        )
+
+    }
+
+    private fun downloadSharedOriginalImageBytes(
+        record: SharedRecognitionRecord,
+        url: String,
+        reportUserErrors: Boolean
+    ): ByteArray? {
 
         val request = try {
 
@@ -12766,19 +12910,71 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         } catch (e: Exception) {
 
-            Toast.makeText(this, "共享原图地址无效", Toast.LENGTH_SHORT).show()
+            if (reportUserErrors) {
+
+                runOnUiThread {
+
+                    Toast.makeText(this@MainActivity, "共享原图地址无效", Toast.LENGTH_SHORT).show()
+
+                }
+
+            }
 
             recordDiagnostic("共享原图请求构建失败: shareId=${record.shareId}, url=$url", e)
 
-            return
+            return null
 
         }
 
-        okHttpClient.newCall(request).enqueue(object : Callback {
+        return try {
 
-            override fun onFailure(call: Call, e: IOException) {
+            okHttpClient.newCall(request).execute().use { response ->
 
-                recordDiagnostic("查看共享原图网络失败: shareId=${record.shareId}, url=$url", e)
+                if (!response.isSuccessful) {
+
+                    if (reportUserErrors) {
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "共享原图加载失败: HTTP ${response.code}", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                    }
+
+                    recordDiagnostic("共享原图 HTTP 失败: shareId=${record.shareId}, code=${response.code}, url=$url")
+
+                    return null
+
+                }
+
+                val bytes = response.body?.bytes()
+
+                if (bytes == null || bytes.isEmpty()) {
+
+                    if (reportUserErrors) {
+
+                        runOnUiThread {
+
+                            Toast.makeText(this@MainActivity, "共享原图为空", Toast.LENGTH_SHORT).show()
+
+                        }
+
+                    }
+
+                    recordDiagnostic("共享原图为空: shareId=${record.shareId}, url=$url")
+
+                    return null
+
+                }
+
+                bytes
+
+            }
+
+        } catch (e: Exception) {
+
+            if (reportUserErrors) {
 
                 runOnUiThread {
 
@@ -12788,85 +12984,275 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             }
 
-            override fun onResponse(call: Call, response: Response) {
+            recordDiagnostic("共享原图网络失败: shareId=${record.shareId}, url=$url", e)
 
-                response.use {
+            null
 
-                    if (!it.isSuccessful) {
+        }
 
-                        recordDiagnostic("查看共享原图 HTTP 失败: shareId=${record.shareId}, code=${it.code}, url=$url")
+    }
 
-                        runOnUiThread {
+    private fun prefetchRecentSharedOriginalImages() {
 
-                            Toast.makeText(this@MainActivity, "共享原图加载失败: HTTP ${it.code}", Toast.LENGTH_SHORT).show()
+        if (!recordShareEnabled) {
 
-                        }
+            return
 
-                        return
+        }
 
-                    }
+        val now = System.currentTimeMillis()
 
-                    val bytes = it.body?.bytes()
+        val candidates = synchronized(sharedRecognitionRecords) {
 
-                    if (bytes == null || bytes.isEmpty()) {
+            sharedRecognitionRecords
 
-                        runOnUiThread {
+                .filter { it.originalUrl.isNotBlank() && it.expiresAt > now }
 
-                            Toast.makeText(this@MainActivity, "共享原图为空", Toast.LENGTH_SHORT).show()
+                .sortedByDescending { it.createdAt }
 
-                        }
+                .take(SHARED_ORIGINAL_PREFETCH_LIMIT)
 
-                        return
+        }
 
-                    }
+        if (candidates.isEmpty()) {
 
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            cleanupSharedOriginalCache()
 
-                    if (bitmap == null) {
+            return
 
-                        runOnUiThread {
+        }
 
-                            Toast.makeText(this@MainActivity, "共享原图无法打开", Toast.LENGTH_SHORT).show()
+        executeWorker("预取共享原图缓存") {
 
-                        }
+            cleanupSharedOriginalCache()
 
-                        return
+            candidates.forEach { record ->
 
-                    }
+                if (loadSharedOriginalCacheBytes(record) != null) {
 
-                    runOnUiThread {
+                    return@forEach
 
-                        showBitmapDialog(
+                }
 
-                            title = "查看共享原图",
+                if (!sharedOriginalCacheInFlight.add(record.shareId)) {
 
-                            summary = "由「${record.nickname.ifBlank { DEFAULT_SHARE_NICKNAME }}」共享  ${bitmap.width}x${bitmap.height}  %.1f KB".format(
+                    return@forEach
 
-                                Locale.getDefault(),
+                }
 
-                                bytes.size / 1024f
+                try {
 
-                            ),
+                    val url = expertPhotoUrl(record.originalUrl)
 
-                            bitmap = bitmap
+                    val bytes = downloadSharedOriginalImageBytes(record, url, reportUserErrors = false)
+
+                    if (bytes != null) {
+
+                        saveSharedOriginalCacheBytes(record, bytes)
+
+                        recordDiagnostic(
+
+                            "共享原图已预取缓存: shareId=${record.shareId}, bytes=${bytes.size}, from=${record.nickname}"
 
                         )
 
                     }
 
-                    recordDiagnostic(
+                } finally {
 
-                        "查看共享原图: shareId=${record.shareId}, from=${record.nickname}, " +
-
-                            "size=${bitmap.width}x${bitmap.height}, bytes=${bytes.size}"
-
-                    )
+                    sharedOriginalCacheInFlight.remove(record.shareId)
 
                 }
 
             }
 
-        })
+        }
+
+    }
+
+    private fun loadSharedOriginalCacheBytes(record: SharedRecognitionRecord): ByteArray? {
+
+        if (record.expiresAt <= System.currentTimeMillis()) {
+
+            deleteSharedOriginalCacheFile(record.shareId)
+
+            return null
+
+        }
+
+        val cacheFile = sharedOriginalCacheFile(record.shareId)
+
+        if (!cacheFile.exists() || cacheFile.length() <= 0L) {
+
+            return null
+
+        }
+
+        return try {
+
+            cacheFile.readBytes()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("读取共享原图缓存失败: shareId=${record.shareId}, path=${cacheFile.absolutePath}", e)
+
+            try {
+
+                cacheFile.delete()
+
+            } catch (_: Exception) {
+
+            }
+
+            null
+
+        }
+
+    }
+
+    private fun saveSharedOriginalCacheBytes(record: SharedRecognitionRecord, bytes: ByteArray) {
+
+        if (bytes.isEmpty() || record.expiresAt <= System.currentTimeMillis()) {
+
+            return
+
+        }
+
+        val cacheFile = sharedOriginalCacheFile(record.shareId)
+
+        try {
+
+            cacheFile.parentFile?.mkdirs()
+
+            cacheFile.writeBytes(bytes)
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("写入共享原图缓存失败: shareId=${record.shareId}, path=${cacheFile.absolutePath}", e)
+
+        }
+
+    }
+
+    private fun cleanupSharedOriginalCache(activeRecords: List<SharedRecognitionRecord>? = null) {
+
+        val dir = sharedOriginalCacheDir()
+
+        val files = dir.listFiles() ?: return
+
+        val now = System.currentTimeMillis()
+
+        val activeShareIds = activeRecords
+
+            ?.filter { it.expiresAt > now }
+
+            ?.map { it.shareId }
+
+            ?.toSet()
+
+            ?: synchronized(sharedRecognitionRecords) {
+
+                sharedRecognitionRecords
+
+                    .filter { it.expiresAt > now }
+
+                    .map { it.shareId }
+
+                    .toSet()
+
+            }
+
+        files.forEach { file ->
+
+            val shareId = file.name.removeSuffix(SHARED_ORIGINAL_CACHE_SUFFIX)
+
+            val staleByAge = now - file.lastModified() > SHARED_DELETED_ID_RETENTION_MS
+
+            if (shareId !in activeShareIds || staleByAge) {
+
+                try {
+
+                    file.delete()
+
+                } catch (e: Exception) {
+
+                    recordDiagnostic("清理共享原图缓存失败: path=${file.absolutePath}", e)
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private fun deleteSharedOriginalCacheFile(shareId: String) {
+
+        try {
+
+            sharedOriginalCacheFile(shareId).delete()
+
+        } catch (e: Exception) {
+
+            recordDiagnostic("删除共享原图缓存失败: shareId=$shareId", e)
+
+        }
+
+    }
+
+    private fun sharedOriginalCacheFile(shareId: String): File {
+
+        val safeName = shareId
+
+            .ifBlank { "unknown" }
+
+            .map { ch -> if (ch.isLetterOrDigit() || ch == '-' || ch == '_') ch else '_' }
+
+            .joinToString(separator = "")
+
+        return File(sharedOriginalCacheDir(), safeName + SHARED_ORIGINAL_CACHE_SUFFIX)
+
+    }
+
+    private fun sharedOriginalCacheDir(): File {
+
+        return File(cacheDir, SHARED_ORIGINAL_CACHE_DIR).apply {
+
+            if (!exists()) {
+
+                mkdirs()
+
+            }
+
+        }
+
+    }
+
+    private fun sharedRecordToRecognitionRecordForFaceBoxes(record: SharedRecognitionRecord): RecognitionRecord {
+
+        return RecognitionRecord(
+
+            id = record.shareId,
+
+            createdAt = record.createdAt,
+
+            originalWidth = record.originalWidth,
+
+            originalHeight = record.originalHeight,
+
+            uploadWidth = record.uploadWidth,
+
+            uploadHeight = record.uploadHeight,
+
+            faceRectImageWidth = record.faceRectImageWidth,
+
+            faceRectImageHeight = record.faceRectImageHeight,
+
+            uploadSourceRect = record.uploadSourceRect,
+
+            experts = mutableListOf(record.expert)
+
+        )
 
     }
 
@@ -15509,6 +15895,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val rectObj = firstJsonObject(matchItem, "face_rect", "faceRect", "FaceRect", "rect", "Rect", "location", "Location")
 
             ?: return null
+
+        return parseFaceRectObject(rectObj)
+
+    }
+
+    private fun parseNamedFaceRect(parent: JsonObject, vararg names: String): FaceRect? {
+
+        return parseFaceRectObject(firstJsonObject(parent, *names))
+
+    }
+
+    private fun parseFaceRectObject(rectObj: JsonObject?): FaceRect? {
+
+        rectObj ?: return null
 
         val x = firstJsonFloat(rectObj, "x", "X", "left", "Left", "originX", "OriginX") ?: return null
 
@@ -18194,6 +18594,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val SHARED_DELETED_ID_RETENTION_MS = SHARED_RECORD_RETENTION_MS + 5L * 60L * 1000L
 
+        private const val SHARED_ORIGINAL_PREFETCH_LIMIT = 3
+
+        private const val SHARED_ORIGINAL_CACHE_DIR = "shared_originals"
+
+        private const val SHARED_ORIGINAL_CACHE_SUFFIX = "_original.jpg"
+
         private const val SHARE_PUBLISH_MAX_RETRIES = 3
 
         private const val SHARE_PUBLISH_RETRY_DELAY_MS = 1_500L
@@ -18303,6 +18709,12 @@ data class SharedRecognitionRecord(
     var uploadWidth: Int = 0,
 
     var uploadHeight: Int = 0,
+
+    var faceRectImageWidth: Int = 0,
+
+    var faceRectImageHeight: Int = 0,
+
+    var uploadSourceRect: FaceRect? = null,
 
     var expert: ExpertInfo = ExpertInfo("-", "无工作单位", "未填写", "-", "-", 0f, "", null)
 
