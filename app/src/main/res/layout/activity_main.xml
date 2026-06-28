@@ -320,7 +320,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="等待眼镜实时画面。当前阶段仅做本地人脸框检测，云端识别稍后接入。"
+                android:text="等待眼镜实时画面。检测到合格人脸后会按预算上云识别，并保存成功记录。"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
 
@@ -986,7 +986,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="4dp"
-                        android:text="眼镜通过 RTMP 直接推流到手机。正式使用请回到底部“实时”页查看画面、人脸框和专家识别结果；实时识别会按质量上云，暂不保存历史记录。"
+                        android:text="眼镜通过 RTMP 直接推流到手机。正式使用请回到底部“实时”页查看画面、人脸框和专家识别结果；实时识别会按质量和请求预算上云，成功后保存到记录。"
                         android:textColor="@color/text_secondary"
                         android:textSize="12sp" />
 

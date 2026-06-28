@@ -569,6 +569,6 @@ class RtmpAvcPreviewDecoder(
         private const val CODEC_DEQUEUE_TIMEOUT_US = 1_000L
         private const val PREVIEW_EMIT_INTERVAL_MS = 100L
         private const val PREVIEW_JPEG_MAX_SIDE = 1280
-        private const val PREVIEW_JPEG_QUALITY = 82
+        private const val PREVIEW_JPEG_QUALITY = 90
     }
 }

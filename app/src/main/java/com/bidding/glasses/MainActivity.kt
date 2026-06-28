@@ -168,6 +168,8 @@ import kotlin.math.abs
 
 import kotlin.math.roundToInt
 
+import kotlin.math.sqrt
+
 // 引入 Rokid 官方 CXR-L (Cross Reality Link) 标准跨端协同开发包
 
 import com.rokid.cxr.link.CXRLink
@@ -507,6 +509,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     @Volatile private var activeRealtimeCloudRequestCount = 0
 
     @Volatile private var lastRealtimeCloudRequestAt = 0L
+
+    private val realtimeCloudBudgetLock = Any()
+
+    private val realtimeCloudHttpRequestStarts = ArrayDeque<Long>()
+
+    private val realtimeTrackLastRescueAt = mutableMapOf<Long, Long>()
+
+    @Volatile private var activeRealtimeCloudHttpRequestCount = 0
+
+    @Volatile private var lastRealtimeRescueHttpAt = 0L
+
+    @Volatile private var lastRealtimeCloudBudgetLogAt = 0L
+
+    @Volatile private var lastRealtimeCloudBudgetLogKey = ""
+
+    private val realtimeRescueLock = Any()
+
+    private val realtimeRescueCandidates = ArrayDeque<RealtimeRescueCandidate>()
+
+    @Volatile private var activeRealtimeRescueRequestCount = 0
+
+    @Volatile private var lastRealtimeNoLocalFaceRescueCandidateAt = 0L
 
     @Volatile private var lastRealtimeCrowdModeAt = 0L
 
@@ -4358,6 +4382,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             lastRealtimeCloudRequestAt = 0L
         }
+        synchronized(realtimeCloudBudgetLock) {
+            realtimeCloudHttpRequestStarts.clear()
+            realtimeTrackLastRescueAt.clear()
+            activeRealtimeCloudHttpRequestCount = 0
+            lastRealtimeRescueHttpAt = 0L
+            lastRealtimeCloudBudgetLogAt = 0L
+            lastRealtimeCloudBudgetLogKey = ""
+        }
+        val clearedRescueCandidates = synchronized(realtimeRescueLock) {
+            val count = realtimeRescueCandidates.size
+            realtimeRescueCandidates.clear()
+            activeRealtimeRescueRequestCount = 0
+            lastRealtimeNoLocalFaceRescueCandidateAt = 0L
+            count
+        }
         val clearedLookbackFrames = synchronized(realtimeLookbackLock) {
             val count = realtimeLookbackFrames.size
             realtimeLookbackFrames.clear()
@@ -4394,11 +4433,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         lastRealtimeLoggedFaceCount = -1
         lastRealtimeLoggedValidFaceCount = -1
         lastRealtimeLoggedUploadableFaceCount = -1
-        if (removedTracks > 0 || clearedBestCandidates > 0 || inFlightTracks > 0 || clearedLookbackFrames > 0) {
+        if (removedTracks > 0 || clearedBestCandidates > 0 || inFlightTracks > 0 ||
+            clearedLookbackFrames > 0 || clearedRescueCandidates > 0
+        ) {
             recordDiagnostic(
                 "实时识别候选清理: reason=$reason, removedTracks=$removedTracks, " +
                     "clearedCandidates=$clearedBestCandidates, inFlight=$inFlightTracks, " +
-                    "lookbackFrames=$clearedLookbackFrames, session=${currentRealtimeRecognitionSessionId()}"
+                    "lookbackFrames=$clearedLookbackFrames, rescueCandidates=$clearedRescueCandidates, " +
+                    "session=${currentRealtimeRecognitionSessionId()}"
             )
         }
     }
@@ -4677,6 +4719,413 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             recordDiagnostic("实时视频候选创建失败: frame=$decodedFrames", e)
             null
         }
+    }
+
+    private fun enqueueRealtimeRescueCandidates(
+        bitmap: Bitmap,
+        faces: List<Face>,
+        decodedFrames: Long,
+        frameBytes: ByteArray,
+        faceEvaluationSummary: RealtimeFaceEvaluationSummary,
+        crowdModeForFrame: Boolean
+    ) {
+        if (!isRealtimeRecognitionPageActive || !latestRtmpReceiverSnapshot.running || frameBytes.isEmpty()) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        val rescueCandidate = buildRealtimeRescueCandidate(
+            bitmap = bitmap,
+            faces = faces,
+            decodedFrames = decodedFrames,
+            frameBytes = frameBytes,
+            faceEvaluationSummary = faceEvaluationSummary,
+            crowdModeForFrame = crowdModeForFrame,
+            now = now
+        ) ?: return
+        synchronized(realtimeRescueLock) {
+            trimRealtimeRescueCandidatesLocked(now)
+            val candidates = (realtimeRescueCandidates.toList() + rescueCandidate)
+                .distinctBy { "${it.decodedFrames}|${it.reason}|${it.sourceTrackId ?: 0L}" }
+                .sortedWith(realtimeRescueComparator())
+                .take(REALTIME_RESCUE_QUEUE_MAX)
+            realtimeRescueCandidates.clear()
+            realtimeRescueCandidates.addAll(candidates)
+        }
+        recordDiagnostic(
+            "实时救援候选入池: reason=${rescueCandidate.reason}, priority=${rescueCandidate.priority}, " +
+                "track=${rescueCandidate.sourceTrackId ?: "-"}, frame=${rescueCandidate.decodedFrames}, " +
+                "faces=${rescueCandidate.localFaceCount}, maxFaceNum=${rescueCandidate.maxFaceNum}, " +
+                "q=${rescueCandidate.qualityScore}, p=${rescueCandidate.dispatchScore}, " +
+                "skin=${String.format(Locale.CHINA, "%.3f", rescueCandidate.skinRatio)}, " +
+                "rect=${rescueCandidate.sourceFaceRect?.let { "${it.width()}x${it.height()}" } ?: "full"}"
+        )
+        maybeStartRealtimeFrameRescue()
+    }
+
+    private fun buildRealtimeRescueCandidate(
+        bitmap: Bitmap,
+        faces: List<Face>,
+        decodedFrames: Long,
+        frameBytes: ByteArray,
+        faceEvaluationSummary: RealtimeFaceEvaluationSummary,
+        crowdModeForFrame: Boolean,
+        now: Long
+    ): RealtimeRescueCandidate? {
+        if (faceEvaluationSummary.uploadableCount > 0) {
+            return null
+        }
+        val faceRescue = faces
+            .asSequence()
+            .mapNotNull { face ->
+                val rect = clippedRect(Rect(face.boundingBox), bitmap.width, bitmap.height) ?: return@mapNotNull null
+                val minSide = minOf(rect.width(), rect.height())
+                val areaRatio = rect.width().toFloat() * rect.height().toFloat() /
+                    (bitmap.width.toFloat() * bitmap.height.toFloat()).coerceAtLeast(1f)
+                if (minSide < REALTIME_RESCUE_MIN_FACE_SIDE_PX ||
+                    areaRatio < REALTIME_RESCUE_MIN_FACE_AREA_RATIO ||
+                    abs(face.headEulerAngleY) > REALTIME_MAX_UPLOAD_YAW ||
+                    abs(face.headEulerAngleX) > REALTIME_MAX_UPLOAD_PITCH
+                ) {
+                    return@mapNotNull null
+                }
+                val evaluation = faceEvaluationSummary.evaluations[face]
+                val score = if (evaluation != null) {
+                    RealtimeFaceScore(
+                        qualityScore = evaluation.qualityScore,
+                        dispatchScore = evaluation.dispatchScore,
+                        sharpnessScore = evaluation.sharpnessScore,
+                        areaBonus = evaluation.areaBonus
+                    )
+                } else {
+                    scoreRealtimeFaceCandidate(bitmap, face, rect)
+                }
+                val skinRatio = evaluation?.skinRatio ?: estimateRealtimeFaceSkinRatio(bitmap, rect)
+                val smallEnoughForRescue = minSide <= REALTIME_RESCUE_MAX_PRIMARY_FACE_SIDE_PX ||
+                    evaluation?.canUpload == false ||
+                    abs(face.headEulerAngleY) >= REALTIME_SIDE_PROFILE_MIN_YAW
+                if (!smallEnoughForRescue) {
+                    return@mapNotNull null
+                }
+                if (skinRatio < REALTIME_RESCUE_MIN_SKIN_RATIO &&
+                    score.qualityScore < REALTIME_RESCUE_MIN_QUALITY
+                ) {
+                    return@mapNotNull null
+                }
+                val centerX = rect.centerX().toFloat() / bitmap.width.toFloat().coerceAtLeast(1f)
+                val centerY = rect.centerY().toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)
+                val trackHint = realtimeRescueTrackHint(centerX, centerY, areaRatio, now, crowdModeForFrame)
+                if (trackHint?.matchedRecently == true) {
+                    return@mapNotNull null
+                }
+                val priority = when {
+                    trackHint == null || trackHint.neverUploaded -> 0
+                    now - trackHint.lastSeenAt >= REALTIME_LOST_FACE_FLUSH_MS -> 1
+                    trackHint.consecutiveFailures > 0 -> 2
+                    else -> 3
+                }
+                RealtimeRescueCandidate(
+                    createdAt = now,
+                    decodedFrames = decodedFrames,
+                    frameBytes = frameBytes.copyOf(),
+                    frameWidth = bitmap.width,
+                    frameHeight = bitmap.height,
+                    reason = when {
+                        minSide < REALTIME_MIN_CLOUD_FACE_SIDE_PX -> "small_face_rescue"
+                        abs(face.headEulerAngleY) >= REALTIME_SIDE_PROFILE_MIN_YAW -> "side_face_rescue"
+                        else -> "quality_gate_rescue"
+                    },
+                    priority = priority,
+                    sourceTrackId = trackHint?.trackId,
+                    sourceFaceRect = Rect(rect),
+                    qualityScore = score.qualityScore,
+                    dispatchScore = score.dispatchScore,
+                    skinRatio = skinRatio,
+                    localFaceCount = faces.size,
+                    maxFaceNum = faces.size.coerceIn(1, REALTIME_RESCUE_CLOUD_MAX_FACE_NUM)
+                )
+            }
+            .sortedWith(realtimeRescueComparator())
+            .firstOrNull()
+        if (faceRescue != null) {
+            return faceRescue
+        }
+        if (faces.isEmpty() && now - lastRealtimeNoLocalFaceRescueCandidateAt >= REALTIME_RESCUE_NO_LOCAL_FACE_INTERVAL_MS) {
+            val analysis = analyzeVideoRescueRegion(bitmap, emptyList())
+            if (analysis.skinRatio >= REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO) {
+                lastRealtimeNoLocalFaceRescueCandidateAt = now
+                return RealtimeRescueCandidate(
+                    createdAt = now,
+                    decodedFrames = decodedFrames,
+                    frameBytes = frameBytes.copyOf(),
+                    frameWidth = bitmap.width,
+                    frameHeight = bitmap.height,
+                    reason = "no_local_face_skin_rescue",
+                    priority = 4,
+                    sourceTrackId = null,
+                    sourceFaceRect = analysis.regionRect?.toPixelRect(bitmap.width, bitmap.height),
+                    qualityScore = 0,
+                    dispatchScore = (analysis.skinRatio * VIDEO_RESCUE_SKIN_SCORE_WEIGHT).roundToInt(),
+                    skinRatio = analysis.skinRatio,
+                    localFaceCount = 0,
+                    maxFaceNum = minOf(3, REALTIME_RESCUE_CLOUD_MAX_FACE_NUM)
+                )
+            }
+        }
+        return null
+    }
+
+    private fun realtimeRescueTrackHint(
+        centerX: Float,
+        centerY: Float,
+        areaRatio: Float,
+        now: Long,
+        crowdMode: Boolean
+    ): RealtimeRescueTrackHint? {
+        return synchronized(realtimeTrackLock) {
+            realtimePersonTracks
+                .filter { now - it.lastSeenAt <= REALTIME_TRACK_STALE_MS }
+                .mapNotNull { track ->
+                    val dx = track.centerX - centerX
+                    val dy = track.centerY - centerY
+                    val distance = sqrt(dx * dx + dy * dy)
+                    val centerLimit = if (crowdMode) {
+                        REALTIME_CROWD_TRACK_MAX_CENTER_DISTANCE
+                    } else {
+                        REALTIME_TRACK_MAX_CENTER_DISTANCE
+                    }
+                    val sizeLimit = if (crowdMode) {
+                        REALTIME_CROWD_TRACK_MAX_SIZE_RATIO
+                    } else {
+                        REALTIME_TRACK_MAX_SIZE_RATIO
+                    }
+                    if (distance > centerLimit ||
+                        realtimeSizeRatio(track.sizeRatio, areaRatio) > sizeLimit
+                    ) {
+                        return@mapNotNull null
+                    }
+                    track to distance
+                }
+                .minByOrNull { it.second }
+                ?.first
+                ?.let { track ->
+                    RealtimeRescueTrackHint(
+                        trackId = track.id,
+                        lastSeenAt = track.lastSeenAt,
+                        neverUploaded = track.lastCloudUploadAt <= 0L,
+                        matchedRecently = track.lastMatchedNames.isNotBlank() &&
+                            track.lastCloudUploadAt > 0L &&
+                            now - track.lastCloudUploadAt < REALTIME_RECORD_DUPLICATE_WINDOW_MS,
+                        consecutiveFailures = track.consecutiveNoFaceCount + track.consecutiveNoMatchCount
+                    )
+                }
+        }
+    }
+
+    private fun trimRealtimeRescueCandidatesLocked(now: Long) {
+        val iterator = realtimeRescueCandidates.iterator()
+        while (iterator.hasNext()) {
+            val candidate = iterator.next()
+            if (now - candidate.createdAt > REALTIME_RESCUE_CANDIDATE_MAX_AGE_MS) {
+                iterator.remove()
+            }
+        }
+        while (realtimeRescueCandidates.size > REALTIME_RESCUE_QUEUE_MAX) {
+            realtimeRescueCandidates.removeLast()
+        }
+    }
+
+    private fun realtimeRescueComparator(): Comparator<RealtimeRescueCandidate> {
+        return compareBy<RealtimeRescueCandidate> { it.priority }
+            .thenByDescending { it.dispatchScore }
+            .thenByDescending { it.qualityScore }
+            .thenByDescending { it.skinRatio }
+            .thenBy { it.createdAt }
+    }
+
+    private fun maybeStartRealtimeFrameRescue() {
+        if (!isRealtimeCloudRecognitionAllowed()) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        val plan = synchronized(realtimeRescueLock) {
+            trimRealtimeRescueCandidatesLocked(now)
+            if (activeRealtimeRescueRequestCount >= REALTIME_RESCUE_MAX_IN_FLIGHT) {
+                return
+            }
+            val candidate = realtimeRescueCandidates
+                .sortedWith(realtimeRescueComparator())
+                .firstOrNull() ?: return
+            val permit = acquireRealtimeCloudHttpBudget(
+                kind = "frame_rescue",
+                trackId = candidate.sourceTrackId,
+                rescue = true,
+                now = now
+            ) ?: return
+            realtimeRescueCandidates.remove(candidate)
+            activeRealtimeRescueRequestCount += 1
+            RealtimeRescueUploadPlan(
+                sessionId = currentRealtimeRecognitionSessionId(),
+                candidate = candidate,
+                budgetPermit = permit
+            )
+        }
+        startRealtimeFrameRescueRecognition(plan)
+    }
+
+    private fun startRealtimeFrameRescueRecognition(plan: RealtimeRescueUploadPlan) {
+        var budgetPermit: RealtimeCloudBudgetPermit? = plan.budgetPermit
+        val rescue = plan.candidate
+        recordDiagnostic(
+            "实时救援云端识别入队: session=${plan.sessionId}, reason=${rescue.reason}, " +
+                "track=${rescue.sourceTrackId ?: "-"}, frame=${rescue.decodedFrames}, " +
+                "priority=${rescue.priority}, maxFaceNum=${rescue.maxFaceNum}, " +
+                "q=${rescue.qualityScore}, p=${rescue.dispatchScore}, " +
+                "skin=${String.format(Locale.CHINA, "%.3f", rescue.skinRatio)}, " +
+                "ageMs=${System.currentTimeMillis() - rescue.createdAt}"
+        )
+        executeRealtimeCloudWorker("实时视频整帧救援") {
+            try {
+                if (plan.sessionId != currentRealtimeRecognitionSessionId()) {
+                    recordDiagnostic(
+                        "实时救援云端识别丢弃: session=${plan.sessionId}, " +
+                            "currentSession=${currentRealtimeRecognitionSessionId()}, reason=会话已过期"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
+                val upload = prepareRealtimeRescueUploadPayload(rescue)
+                if (upload == null) {
+                    recordDiagnostic(
+                        "实时救援上传图生成失败: frame=${rescue.decodedFrames}, reason=${rescue.reason}"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
+                val startedAt = System.currentTimeMillis()
+                val permitForSearch = budgetPermit
+                budgetPermit = null
+                val result = searchRealtimeFaceOnCloudWithBudget(
+                    "data:image/jpeg;base64,${Base64.encodeToString(upload.uploadBytes, Base64.NO_WRAP)}",
+                    rescue.maxFaceNum,
+                    "实时视频救援 frame=${rescue.decodedFrames} reason=${rescue.reason}",
+                    kind = "frame_rescue",
+                    trackId = rescue.sourceTrackId,
+                    rescue = true,
+                    existingPermit = permitForSearch
+                )
+                if (result == null) {
+                    recordDiagnostic(
+                        "实时救援云端识别跳过: frame=${rescue.decodedFrames}, reason=请求预算不足"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
+                recordDiagnostic(
+                    "实时救援云端识别返回: frame=${rescue.decodedFrames}, reason=${rescue.reason}, " +
+                        "experts=${result.experts.size}, maxFaceNum=${rescue.maxFaceNum}, " +
+                        "costMs=${System.currentTimeMillis() - startedAt}, message=${result.message.take(80)}"
+                )
+                val candidate = rescue.toRealtimeFaceCandidate()
+                updateRealtimeCloudSummary(
+                    trackId = rescue.sourceTrackId ?: 0L,
+                    frame = rescue.decodedFrames,
+                    result = when {
+                        result.experts.isNotEmpty() -> "rescue_success(${result.experts.size})"
+                        isNoFaceCloudResult(result) -> "rescue_noFace"
+                        else -> "rescue_noMatch"
+                    },
+                    costMs = System.currentTimeMillis() - startedAt,
+                    message = result.message
+                )
+                handleRealtimeCloudResult(rescue.sourceTrackId ?: 0L, candidate, upload, result)
+            } finally {
+                budgetPermit?.let {
+                    releaseRealtimeCloudHttpBudget(it)
+                    budgetPermit = null
+                }
+                synchronized(realtimeRescueLock) {
+                    activeRealtimeRescueRequestCount = (activeRealtimeRescueRequestCount - 1).coerceAtLeast(0)
+                }
+                maybeStartRealtimeCloudRecognition()
+                maybeStartRealtimeFrameRescue()
+            }
+        }
+    }
+
+    private fun prepareRealtimeRescueUploadPayload(rescue: RealtimeRescueCandidate): RealtimeUploadPayload? {
+        val frameBitmap = BitmapFactory.decodeByteArray(rescue.frameBytes, 0, rescue.frameBytes.size)
+        if (frameBitmap == null) {
+            recordDiagnostic(
+                "实时救援上传图准备失败: 原始帧解码失败 frame=${rescue.decodedFrames}, bytes=${rescue.frameBytes.size}"
+            )
+            return null
+        }
+        var uploadBitmap: Bitmap? = null
+        return try {
+            uploadBitmap = resizeBitmapToMaxSide(frameBitmap, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
+            val bitmapForUpload = uploadBitmap ?: frameBitmap
+            val uploadBytes = bitmapToJpegBytes(bitmapForUpload, FACE_UPLOAD_JPEG_QUALITY)
+            val sourceRect = Rect(0, 0, frameBitmap.width, frameBitmap.height)
+            val localRect = rescue.sourceFaceRect
+                ?.let {
+                    scalePixelRectToFaceRect(
+                        it,
+                        frameBitmap.width,
+                        frameBitmap.height,
+                        bitmapForUpload.width,
+                        bitmapForUpload.height
+                    )
+                }
+                ?: FaceRect(0f, 0f, bitmapForUpload.width.toFloat(), bitmapForUpload.height.toFloat())
+            RealtimeUploadPayload(
+                uploadBytes = uploadBytes,
+                uploadWidth = bitmapForUpload.width,
+                uploadHeight = bitmapForUpload.height,
+                localFaceRect = localRect,
+                sourceCropRect = faceRectFromPixelRect(sourceRect),
+                cropMode = "frame_rescue",
+                cropWidth = sourceRect.width(),
+                cropHeight = sourceRect.height()
+            )
+        } catch (e: Exception) {
+            recordDiagnostic("实时救援上传图准备异常: frame=${rescue.decodedFrames}", e)
+            null
+        } finally {
+            if (uploadBitmap != null && uploadBitmap !== frameBitmap) {
+                try {
+                    uploadBitmap.recycle()
+                } catch (_: Exception) {
+                }
+            }
+            try {
+                frameBitmap.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun RealtimeRescueCandidate.toRealtimeFaceCandidate(): RealtimeFaceCandidate {
+        val rect = sourceFaceRect ?: Rect(0, 0, frameWidth.coerceAtLeast(1), frameHeight.coerceAtLeast(1))
+        val areaRatio = rect.width().toFloat() * rect.height().toFloat() /
+            (frameWidth.toFloat() * frameHeight.toFloat()).coerceAtLeast(1f)
+        return RealtimeFaceCandidate(
+            createdAt = createdAt,
+            decodedFrames = decodedFrames,
+            qualityScore = qualityScore,
+            dispatchScore = dispatchScore,
+            cloudGateQuality = qualityScore,
+            sharpnessScore = qualityScore,
+            areaBonus = 0,
+            frameBytes = frameBytes,
+            frameWidth = frameWidth,
+            frameHeight = frameHeight,
+            faceRectInFrame = Rect(rect),
+            faceAreaRatio = areaRatio,
+            faceCenterX = rect.centerX().toFloat() / frameWidth.toFloat().coerceAtLeast(1f),
+            faceCenterY = rect.centerY().toFloat() / frameHeight.toFloat().coerceAtLeast(1f),
+            yaw = 0f,
+            pitch = 0f,
+            roll = 0f,
+            skinRatio = skinRatio,
+            trackingId = null
+        )
     }
 
     private fun isLikelyRealtimeFalsePositive(
@@ -5055,6 +5504,133 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun trimRealtimeCloudBudgetLocked(now: Long) {
+        while (true) {
+            val first = realtimeCloudHttpRequestStarts.peekFirst() ?: break
+            if (now - first <= REALTIME_CLOUD_HTTP_ROLLING_WINDOW_MS) {
+                break
+            }
+            realtimeCloudHttpRequestStarts.removeFirst()
+        }
+        val iterator = realtimeTrackLastRescueAt.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (now - entry.value > REALTIME_RESCUE_TRACK_NO_FACE_COOLDOWN_MS * 3) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun realtimeCloudBudgetAvailableSlots(now: Long): Int {
+        return synchronized(realtimeCloudBudgetLock) {
+            trimRealtimeCloudBudgetLocked(now)
+            val activeSlots = REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT - activeRealtimeCloudHttpRequestCount
+            val rollingSlots = REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS - realtimeCloudHttpRequestStarts.size
+            minOf(activeSlots, rollingSlots).coerceAtLeast(0)
+        }
+    }
+
+    private fun acquireRealtimeCloudHttpBudget(
+        kind: String,
+        trackId: Long?,
+        rescue: Boolean,
+        now: Long = System.currentTimeMillis()
+    ): RealtimeCloudBudgetPermit? {
+        synchronized(realtimeCloudBudgetLock) {
+            trimRealtimeCloudBudgetLocked(now)
+            val blockReason = when {
+                activeRealtimeCloudHttpRequestCount >= REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT ->
+                    "http_inflight_full"
+                realtimeCloudHttpRequestStarts.size >= REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS ->
+                    "rolling_window_full"
+                rescue && now - lastRealtimeRescueHttpAt < REALTIME_RESCUE_MIN_INTERVAL_MS ->
+                    "rescue_interval"
+                rescue && trackId != null &&
+                    now - (realtimeTrackLastRescueAt[trackId] ?: 0L) < REALTIME_RESCUE_TRACK_NO_FACE_COOLDOWN_MS ->
+                    "track_rescue_cooldown"
+                else -> ""
+            }
+            if (blockReason.isNotBlank()) {
+                maybeLogRealtimeCloudBudgetBlocked(
+                    kind = kind,
+                    trackId = trackId,
+                    rescue = rescue,
+                    reason = blockReason,
+                    now = now
+                )
+                return null
+            }
+            activeRealtimeCloudHttpRequestCount += 1
+            realtimeCloudHttpRequestStarts.addLast(now)
+            if (rescue) {
+                lastRealtimeRescueHttpAt = now
+                if (trackId != null) {
+                    realtimeTrackLastRescueAt[trackId] = now
+                }
+            }
+            return RealtimeCloudBudgetPermit(
+                kind = kind,
+                trackId = trackId,
+                rescue = rescue,
+                startedAt = now
+            )
+        }
+    }
+
+    private fun releaseRealtimeCloudHttpBudget(permit: RealtimeCloudBudgetPermit) {
+        synchronized(realtimeCloudBudgetLock) {
+            activeRealtimeCloudHttpRequestCount = (activeRealtimeCloudHttpRequestCount - 1).coerceAtLeast(0)
+        }
+    }
+
+    private fun maybeLogRealtimeCloudBudgetBlocked(
+        kind: String,
+        trackId: Long?,
+        rescue: Boolean,
+        reason: String,
+        now: Long
+    ) {
+        val key = "$kind|$trackId|$rescue|$reason"
+        if (now - lastRealtimeCloudBudgetLogAt < REALTIME_CLOUD_BUDGET_LOG_INTERVAL_MS &&
+            key == lastRealtimeCloudBudgetLogKey
+        ) {
+            return
+        }
+        lastRealtimeCloudBudgetLogAt = now
+        lastRealtimeCloudBudgetLogKey = key
+        val snapshot = synchronized(realtimeCloudBudgetLock) {
+            trimRealtimeCloudBudgetLocked(now)
+            "httpActive=$activeRealtimeCloudHttpRequestCount/$REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT, " +
+                "rolling=${realtimeCloudHttpRequestStarts.size}/$REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS, " +
+                "rescueSinceMs=${if (lastRealtimeRescueHttpAt > 0L) now - lastRealtimeRescueHttpAt else -1}"
+        }
+        recordDiagnostic(
+            "实时云端请求预算拦截: kind=$kind, track=${trackId ?: "-"}, " +
+                "rescue=$rescue, reason=$reason, $snapshot"
+        )
+    }
+
+    private fun searchRealtimeFaceOnCloudWithBudget(
+        imageDataUrl: String,
+        maxFaceNum: Int,
+        description: String,
+        kind: String,
+        trackId: Long?,
+        rescue: Boolean,
+        existingPermit: RealtimeCloudBudgetPermit? = null
+    ): CloudFaceSearchResult? {
+        val permit = existingPermit ?: acquireRealtimeCloudHttpBudget(
+            kind = kind,
+            trackId = trackId,
+            rescue = rescue
+        ) ?: return null
+        return try {
+            searchFaceOnCloudSync(imageDataUrl, maxFaceNum, description)
+        } finally {
+            releaseRealtimeCloudHttpBudget(permit)
+        }
+    }
+
     private fun maybeStartRealtimeCloudRecognition() {
         if (!isRealtimeCloudRecognitionAllowed()) {
             return
@@ -5099,7 +5675,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 )
                 return
             }
-            val availableSlots = (maxConcurrent - activeRealtimeCloudRequestCount).coerceAtLeast(0)
+            val planSlots = (maxConcurrent - activeRealtimeCloudRequestCount).coerceAtLeast(0)
+            val budgetSlots = realtimeCloudBudgetAvailableSlots(now)
+            if (budgetSlots <= 0) {
+                maybeLogRealtimeCloudScheduleWait(
+                    reason = "请求预算不足",
+                    now = now,
+                    pendingCount = pendingCount,
+                    activeCount = activeRealtimeCloudRequestCount,
+                    maxConcurrent = maxConcurrent,
+                    crowdMode = crowdMode,
+                    collectWindow = collectWindow,
+                    dispatchInterval = dispatchInterval,
+                    detail = "httpActive=$activeRealtimeCloudHttpRequestCount/$REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT"
+                )
+                return
+            }
+            val availableSlots = minOf(planSlots, budgetSlots).coerceAtLeast(0)
             if (availableSlots <= 0) {
                 maybeLogRealtimeCloudScheduleWait(
                     reason = "无可用槽位",
@@ -5198,7 +5790,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         .thenByDescending { it.second.faceAreaRatio }
                 )
                 .take(availableSlots)
-                .mapIndexed { index, (track, candidate) ->
+                .mapIndexedNotNull { index, (track, candidate) ->
+                    val budgetPermit = acquireRealtimeCloudHttpBudget(
+                        kind = "primary",
+                        trackId = track.id,
+                        rescue = false,
+                        now = now
+                    ) ?: return@mapIndexedNotNull null
                     val inCooldown = track.lastCloudUploadAt > 0L &&
                         now - track.lastCloudUploadAt < realtimeCloudCooldownMs(track)
                     val lostFaceFlush = now - track.lastSeenAt >= REALTIME_LOST_FACE_FLUSH_MS
@@ -5233,7 +5831,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         crowdMode = crowdMode,
                         batchIndex = index + 1,
                         noFaceCountAtStart = track.consecutiveNoFaceCount,
-                        noFaceSuppressedUntilAtStart = track.noFaceSuppressedUntil
+                        noFaceSuppressedUntilAtStart = track.noFaceSuppressedUntil,
+                        initialBudgetPermit = budgetPermit
                     )
                 }
                 .also {
@@ -5420,6 +6019,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun startRealtimeCloudRecognition(plan: RealtimeCloudUploadPlan) {
         var candidate = plan.candidate
+        var initialBudgetPermit: RealtimeCloudBudgetPermit? = plan.initialBudgetPermit
         recordDiagnostic(
                 "实时云端识别候选入队: session=${plan.sessionId}, track=${plan.trackId}, reason=${plan.reason}, " +
                 "mode=${if (plan.crowdMode) "crowd" else "normal"}, batch=${plan.batchIndex}, " +
@@ -5489,11 +6089,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 )
                 val base64 = Base64.encodeToString(upload.uploadBytes, Base64.NO_WRAP)
                 val cloudStartedAt = System.currentTimeMillis()
-                var result = searchFaceOnCloudSync(
+                val initialPermit = initialBudgetPermit
+                initialBudgetPermit = null
+                var result = searchRealtimeFaceOnCloudWithBudget(
                     "data:image/jpeg;base64,$base64",
                     1,
-                    "实时视频 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}"
-                )
+                    "实时视频 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}",
+                    kind = "primary",
+                    trackId = plan.trackId,
+                    rescue = false,
+                    existingPermit = initialPermit
+                ) ?: run {
+                    updateRealtimeCloudSummary(
+                        trackId = plan.trackId,
+                        frame = candidate.decodedFrames,
+                        result = "budget_blocked",
+                        costMs = -1L,
+                        message = "实时云端请求预算不足"
+                    )
+                    recordDiagnostic(
+                        "实时云端识别跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=请求预算不足"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
                 recordDiagnostic(
                     "实时云端识别返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
                         "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - cloudStartedAt}, " +
@@ -5514,17 +6132,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 "upload=${retryUpload.uploadWidth}x${retryUpload.uploadHeight}, bytes=${retryUpload.uploadBytes.size}"
                         )
                         val retryStartedAt = System.currentTimeMillis()
-                        result = searchFaceOnCloudSync(
+                        val retryResult = searchRealtimeFaceOnCloudWithBudget(
                             "data:image/jpeg;base64,${Base64.encodeToString(retryUpload.uploadBytes, Base64.NO_WRAP)}",
                             1,
-                            "实时视频重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}"
+                            "实时视频重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}",
+                            kind = "wide_retry",
+                            trackId = plan.trackId,
+                            rescue = false
                         )
-                        recordDiagnostic(
-                            "实时云端识别重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
-                                "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - retryStartedAt}, " +
-                                "message=${result.message.take(80)}"
-                        )
-                        finalUpload = retryUpload
+                        if (retryResult != null) {
+                            result = retryResult
+                            recordDiagnostic(
+                                "实时云端识别重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                                    "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - retryStartedAt}, " +
+                                    "message=${result.message.take(80)}"
+                            )
+                            finalUpload = retryUpload
+                        } else {
+                            recordDiagnostic(
+                                "实时云端识别大范围重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=请求预算不足"
+                            )
+                        }
                     } else {
                         recordDiagnostic(
                             "实时云端识别大范围重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=重试上传图生成失败"
@@ -5548,17 +6176,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 "upload=${primaryRetryUpload.uploadWidth}x${primaryRetryUpload.uploadHeight}, bytes=${primaryRetryUpload.uploadBytes.size}"
                         )
                         val primaryRetryStartedAt = System.currentTimeMillis()
-                        result = searchFaceOnCloudSync(
+                        val primaryRetryResult = searchRealtimeFaceOnCloudWithBudget(
                             "data:image/jpeg;base64,${Base64.encodeToString(primaryRetryUpload.uploadBytes, Base64.NO_WRAP)}",
                             1,
-                            "实时视频主裁剪重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}"
+                            "实时视频主裁剪重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}",
+                            kind = "primary_retry",
+                            trackId = plan.trackId,
+                            rescue = false
                         )
-                        recordDiagnostic(
-                            "实时云端识别主裁剪重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
-                                "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - primaryRetryStartedAt}, " +
-                                "message=${result.message.take(80)}"
-                        )
-                        finalUpload = primaryRetryUpload
+                        if (primaryRetryResult != null) {
+                            result = primaryRetryResult
+                            recordDiagnostic(
+                                "实时云端识别主裁剪重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                                    "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - primaryRetryStartedAt}, " +
+                                    "message=${result.message.take(80)}"
+                            )
+                            finalUpload = primaryRetryUpload
+                        } else {
+                            recordDiagnostic(
+                                "实时云端识别主裁剪重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=请求预算不足"
+                            )
+                        }
                     } else {
                         recordDiagnostic(
                             "实时云端识别主裁剪重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=主裁剪上传图生成失败"
@@ -5588,6 +6226,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 handleRealtimeCloudResult(plan.trackId, candidate, finalUpload, result)
             } finally {
+                initialBudgetPermit?.let {
+                    releaseRealtimeCloudHttpBudget(it)
+                    initialBudgetPermit = null
+                }
                 synchronized(realtimeTrackLock) {
                     activeRealtimeCloudRequestCount = (activeRealtimeCloudRequestCount - 1).coerceAtLeast(0)
                     realtimePersonTracks.firstOrNull { it.id == plan.trackId }?.let { track ->
@@ -5601,6 +6243,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     }
                 }
                 maybeStartRealtimeCloudRecognition()
+                maybeStartRealtimeFrameRescue()
             }
         }
     }
@@ -6514,6 +7157,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 latestRealtimeUploadableFaceCount = faceEvaluationSummary.uploadableCount
                 if (isRealtimeRecognitionPageActive && latestRtmpReceiverSnapshot.running) {
                     updateRealtimeFaceCandidates(
+                        bitmap = detectionBitmap,
+                        faces = faces,
+                        decodedFrames = decodedFrames,
+                        frameBytes = jpegBytes,
+                        faceEvaluationSummary = faceEvaluationSummary,
+                        crowdModeForFrame = crowdModeForFrame
+                    )
+                    enqueueRealtimeRescueCandidates(
                         bitmap = detectionBitmap,
                         faces = faces,
                         decodedFrames = decodedFrames,
@@ -17385,10 +18036,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val pendingPreviewFrame = synchronized(rtmpPreviewFrameDispatchLock) {
                 pendingRtmpPreviewFrame?.decodedFrames ?: 0L
             }
+            val realtimeBudgetSnapshot = synchronized(realtimeCloudBudgetLock) {
+                trimRealtimeCloudBudgetLocked(realtimeNow)
+                "http:$activeRealtimeCloudHttpRequestCount/$REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT," +
+                    "rolling:${realtimeCloudHttpRequestStarts.size}/$REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS," +
+                    "rescueSinceMs:${if (lastRealtimeRescueHttpAt > 0L) realtimeNow - lastRealtimeRescueHttpAt else -1}"
+            }
+            val rescueQueueSnapshot = synchronized(realtimeRescueLock) {
+                trimRealtimeRescueCandidatesLocked(realtimeNow)
+                "active:$activeRealtimeRescueRequestCount/$REALTIME_RESCUE_MAX_IN_FLIGHT," +
+                    "queued:${realtimeRescueCandidates.size}"
+            }
             appendLine(
                 "activeRealtimeCloudRequests=$activeRealtimeCloudRequestCount/${realtimeCloudMaxConcurrentRequests(realtimeNow)}," +
                     "crowdMode=${isRealtimeCrowdModeActive(realtimeNow)},session=${currentRealtimeRecognitionSessionId()}"
             )
+
+            appendLine("realtimeCloudBudget=$realtimeBudgetSnapshot,rescue=$rescueQueueSnapshot")
 
             appendLine("realtimeTracks=${realtimeTrackDiagnosticsSummary(realtimeNow)}")
 
@@ -18398,6 +19062,40 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val REALTIME_CLOUD_FAILURE_PRIORITY_PENALTY_MAX = 3
 
+        private const val REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT = 2
+
+        private const val REALTIME_CLOUD_HTTP_ROLLING_WINDOW_MS = 10_000L
+
+        private const val REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS = 10
+
+        private const val REALTIME_CLOUD_BUDGET_LOG_INTERVAL_MS = 2_000L
+
+        private const val REALTIME_RESCUE_MIN_INTERVAL_MS = 2_500L
+
+        private const val REALTIME_RESCUE_TRACK_NO_FACE_COOLDOWN_MS = 8_000L
+
+        private const val REALTIME_RESCUE_MAX_IN_FLIGHT = 1
+
+        private const val REALTIME_RESCUE_QUEUE_MAX = 6
+
+        private const val REALTIME_RESCUE_CANDIDATE_MAX_AGE_MS = 2_500L
+
+        private const val REALTIME_RESCUE_MIN_FACE_SIDE_PX = 35
+
+        private const val REALTIME_RESCUE_MAX_PRIMARY_FACE_SIDE_PX = 60
+
+        private const val REALTIME_RESCUE_MIN_FACE_AREA_RATIO = 0.0006f
+
+        private const val REALTIME_RESCUE_MIN_SKIN_RATIO = 0.035f
+
+        private const val REALTIME_RESCUE_MIN_QUALITY = 260
+
+        private const val REALTIME_RESCUE_NO_LOCAL_FACE_INTERVAL_MS = 5_000L
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO = 0.006f
+
+        private const val REALTIME_RESCUE_CLOUD_MAX_FACE_NUM = 5
+
         private const val REALTIME_UPLOAD_MIN_SIDE = 384
 
         private const val REALTIME_RETRY_UPLOAD_MIN_SIDE = 512
@@ -19037,6 +19735,44 @@ data class RealtimeUploadPayload(
     val cropHeight: Int
 )
 
+data class RealtimeCloudBudgetPermit(
+    val kind: String,
+    val trackId: Long?,
+    val rescue: Boolean,
+    val startedAt: Long
+)
+
+data class RealtimeRescueCandidate(
+    val createdAt: Long,
+    val decodedFrames: Long,
+    val frameBytes: ByteArray,
+    val frameWidth: Int,
+    val frameHeight: Int,
+    val reason: String,
+    val priority: Int,
+    val sourceTrackId: Long?,
+    val sourceFaceRect: Rect?,
+    val qualityScore: Int,
+    val dispatchScore: Int,
+    val skinRatio: Float,
+    val localFaceCount: Int,
+    val maxFaceNum: Int
+)
+
+data class RealtimeRescueUploadPlan(
+    val sessionId: Long,
+    val candidate: RealtimeRescueCandidate,
+    val budgetPermit: RealtimeCloudBudgetPermit
+)
+
+data class RealtimeRescueTrackHint(
+    val trackId: Long,
+    val lastSeenAt: Long,
+    val neverUploaded: Boolean,
+    val matchedRecently: Boolean,
+    val consecutiveFailures: Int
+)
+
 data class RealtimePersonTrack(
     val id: Long,
     var trackingId: Int?,
@@ -19077,7 +19813,8 @@ data class RealtimeCloudUploadPlan(
     val crowdMode: Boolean,
     val batchIndex: Int,
     val noFaceCountAtStart: Int,
-    val noFaceSuppressedUntilAtStart: Long
+    val noFaceSuppressedUntilAtStart: Long,
+    val initialBudgetPermit: RealtimeCloudBudgetPermit
 )
 
 data class LocalIpv4Candidate(
