@@ -10,6 +10,8 @@
     <string name="status_match_failed">❌ 未匹配到任何登记的专家档案</string>
     <string name="title_diagnostics">测试诊断日志</string>
     <string name="btn_copy_diagnostics">复制诊断</string>
+    <string name="btn_export_diagnostics">导出日志</string>
+    <string name="btn_clear_diagnostics">清空日志</string>
     <string name="diagnostics_empty">等待诊断信息...</string>
     <string name="title_main">乐奇眼镜识别</string>
     <string name="subtitle_main">无线抓拍 · 本地筛脸 · 云端核验</string>

@@ -112,6 +112,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 
 import com.bidding.glasses.databinding.ActivityMainBinding
 
@@ -197,6 +198,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var realtimeCloudExecutor: ExecutorService
 
     private lateinit var thumbnailExecutor: ExecutorService
+
+    private lateinit var diagnosticFileExecutor: ExecutorService
 
     private val faceDetector: FaceDetector by lazy {
 
@@ -623,6 +626,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private val diagnosticTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.CHINA)
 
+    private val persistentDiagnosticTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA)
+
     private val historyTimeFormat = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
 
     private val diagnosticLines = ArrayDeque<String>()
@@ -710,6 +715,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         realtimeCloudExecutor = Executors.newFixedThreadPool(REALTIME_CROWD_CLOUD_MAX_CONCURRENT_REQUESTS)
 
         thumbnailExecutor = Executors.newCachedThreadPool()
+
+        diagnosticFileExecutor = Executors.newSingleThreadExecutor()
 
         loadRecognitionRecords()
 
@@ -930,6 +937,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         binding.btnCopyDiagnostics.setOnClickListener {
 
             copyDiagnosticsToClipboard()
+
+        }
+
+        binding.btnExportDiagnostics.setOnClickListener {
+
+            exportDiagnosticsLogFile()
+
+        }
+
+        binding.btnClearDiagnostics.setOnClickListener {
+
+            clearDiagnosticsLogs()
 
         }
 
@@ -4514,6 +4533,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 faceRect = faceRect,
                 faceAreaRatio = faceAreaRatio,
                 quality = cloudGateQuality,
+                rawQuality = score.qualityScore,
+                sharpness = score.sharpnessScore,
                 yaw = face.headEulerAngleY,
                 pitch = face.headEulerAngleX,
                 skinRatio = skinRatio,
@@ -4806,6 +4827,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 if (!smallEnoughForRescue) {
                     return@mapNotNull null
                 }
+                if (!isRealtimeFaceRescueCandidateCredible(
+                        minSide = minSide,
+                        quality = score.qualityScore,
+                        sharpness = score.sharpnessScore,
+                        yaw = face.headEulerAngleY,
+                        skinRatio = skinRatio
+                    )
+                ) {
+                    return@mapNotNull null
+                }
                 if (skinRatio < REALTIME_RESCUE_MIN_SKIN_RATIO &&
                     score.qualityScore < REALTIME_RESCUE_MIN_QUALITY
                 ) {
@@ -4837,6 +4868,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     priority = priority,
                     sourceTrackId = trackHint?.trackId,
                     sourceFaceRect = Rect(rect),
+                    yaw = face.headEulerAngleY,
+                    pitch = face.headEulerAngleX,
                     qualityScore = score.qualityScore,
                     dispatchScore = score.dispatchScore,
                     skinRatio = skinRatio,
@@ -4851,7 +4884,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         if (faces.isEmpty() && now - lastRealtimeNoLocalFaceRescueCandidateAt >= REALTIME_RESCUE_NO_LOCAL_FACE_INTERVAL_MS) {
             val analysis = analyzeVideoRescueRegion(bitmap, emptyList())
-            if (analysis.skinRatio >= REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO) {
+            if (analysis.skinRatio >= REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO &&
+                isRealtimeNoLocalRescueRegionCredible(analysis)
+            ) {
                 lastRealtimeNoLocalFaceRescueCandidateAt = now
                 return RealtimeRescueCandidate(
                     createdAt = now,
@@ -4863,15 +4898,71 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     priority = 4,
                     sourceTrackId = null,
                     sourceFaceRect = analysis.regionRect?.toPixelRect(bitmap.width, bitmap.height),
+                    yaw = 0f,
+                    pitch = 0f,
                     qualityScore = 0,
                     dispatchScore = (analysis.skinRatio * VIDEO_RESCUE_SKIN_SCORE_WEIGHT).roundToInt(),
                     skinRatio = analysis.skinRatio,
                     localFaceCount = 0,
                     maxFaceNum = minOf(3, REALTIME_RESCUE_CLOUD_MAX_FACE_NUM)
                 )
+            } else if (analysis.skinRatio >= REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO) {
+                recordDiagnostic(
+                    "实时无本地脸救援跳过: reason=肤色区域不像人脸, " +
+                        "skin=${String.format(Locale.CHINA, "%.3f", analysis.skinRatio)}, " +
+                        "region=${String.format(Locale.CHINA, "%.2f", analysis.regionAreaRatio)}, " +
+                        "rect=${analysis.regionRect?.let { "${String.format(Locale.CHINA, "%.2f", it.width)}x${String.format(Locale.CHINA, "%.2f", it.height)}" } ?: "none"}"
+                )
             }
         }
         return null
+    }
+
+    private fun isRealtimeFaceRescueCandidateCredible(
+        minSide: Int,
+        quality: Int,
+        sharpness: Int,
+        yaw: Float,
+        skinRatio: Float
+    ): Boolean {
+        val sideProfile = abs(yaw) >= REALTIME_SIDE_PROFILE_MIN_YAW
+        val smallFace = minSide < REALTIME_MIN_CLOUD_FACE_SIDE_PX
+        if (minSide < REALTIME_RESCUE_TINY_FACE_SIDE_PX) {
+            return sideProfile &&
+                minSide >= REALTIME_RESCUE_MIN_FACE_SIDE_PX &&
+                quality >= REALTIME_RESCUE_TINY_SIDE_MIN_QUALITY &&
+                sharpness >= REALTIME_RESCUE_TINY_SIDE_MIN_SHARPNESS &&
+                skinRatio >= REALTIME_RESCUE_TINY_SIDE_MIN_SKIN_RATIO
+        }
+        if (!smallFace && !sideProfile && quality < REALTIME_RESCUE_QUALITY_GATE_MIN_QUALITY) {
+            return false
+        }
+        if (quality <= 0 && sharpness < REALTIME_RESCUE_ZERO_QUALITY_MIN_SHARPNESS) {
+            return false
+        }
+        return true
+    }
+
+    private fun isRealtimeNoLocalRescueRegionCredible(analysis: VideoRescueRegionAnalysis): Boolean {
+        val rect = analysis.regionRect ?: return false
+        val area = analysis.regionAreaRatio
+        if (area < REALTIME_RESCUE_NO_LOCAL_MIN_REGION_AREA_RATIO ||
+            area > REALTIME_RESCUE_NO_LOCAL_MAX_REGION_AREA_RATIO
+        ) {
+            return false
+        }
+        if (area > REALTIME_RESCUE_NO_LOCAL_LARGE_REGION_AREA_RATIO &&
+            analysis.skinRatio < REALTIME_RESCUE_NO_LOCAL_LARGE_REGION_MIN_SKIN_RATIO
+        ) {
+            return false
+        }
+        if (rect.width > REALTIME_RESCUE_NO_LOCAL_MAX_REGION_WIDTH_RATIO ||
+            rect.height > REALTIME_RESCUE_NO_LOCAL_MAX_REGION_HEIGHT_RATIO
+        ) {
+            return false
+        }
+        val aspect = rect.width / rect.height.coerceAtLeast(0.001f)
+        return aspect in REALTIME_RESCUE_NO_LOCAL_MIN_ASPECT_RATIO..REALTIME_RESCUE_NO_LOCAL_MAX_ASPECT_RATIO
     }
 
     private fun realtimeRescueTrackHint(
@@ -4999,6 +5090,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     )
                     return@executeRealtimeCloudWorker
                 }
+                if (!isRealtimeRescueUploadPrecheckPassed(rescue, upload)) {
+                    updateRealtimeCloudSummary(
+                        trackId = rescue.sourceTrackId ?: 0L,
+                        frame = rescue.decodedFrames,
+                        result = "rescue_precheck_noFace",
+                        costMs = 0,
+                        message = "救援上传图本地预检无脸"
+                    )
+                    recordDiagnostic(
+                        "实时救援云端识别跳过: frame=${rescue.decodedFrames}, reason=救援上传图本地预检无脸"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
                 val startedAt = System.currentTimeMillis()
                 val permitForSearch = budgetPermit
                 budgetPermit = null
@@ -5049,6 +5153,82 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun isRealtimeRescueUploadPrecheckPassed(
+        rescue: RealtimeRescueCandidate,
+        upload: RealtimeUploadPayload
+    ): Boolean {
+        if (!shouldPrecheckRealtimeRescueUpload(rescue)) {
+            return true
+        }
+        var uploadBitmap: Bitmap? = null
+        return try {
+            uploadBitmap = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
+            if (uploadBitmap == null) {
+                recordDiagnostic(
+                    "实时救援上传图本地预检跳过: frame=${rescue.decodedFrames}, reason=decode_failed, " +
+                        "rescue=${rescue.reason}, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                        "upload=${upload.uploadWidth}x${upload.uploadHeight}"
+                )
+                true
+            } else {
+                val faces = synchronized(lookbackFaceDetectorLock) {
+                    Tasks.await(
+                        getLookbackFaceDetectorLocked().process(InputImage.fromBitmap(uploadBitmap, 0)),
+                        REALTIME_RESCUE_UPLOAD_PRECHECK_TIMEOUT_MS,
+                        TimeUnit.MILLISECONDS
+                    )
+                }
+                val sourceRect = rescue.sourceFaceRect
+                val minSide = sourceRect?.let { minOf(it.width(), it.height()) } ?: 0
+                val sourceRectLabel = sourceRect?.let { "${it.width()}x${it.height()}" } ?: "none"
+                if (faces.isEmpty()) {
+                    recordDiagnostic(
+                        "实时救援上传图本地预检无脸: frame=${rescue.decodedFrames}, rescue=${rescue.reason}, " +
+                            "cropMode=${upload.cropMode}, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                            "upload=${uploadBitmap.width}x${uploadBitmap.height}, " +
+                            "candidateRect=$sourceRectLabel, " +
+                            "minSide=$minSide, q=${rescue.qualityScore}, p=${rescue.dispatchScore}, " +
+                            "yaw=${String.format(Locale.CHINA, "%.1f", rescue.yaw)}, " +
+                            "skin=${String.format(Locale.CHINA, "%.3f", rescue.skinRatio)}"
+                    )
+                    false
+                } else {
+                    recordDiagnostic(
+                        "实时救援上传图本地预检通过: frame=${rescue.decodedFrames}, rescue=${rescue.reason}, " +
+                            "faces=${faces.size}, cropMode=${upload.cropMode}, " +
+                            "upload=${uploadBitmap.width}x${uploadBitmap.height}, minSide=$minSide, " +
+                            "q=${rescue.qualityScore}, yaw=${String.format(Locale.CHINA, "%.1f", rescue.yaw)}"
+                    )
+                    true
+                }
+            }
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时救援上传图本地预检跳过: frame=${rescue.decodedFrames}, rescue=${rescue.reason}, reason=exception",
+                e
+            )
+            true
+        } finally {
+            try {
+                uploadBitmap?.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun shouldPrecheckRealtimeRescueUpload(rescue: RealtimeRescueCandidate): Boolean {
+        if (rescue.reason != "small_face_rescue") {
+            return false
+        }
+        if (abs(rescue.yaw) >= REALTIME_SIDE_PROFILE_MIN_YAW) {
+            return false
+        }
+        val sourceRect = rescue.sourceFaceRect ?: return false
+        val minSide = minOf(sourceRect.width(), sourceRect.height())
+        return minSide < REALTIME_RESCUE_SMALL_UPLOAD_PRECHECK_FACE_SIDE_PX ||
+            rescue.qualityScore < REALTIME_RESCUE_SMALL_UPLOAD_PRECHECK_MIN_QUALITY
+    }
+
     private fun prepareRealtimeRescueUploadPayload(rescue: RealtimeRescueCandidate): RealtimeUploadPayload? {
         val frameBitmap = BitmapFactory.decodeByteArray(rescue.frameBytes, 0, rescue.frameBytes.size)
         if (frameBitmap == null) {
@@ -5059,6 +5239,53 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         var uploadBitmap: Bitmap? = null
         return try {
+            rescue.sourceFaceRect?.let { sourceRect ->
+                val targetRect = clippedRect(Rect(sourceRect), frameBitmap.width, frameBitmap.height)
+                if (targetRect != null) {
+                    val uploadImage = buildRealtimeFaceUploadImageFromRect(
+                        sourceBitmap = frameBitmap,
+                        faceRect = targetRect,
+                        maxUploadSide = VIDEO_MAX_UPLOAD_IMAGE_SIDE,
+                        wideRetry = true
+                    )
+                    try {
+                        val uploadBytes = bitmapToJpegBytes(uploadImage.bitmap, FACE_UPLOAD_JPEG_QUALITY)
+                        val localRect = uploadImage.localFaceRects.firstOrNull() ?: FaceRect(
+                            0f,
+                            0f,
+                            uploadImage.bitmap.width.toFloat(),
+                            uploadImage.bitmap.height.toFloat()
+                        )
+                        val cropMode = if (rescue.reason == "no_local_face_skin_rescue") {
+                            "region_rescue"
+                        } else {
+                            "face_rescue"
+                        }
+                        recordDiagnostic(
+                            "实时局部救援裁剪上传: reason=${rescue.reason}, frame=${rescue.decodedFrames}, " +
+                                "target=${targetRect.width()}x${targetRect.height()}, " +
+                                "crop=${uploadImage.sourceCropRect.width()}x${uploadImage.sourceCropRect.height()}, " +
+                                "mode=$cropMode, upload=${uploadImage.bitmap.width}x${uploadImage.bitmap.height}, " +
+                                "bytes=${uploadBytes.size}"
+                        )
+                        return RealtimeUploadPayload(
+                            uploadBytes = uploadBytes,
+                            uploadWidth = uploadImage.bitmap.width,
+                            uploadHeight = uploadImage.bitmap.height,
+                            localFaceRect = localRect,
+                            sourceCropRect = faceRectFromPixelRect(uploadImage.sourceCropRect),
+                            cropMode = cropMode,
+                            cropWidth = uploadImage.sourceCropRect.width(),
+                            cropHeight = uploadImage.sourceCropRect.height()
+                        )
+                    } finally {
+                        try {
+                            uploadImage.bitmap.recycle()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
             uploadBitmap = resizeBitmapToMaxSide(frameBitmap, VIDEO_MAX_UPLOAD_IMAGE_SIDE)
             val bitmapForUpload = uploadBitmap ?: frameBitmap
             val uploadBytes = bitmapToJpegBytes(bitmapForUpload, FACE_UPLOAD_JPEG_QUALITY)
@@ -5120,8 +5347,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             faceAreaRatio = areaRatio,
             faceCenterX = rect.centerX().toFloat() / frameWidth.toFloat().coerceAtLeast(1f),
             faceCenterY = rect.centerY().toFloat() / frameHeight.toFloat().coerceAtLeast(1f),
-            yaw = 0f,
-            pitch = 0f,
+            yaw = yaw,
+            pitch = pitch,
             roll = 0f,
             skinRatio = skinRatio,
             trackingId = null
@@ -5245,6 +5472,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         faceRect: Rect,
         faceAreaRatio: Float,
         quality: Int,
+        rawQuality: Int,
+        sharpness: Int,
         yaw: Float,
         pitch: Float,
         skinRatio: Float,
@@ -5260,6 +5489,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         if (abs(yaw) > REALTIME_MAX_UPLOAD_YAW || abs(pitch) > REALTIME_MAX_UPLOAD_PITCH) {
             return RealtimeCloudCandidateDecision(false, "角度大")
+        }
+        if (!hasRealtimeUsableRawFaceSignal(rawQuality, sharpness, yaw, skinRatio)) {
+            return RealtimeCloudCandidateDecision(false, "清晰度低")
         }
         val minSide = minOf(faceRect.width(), faceRect.height())
         if (minSide < REALTIME_HARD_MIN_CLOUD_FACE_SIDE_PX) {
@@ -5289,6 +5521,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return RealtimeCloudCandidateDecision(false, if (sideProfile) "侧脸质量低" else "质量低")
         }
         return RealtimeCloudCandidateDecision(true, "")
+    }
+
+    private fun hasRealtimeUsableRawFaceSignal(
+        rawQuality: Int,
+        sharpness: Int,
+        yaw: Float,
+        skinRatio: Float
+    ): Boolean {
+        val sideProfile = abs(yaw) >= REALTIME_SIDE_PROFILE_MIN_YAW
+        val minRawQuality = if (sideProfile) {
+            REALTIME_SIDE_PROFILE_MIN_RAW_UPLOAD_QUALITY
+        } else {
+            REALTIME_MIN_RAW_UPLOAD_QUALITY
+        }
+        if (rawQuality >= minRawQuality) {
+            return true
+        }
+        val minSharpness = if (sideProfile) {
+            REALTIME_SIDE_PROFILE_MIN_UPLOAD_SHARPNESS
+        } else {
+            REALTIME_MIN_UPLOAD_SHARPNESS
+        }
+        val minSkinRatio = if (sideProfile) {
+            REALTIME_SIDE_PROFILE_RAW_MIN_SKIN_RATIO
+        } else {
+            REALTIME_RAW_MIN_SKIN_RATIO
+        }
+        return sharpness >= minSharpness && skinRatio >= minSkinRatio
+    }
+
+    private fun hasRealtimeUsableRawFaceSignal(candidate: RealtimeFaceCandidate): Boolean {
+        return hasRealtimeUsableRawFaceSignal(
+            rawQuality = candidate.qualityScore,
+            sharpness = candidate.sharpnessScore,
+            yaw = candidate.yaw,
+            skinRatio = candidate.skinRatio
+        )
     }
 
     private fun findOrCreateRealtimeTrackLocked(
@@ -5538,10 +5807,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     ): RealtimeCloudBudgetPermit? {
         synchronized(realtimeCloudBudgetLock) {
             trimRealtimeCloudBudgetLocked(now)
+            val skipRollingWindow = isRealtimeRetryKind(kind)
             val blockReason = when {
                 activeRealtimeCloudHttpRequestCount >= REALTIME_CLOUD_HTTP_MAX_IN_FLIGHT ->
                     "http_inflight_full"
-                realtimeCloudHttpRequestStarts.size >= REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS ->
+                !skipRollingWindow && realtimeCloudHttpRequestStarts.size >= REALTIME_CLOUD_HTTP_ROLLING_MAX_REQUESTS ->
                     "rolling_window_full"
                 rescue && now - lastRealtimeRescueHttpAt < REALTIME_RESCUE_MIN_INTERVAL_MS ->
                     "rescue_interval"
@@ -5561,7 +5831,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return null
             }
             activeRealtimeCloudHttpRequestCount += 1
-            realtimeCloudHttpRequestStarts.addLast(now)
+            if (!skipRollingWindow) {
+                realtimeCloudHttpRequestStarts.addLast(now)
+            }
             if (rescue) {
                 lastRealtimeRescueHttpAt = now
                 if (trackId != null) {
@@ -5575,6 +5847,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 startedAt = now
             )
         }
+    }
+
+    private fun isRealtimeRetryKind(kind: String): Boolean {
+        return kind == "primary_retry" || kind == "wide_retry"
     }
 
     private fun releaseRealtimeCloudHttpBudget(permit: RealtimeCloudBudgetPermit) {
@@ -5714,12 +5990,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 .mapNotNull { track ->
                     val candidate = track.bestCandidate ?: return@mapNotNull null
                     val candidateAgeMs = now - candidate.createdAt
-                    if (candidateAgeMs > REALTIME_CANDIDATE_MAX_AGE_MS) {
+                    val hasUsableSignal = hasRealtimeUsableRawFaceSignal(candidate)
+                    val candidateMaxAgeMs = if (hasUsableSignal &&
+                        candidate.qualityScore >= REALTIME_HIGH_QUALITY_CANDIDATE_MIN_QUALITY
+                    ) {
+                        REALTIME_HIGH_QUALITY_CANDIDATE_MAX_AGE_MS
+                    } else {
+                        REALTIME_CANDIDATE_MAX_AGE_MS
+                    }
+                    if (candidateAgeMs > candidateMaxAgeMs) {
                         recordDiagnostic(
                 "实时云端候选丢弃: track=${track.id}, reason=候选过期, " +
                                 "ageMs=$candidateAgeMs, frame=${candidate.decodedFrames}, " +
                                 "q=${candidate.qualityScore}, p=${candidate.dispatchScore}, " +
                                 "area=${String.format(Locale.CHINA, "%.4f", candidate.faceAreaRatio)}, " +
+                                "rect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}"
+                        )
+                        track.bestCandidate = null
+                        return@mapNotNull null
+                    }
+                    if (!hasUsableSignal) {
+                        recordDiagnostic(
+                            "实时云端候选丢弃: track=${track.id}, reason=真实人脸信号不足, " +
+                                "ageMs=$candidateAgeMs, frame=${candidate.decodedFrames}, " +
+                                "q=${candidate.qualityScore}, sharp=${candidate.sharpnessScore}, " +
+                                "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}, " +
+                                "p=${candidate.dispatchScore}, area=${String.format(Locale.CHINA, "%.4f", candidate.faceAreaRatio)}, " +
                                 "rect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}"
                         )
                         track.bestCandidate = null
@@ -5785,8 +6081,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     compareBy<Pair<RealtimePersonTrack, RealtimeFaceCandidate>> {
                         realtimeCloudDispatchPriority(it.first)
                     }
-                        .thenByDescending { it.second.dispatchScore }
+                        .thenBy { it.first.consecutiveNoFaceCount }
                         .thenByDescending { it.second.qualityScore }
+                        .thenByDescending { it.second.dispatchScore }
                         .thenByDescending { it.second.faceAreaRatio }
                 )
                 .take(availableSlots)
@@ -5930,9 +6227,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             track.lastNoFaceQuality.toFloat().coerceAtLeast(1f)
         val areaRatio = candidate.faceAreaRatio /
             track.lastNoFaceAreaRatio.coerceAtLeast(0.000001f)
-        val sizeImproved = areaRatio >= REALTIME_NO_FACE_SUPPRESS_AREA_BREAK_RATIO ||
-            candidate.faceRectInFrame.width() >= track.lastNoFaceFaceWidth + REALTIME_NO_FACE_SUPPRESS_SIDE_BREAK_PX ||
-            candidate.faceRectInFrame.height() >= track.lastNoFaceFaceHeight + REALTIME_NO_FACE_SUPPRESS_SIDE_BREAK_PX
+        val sizeImproved = hasRealtimeUsableRawFaceSignal(candidate) &&
+            (areaRatio >= REALTIME_NO_FACE_SUPPRESS_AREA_BREAK_RATIO ||
+                candidate.faceRectInFrame.width() >= track.lastNoFaceFaceWidth + REALTIME_NO_FACE_SUPPRESS_SIDE_BREAK_PX ||
+                candidate.faceRectInFrame.height() >= track.lastNoFaceFaceHeight + REALTIME_NO_FACE_SUPPRESS_SIDE_BREAK_PX)
         val qualityImproved = qualityGain >= REALTIME_NO_FACE_SUPPRESS_QUALITY_BREAK_GAIN ||
             qualityRatio >= REALTIME_NO_FACE_SUPPRESS_QUALITY_BREAK_RATIO
         return sizeImproved || qualityImproved || isRealtimeNoFaceAbsoluteHighQualityBreakthrough(candidate)
@@ -6008,13 +6306,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         val minSide = minOf(candidate.faceRectInFrame.width(), candidate.faceRectInFrame.height())
         val isNoFace = isNoFaceCloudResult(result)
-        if (isNoFace && minSide < REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_FACE_SIDE_PX) {
-            return false
+        if (isNoFace) {
+            val credibleSmallFace =
+                minSide >= REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_FACE_SIDE_PX &&
+                    hasRealtimeUsableRawFaceSignal(candidate) &&
+                    (candidate.qualityScore >= REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_QUALITY ||
+                        candidate.sharpnessScore >= REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_SHARPNESS ||
+                        candidate.dispatchScore >= REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_DISPATCH_SCORE)
+            return credibleSmallFace
         }
-        val minQualityLimit = if (isNoFace) 250 else REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_QUALITY
-        val minDispatchLimit = if (isNoFace) 400 else REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_DISPATCH_SCORE
         return minSide >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_FACE_SIDE_PX &&
-            (candidate.qualityScore >= minQualityLimit || candidate.dispatchScore >= minDispatchLimit)
+            (candidate.qualityScore >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_QUALITY ||
+                candidate.dispatchScore >= REALTIME_WIDE_NO_MATCH_PRIMARY_RETRY_MIN_DISPATCH_SCORE)
     }
 
     private fun startRealtimeCloudRecognition(plan: RealtimeCloudUploadPlan) {
@@ -6078,6 +6381,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     )
                     return@executeRealtimeCloudWorker
                 }
+                if (!isRealtimeCloudUploadPrecheckPassed(plan.trackId, candidate, upload)) {
+                    updateRealtimeCloudSummary(
+                        trackId = plan.trackId,
+                        frame = candidate.decodedFrames,
+                        result = "upload_precheck_no_face",
+                        costMs = -1L,
+                        message = "上传图本地预检无脸"
+                    )
+                    recordDiagnostic(
+                        "实时云端识别跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                            "reason=上传图本地预检无脸, cropMode=${upload.cropMode}, " +
+                            "crop=${upload.cropWidth}x${upload.cropHeight}, upload=${upload.uploadWidth}x${upload.uploadHeight}, " +
+                            "q=${candidate.qualityScore}, sharp=${candidate.sharpnessScore}, " +
+                            "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}"
+                    )
+                    return@executeRealtimeCloudWorker
+                }
                 recordDiagnostic(
                         "实时云端识别候选采用: session=${plan.sessionId}, track=${plan.trackId}, reason=${plan.reason}, " +
                         "frame=${candidate.decodedFrames}, q=${candidate.qualityScore}, " +
@@ -6118,6 +6438,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         "message=${result.message.take(80)}"
                 )
                 var finalUpload = upload
+                val triedPrimaryUpload = !preferWideUpload
                 if (result.experts.isEmpty() && isNoFaceCloudResult(result) && !preferWideUpload) {
                     recordDiagnostic(
                         "实时云端识别触发大范围重试: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
@@ -6160,6 +6481,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     }
                 }
                 if (result.experts.isEmpty() &&
+                    !triedPrimaryUpload &&
                     shouldRetryRealtimePrimaryAfterWideNoMatch(candidate, finalUpload, result)
                 ) {
                     recordDiagnostic(
@@ -6170,32 +6492,49 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     )
                     val primaryRetryUpload = prepareRealtimeUploadPayload(candidate, wideRetry = false)
                     if (primaryRetryUpload != null) {
-                        recordDiagnostic(
-                            "实时云端识别主裁剪重试候选采用: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
-                                "mode=${primaryRetryUpload.cropMode}, crop=${primaryRetryUpload.cropWidth}x${primaryRetryUpload.cropHeight}, " +
-                                "upload=${primaryRetryUpload.uploadWidth}x${primaryRetryUpload.uploadHeight}, bytes=${primaryRetryUpload.uploadBytes.size}"
-                        )
-                        val primaryRetryStartedAt = System.currentTimeMillis()
-                        val primaryRetryResult = searchRealtimeFaceOnCloudWithBudget(
-                            "data:image/jpeg;base64,${Base64.encodeToString(primaryRetryUpload.uploadBytes, Base64.NO_WRAP)}",
-                            1,
-                            "实时视频主裁剪重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}",
-                            kind = "primary_retry",
-                            trackId = plan.trackId,
-                            rescue = false
-                        )
-                        if (primaryRetryResult != null) {
-                            result = primaryRetryResult
+                        if (!isRealtimePrimaryRetryAfterWideNoFacePrecheckPassed(plan.trackId, candidate, primaryRetryUpload)) {
                             recordDiagnostic(
-                                "实时云端识别主裁剪重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
-                                    "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - primaryRetryStartedAt}, " +
-                                    "message=${result.message.take(80)}"
+                                "实时云端识别主裁剪重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                                    "reason=主裁剪上传图本地预检无脸, crop=${primaryRetryUpload.cropWidth}x${primaryRetryUpload.cropHeight}, " +
+                                    "upload=${primaryRetryUpload.uploadWidth}x${primaryRetryUpload.uploadHeight}, " +
+                                    "q=${candidate.qualityScore}, sharp=${candidate.sharpnessScore}, " +
+                                    "yaw=${String.format(Locale.CHINA, "%.1f", candidate.yaw)}"
                             )
-                            finalUpload = primaryRetryUpload
+                            updateRealtimeCloudSummary(
+                                trackId = plan.trackId,
+                                frame = candidate.decodedFrames,
+                                result = "primary_retry_precheck_noFace",
+                                costMs = System.currentTimeMillis() - cloudStartedAt,
+                                message = "主裁剪重试本地预检无脸"
+                            )
                         } else {
                             recordDiagnostic(
-                                "实时云端识别主裁剪重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=请求预算不足"
+                                "实时云端识别主裁剪重试候选采用: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                                    "mode=${primaryRetryUpload.cropMode}, crop=${primaryRetryUpload.cropWidth}x${primaryRetryUpload.cropHeight}, " +
+                                    "upload=${primaryRetryUpload.uploadWidth}x${primaryRetryUpload.uploadHeight}, bytes=${primaryRetryUpload.uploadBytes.size}"
                             )
+                            val primaryRetryStartedAt = System.currentTimeMillis()
+                            val primaryRetryResult = searchRealtimeFaceOnCloudWithBudget(
+                                "data:image/jpeg;base64,${Base64.encodeToString(primaryRetryUpload.uploadBytes, Base64.NO_WRAP)}",
+                                1,
+                                "实时视频主裁剪重试 track=${plan.trackId} frame=${candidate.decodedFrames} mode=${if (plan.crowdMode) "crowd" else "normal"}",
+                                kind = "primary_retry",
+                                trackId = plan.trackId,
+                                rescue = false
+                            )
+                            if (primaryRetryResult != null) {
+                                result = primaryRetryResult
+                                recordDiagnostic(
+                                    "实时云端识别主裁剪重试返回: track=${plan.trackId}, frame=${candidate.decodedFrames}, " +
+                                        "experts=${result.experts.size}, costMs=${System.currentTimeMillis() - primaryRetryStartedAt}, " +
+                                        "message=${result.message.take(80)}"
+                                )
+                                finalUpload = primaryRetryUpload
+                            } else {
+                                recordDiagnostic(
+                                    "实时云端识别主裁剪重试跳过: track=${plan.trackId}, frame=${candidate.decodedFrames}, reason=请求预算不足"
+                                )
+                            }
                         }
                     } else {
                         recordDiagnostic(
@@ -6244,6 +6583,216 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 maybeStartRealtimeCloudRecognition()
                 maybeStartRealtimeFrameRescue()
+            }
+        }
+    }
+
+    private fun isRealtimeCloudUploadPrecheckPassed(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload
+    ): Boolean {
+        return isRealtimePrimaryUploadPrecheckPassed(trackId, candidate, upload) &&
+            isRealtimeWideRetryUploadPrecheckPassed(trackId, candidate, upload)
+    }
+
+    private fun isRealtimePrimaryUploadPrecheckPassed(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload
+    ): Boolean {
+        if (upload.cropMode != "primary") {
+            return true
+        }
+        val minSide = minOf(candidate.faceRectInFrame.width(), candidate.faceRectInFrame.height())
+        val lowQualityCandidate = candidate.qualityScore <= 0
+        val minPrecheckSide = if (lowQualityCandidate) {
+            REALTIME_PRIMARY_UPLOAD_PRECHECK_LOW_Q_MIN_FACE_SIDE_PX
+        } else {
+            REALTIME_PRIMARY_UPLOAD_PRECHECK_MIN_FACE_SIDE_PX
+        }
+        if (minSide < minPrecheckSide) {
+            return true
+        }
+        val maxYaw = if (lowQualityCandidate) {
+            REALTIME_PRIMARY_UPLOAD_PRECHECK_LOW_Q_MAX_YAW
+        } else {
+            REALTIME_PRIMARY_UPLOAD_PRECHECK_MAX_YAW
+        }
+        if (abs(candidate.yaw) > maxYaw ||
+            abs(candidate.pitch) > REALTIME_PRIMARY_UPLOAD_PRECHECK_MAX_PITCH
+        ) {
+            return true
+        }
+        var uploadBitmap: Bitmap? = null
+        try {
+            uploadBitmap = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
+            if (uploadBitmap == null) {
+                recordDiagnostic(
+                    "实时云端识别上传图本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "reason=decode_failed, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                        "upload=${upload.uploadWidth}x${upload.uploadHeight}"
+                )
+                return true
+            }
+            val faces = synchronized(lookbackFaceDetectorLock) {
+                Tasks.await(
+                    getLookbackFaceDetectorLocked().process(InputImage.fromBitmap(uploadBitmap, 0)),
+                    REALTIME_PRIMARY_UPLOAD_PRECHECK_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+            if (faces.isEmpty()) {
+                recordDiagnostic(
+                    "实时云端识别上传图本地预检无脸: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "crop=${upload.cropWidth}x${upload.cropHeight}, upload=${uploadBitmap.width}x${uploadBitmap.height}, " +
+                        "candidateRect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}, " +
+                        "q=${candidate.qualityScore}, sharp=${candidate.sharpnessScore}, " +
+                        "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}, lowQ=$lowQualityCandidate"
+                )
+                return false
+            }
+            recordDiagnostic(
+                "实时云端识别上传图本地预检通过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                    "faces=${faces.size}, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                    "upload=${uploadBitmap.width}x${uploadBitmap.height}, lowQ=$lowQualityCandidate"
+            )
+            return true
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时云端识别上传图本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, reason=exception",
+                e
+            )
+            return true
+        } finally {
+            try {
+                uploadBitmap?.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun isRealtimeWideRetryUploadPrecheckPassed(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload
+    ): Boolean {
+        if (upload.cropMode != "wide_retry") {
+            return true
+        }
+        val minSide = minOf(candidate.faceRectInFrame.width(), candidate.faceRectInFrame.height())
+        val needsHighRiskPrecheck = candidate.qualityScore <= REALTIME_WIDE_UPLOAD_PRECHECK_MAX_QUALITY &&
+            minSide <= REALTIME_WIDE_UPLOAD_PRECHECK_MAX_FACE_SIDE_PX &&
+            candidate.dispatchScore <= REALTIME_WIDE_UPLOAD_PRECHECK_MAX_DISPATCH_SCORE
+        if (!needsHighRiskPrecheck) {
+            return true
+        }
+        var uploadBitmap: Bitmap? = null
+        try {
+            uploadBitmap = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
+            if (uploadBitmap == null) {
+                recordDiagnostic(
+                    "实时云端识别大范围上传图本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "reason=decode_failed, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                        "upload=${upload.uploadWidth}x${upload.uploadHeight}"
+                )
+                return true
+            }
+            val faces = synchronized(lookbackFaceDetectorLock) {
+                Tasks.await(
+                    getLookbackFaceDetectorLocked().process(InputImage.fromBitmap(uploadBitmap, 0)),
+                    REALTIME_WIDE_UPLOAD_PRECHECK_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+            if (faces.isEmpty()) {
+                recordDiagnostic(
+                    "实时云端识别大范围上传图本地预检无脸: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "crop=${upload.cropWidth}x${upload.cropHeight}, upload=${uploadBitmap.width}x${uploadBitmap.height}, " +
+                        "candidateRect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}, " +
+                        "q=${candidate.qualityScore}, gateQ=${candidate.cloudGateQuality}, p=${candidate.dispatchScore}, " +
+                        "sharp=${candidate.sharpnessScore}, yaw=${String.format(Locale.CHINA, "%.1f", candidate.yaw)}, " +
+                        "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}"
+                )
+                return false
+            }
+            recordDiagnostic(
+                "实时云端识别大范围上传图本地预检通过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                    "faces=${faces.size}, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                    "upload=${uploadBitmap.width}x${uploadBitmap.height}, q=${candidate.qualityScore}, p=${candidate.dispatchScore}"
+            )
+            return true
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时云端识别大范围上传图本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, reason=exception",
+                e
+            )
+            return true
+        } finally {
+            try {
+                uploadBitmap?.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun isRealtimePrimaryRetryAfterWideNoFacePrecheckPassed(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload
+    ): Boolean {
+        if (upload.cropMode != "primary") {
+            return true
+        }
+        if (abs(candidate.yaw) > REALTIME_PRIMARY_RETRY_AFTER_WIDE_NO_FACE_PRECHECK_MAX_YAW) {
+            return true
+        }
+        var uploadBitmap: Bitmap? = null
+        try {
+            uploadBitmap = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
+            if (uploadBitmap == null) {
+                recordDiagnostic(
+                    "实时云端识别主裁剪重试本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "reason=decode_failed, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                        "upload=${upload.uploadWidth}x${upload.uploadHeight}"
+                )
+                return true
+            }
+            val faces = synchronized(lookbackFaceDetectorLock) {
+                Tasks.await(
+                    getLookbackFaceDetectorLocked().process(InputImage.fromBitmap(uploadBitmap, 0)),
+                    REALTIME_PRIMARY_RETRY_AFTER_WIDE_NO_FACE_PRECHECK_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+            if (faces.isEmpty()) {
+                recordDiagnostic(
+                    "实时云端识别主裁剪重试本地预检无脸: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "crop=${upload.cropWidth}x${upload.cropHeight}, upload=${uploadBitmap.width}x${uploadBitmap.height}, " +
+                        "candidateRect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}, " +
+                        "q=${candidate.qualityScore}, gateQ=${candidate.cloudGateQuality}, p=${candidate.dispatchScore}, " +
+                        "sharp=${candidate.sharpnessScore}, yaw=${String.format(Locale.CHINA, "%.1f", candidate.yaw)}, " +
+                        "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}"
+                )
+                return false
+            }
+            recordDiagnostic(
+                "实时云端识别主裁剪重试本地预检通过: track=$trackId, frame=${candidate.decodedFrames}, " +
+                    "faces=${faces.size}, crop=${upload.cropWidth}x${upload.cropHeight}, " +
+                    "upload=${uploadBitmap.width}x${uploadBitmap.height}, q=${candidate.qualityScore}, " +
+                    "yaw=${String.format(Locale.CHINA, "%.1f", candidate.yaw)}"
+            )
+            return true
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时云端识别主裁剪重试本地预检跳过: track=$trackId, frame=${candidate.decodedFrames}, reason=exception",
+                e
+            )
+            return true
+        } finally {
+            try {
+                uploadBitmap?.recycle()
+            } catch (_: Exception) {
             }
         }
     }
@@ -6479,6 +7028,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (minSide < REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_SIDE_PX) {
             return false
         }
+        if (!hasRealtimeUsableRawFaceSignal(candidate)) {
+            return false
+        }
         return candidate.cloudGateQuality >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_GATE_QUALITY ||
             candidate.dispatchScore >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_DISPATCH_SCORE ||
             candidate.qualityScore >= REALTIME_LOST_FACE_COOLDOWN_BYPASS_MIN_QUALITY
@@ -6503,7 +7055,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             candidate.faceRectInFrame.width() - track.lastCloudUploadFaceWidth,
             candidate.faceRectInFrame.height() - track.lastCloudUploadFaceHeight
         )
-        val sizeSignificant = track.lastCloudUploadAreaRatio > 0f &&
+        val sizeSignificant = hasRealtimeUsableRawFaceSignal(candidate) &&
+            track.lastCloudUploadAreaRatio > 0f &&
             (areaGainRatio >= REALTIME_SIZE_JUMP_MIN_AREA_RATIO ||
                 sideGain >= REALTIME_SIZE_JUMP_MIN_SIDE_GAIN_PX)
         return qualitySignificant ||
@@ -6551,7 +7104,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             candidate.faceRectInFrame.width() - track.lastCloudUploadFaceWidth,
             candidate.faceRectInFrame.height() - track.lastCloudUploadFaceHeight
         )
-        val sizeSignificant = track.lastCloudUploadAreaRatio > 0f &&
+        val sizeSignificant = hasRealtimeUsableRawFaceSignal(candidate) &&
+            track.lastCloudUploadAreaRatio > 0f &&
             (areaGainRatio >= REALTIME_SIZE_JUMP_MIN_AREA_RATIO ||
                 sideGain >= REALTIME_SIZE_JUMP_MIN_SIDE_GAIN_PX)
         val lostHighQuality = isRealtimeLostHighQualityCooldownBreak(track, candidate, now)
@@ -6586,6 +7140,57 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             message.contains("未检测到人脸")
     }
 
+    private fun diagnoseRealtimeNoFaceUpload(
+        trackId: Long,
+        candidate: RealtimeFaceCandidate,
+        upload: RealtimeUploadPayload,
+        message: String
+    ) {
+        var uploadBitmap: Bitmap? = null
+        try {
+            uploadBitmap = BitmapFactory.decodeByteArray(upload.uploadBytes, 0, upload.uploadBytes.size)
+            if (uploadBitmap == null) {
+                recordDiagnostic(
+                    "实时 NoFace 上传图本地复检失败: track=$trackId, frame=${candidate.decodedFrames}, " +
+                        "reason=decode_failed, cropMode=${upload.cropMode}, upload=${upload.uploadWidth}x${upload.uploadHeight}, " +
+                        "bytes=${upload.uploadBytes.size}, message=${message.take(80)}"
+                )
+                return
+            }
+            val faces = synchronized(lookbackFaceDetectorLock) {
+                Tasks.await(
+                    getLookbackFaceDetectorLocked().process(InputImage.fromBitmap(uploadBitmap, 0)),
+                    REALTIME_NO_FACE_UPLOAD_DIAG_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+            val boxes = faces.take(5).joinToString(";") { face ->
+                val rect = face.boundingBox
+                "${rect.width()}x${rect.height()}@${rect.left},${rect.top}"
+            }
+            recordDiagnostic(
+                "实时 NoFace 上传图本地复检: track=$trackId, frame=${candidate.decodedFrames}, " +
+                    "uploadLocalFaces=${faces.size}, cropMode=${upload.cropMode}, " +
+                    "crop=${upload.cropWidth}x${upload.cropHeight}, upload=${uploadBitmap.width}x${uploadBitmap.height}, " +
+                    "candidateRect=${candidate.faceRectInFrame.width()}x${candidate.faceRectInFrame.height()}, " +
+                    "q=${candidate.qualityScore}, sharp=${candidate.sharpnessScore}, " +
+                    "skin=${String.format(Locale.CHINA, "%.3f", candidate.skinRatio)}, " +
+                    "boxes=$boxes, message=${message.take(80)}"
+            )
+        } catch (e: Exception) {
+            recordDiagnostic(
+                "实时 NoFace 上传图本地复检异常: track=$trackId, frame=${candidate.decodedFrames}, " +
+                    "cropMode=${upload.cropMode}, upload=${upload.uploadWidth}x${upload.uploadHeight}",
+                e
+            )
+        } finally {
+            try {
+                uploadBitmap?.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private fun handleRealtimeCloudResult(
         trackId: Long,
         candidate: RealtimeFaceCandidate,
@@ -6611,6 +7216,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 noFace = noFace,
                 message = result.message
             )
+            if (noFace) {
+                diagnoseRealtimeNoFaceUpload(trackId, candidate, upload, result.message)
+            }
             recordDiagnostic(
                     "实时云端识别未匹配: track=$trackId, frame=${candidate.decodedFrames}, " +
                     "q=${candidate.qualityScore}, gateQ=${candidate.cloudGateQuality}, " +
@@ -10083,8 +10691,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             minSide
         )
         val cropped = Bitmap.createBitmap(sourceBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
-        val uploadBitmap = resizeBitmapForUpload(cropped, maxUploadSide)
-        if (uploadBitmap !== cropped) {
+        val resizedBitmap = resizeBitmapForUpload(cropped, maxUploadSide)
+        val uploadBitmap = if (resizedBitmap === sourceBitmap) {
+            resizedBitmap.copy(resizedBitmap.config ?: Bitmap.Config.ARGB_8888, false)
+        } else {
+            resizedBitmap
+        }
+        if (uploadBitmap !== cropped && cropped !== sourceBitmap) {
             try {
                 cropped.recycle()
             } catch (_: Exception) {
@@ -17893,6 +18506,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         }
 
+        appendPersistentDiagnostic(message, throwable)
+
         if (throwable == null && isRealtimeCloudDiagnosticMessage(message)) {
             rememberRealtimeCloudDiagnosticLine(fullLine)
         }
@@ -17932,9 +18547,59 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun isRealtimeCloudDiagnosticMessage(message: String): Boolean {
         return message.startsWith("实时云端识别") ||
             message.startsWith("实时云端候选") ||
+            message.startsWith("实时救援") ||
+            message.startsWith("实时局部救援") ||
             message.startsWith("实时 NoFace") ||
             message.startsWith("实时同人") ||
             message.startsWith("实时识别记录")
+    }
+
+    private fun appendPersistentDiagnostic(message: String, throwable: Throwable?) {
+        if (!::diagnosticFileExecutor.isInitialized || diagnosticFileExecutor.isShutdown) {
+            return
+        }
+        val timestamp = synchronized(persistentDiagnosticTimeFormat) {
+            persistentDiagnosticTimeFormat.format(Date())
+        }
+        val persistentLine = if (throwable != null) {
+            "[$timestamp] $message\n${Log.getStackTraceString(throwable).lineSequence().take(8).joinToString("\n")}"
+        } else {
+            "[$timestamp] $message"
+        }
+        try {
+            diagnosticFileExecutor.execute {
+                try {
+                    val file = persistentDiagnosticFile()
+                    file.appendText("$persistentLine\n", Charsets.UTF_8)
+                    trimPersistentDiagnosticFileIfNeeded(file)
+                } catch (e: Exception) {
+                    Log.w(TAG, "append persistent diagnostics failed", e)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "append persistent diagnostics rejected", e)
+        }
+    }
+
+    private fun persistentDiagnosticFile(): File {
+        val dir = File(filesDir, "diagnostics")
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+        return File(dir, PERSISTENT_DIAGNOSTIC_FILE_NAME)
+    }
+
+    private fun trimPersistentDiagnosticFileIfNeeded(file: File) {
+        if (!file.exists() || file.length() <= PERSISTENT_DIAGNOSTIC_MAX_BYTES) {
+            return
+        }
+        val bytes = file.readBytes()
+        val keepBytes = bytes.takeLast(PERSISTENT_DIAGNOSTIC_TRIM_TO_BYTES)
+        val keptText = String(keepBytes.toByteArray(), Charsets.UTF_8)
+        file.writeText(
+            "[日志已自动裁剪，仅保留最近约 ${PERSISTENT_DIAGNOSTIC_TRIM_TO_BYTES / 1024}KB]\n$keptText",
+            Charsets.UTF_8
+        )
     }
 
     private fun rememberRealtimeCloudDiagnosticLine(line: String) {
@@ -17976,6 +18641,119 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         recordDiagnostic("用户复制诊断信息: chars=${diagnostics.length}")
 
+    }
+
+    private fun exportDiagnosticsLogFile() {
+        if (!::diagnosticFileExecutor.isInitialized || diagnosticFileExecutor.isShutdown) {
+            Toast.makeText(this, "日志导出失败：日志线程未就绪", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "正在准备诊断日志文件...", Toast.LENGTH_SHORT).show()
+        diagnosticFileExecutor.execute {
+            try {
+                val exportDir = File(cacheDir, "exports")
+                if (!exportDir.exists()) {
+                    exportDir.mkdirs()
+                }
+                exportDir.listFiles()?.forEach { file ->
+                    if (file.isFile && System.currentTimeMillis() - file.lastModified() > DIAGNOSTIC_EXPORT_RETENTION_MS) {
+                        file.delete()
+                    }
+                }
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.CHINA).format(Date())
+                val exportFile = File(exportDir, "rokid-diagnostics-$stamp.txt")
+                val snapshot = collectDiagnosticsSnapshot()
+                val persistentText = try {
+                    val persistentFile = persistentDiagnosticFile()
+                    if (persistentFile.exists()) {
+                        persistentFile.readText(Charsets.UTF_8)
+                    } else {
+                        ""
+                    }
+                } catch (e: Exception) {
+                    "读取持久日志失败: ${e.message}"
+                }
+                exportFile.writeText(
+                    buildString {
+                        appendLine(snapshot)
+                        appendLine()
+                        appendLine("----- persistent logs -----")
+                        if (persistentText.isBlank()) {
+                            appendLine("暂无持久日志")
+                        } else {
+                            append(persistentText)
+                        }
+                    },
+                    Charsets.UTF_8
+                )
+                runOnUiThread {
+                    shareDiagnosticsFile(exportFile)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "export diagnostics failed", e)
+                runOnUiThread {
+                    Toast.makeText(this, "导出诊断日志失败：${e.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun shareDiagnosticsFile(file: File) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "乐奇眼镜伴侣诊断日志")
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(sendIntent, "导出诊断日志"))
+            recordDiagnostic("用户导出诊断日志文件: path=${file.absolutePath}, bytes=${file.length()}")
+        } catch (e: Exception) {
+            recordDiagnostic("导出诊断日志分享失败: path=${file.absolutePath}", e)
+            Toast.makeText(this, "导出诊断日志失败：${e.message ?: "无法分享文件"}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun clearDiagnosticsLogs() {
+        synchronized(diagnosticLines) {
+            diagnosticLines.clear()
+        }
+        synchronized(realtimeCloudEventLines) {
+            realtimeCloudEventLines.clear()
+        }
+        if (::binding.isInitialized) {
+            binding.tvDiagnostics.text = getString(R.string.diagnostics_empty)
+        }
+        if (!::diagnosticFileExecutor.isInitialized || diagnosticFileExecutor.isShutdown) {
+            Toast.makeText(this, "已清空当前日志，日志文件线程未就绪", Toast.LENGTH_SHORT).show()
+            Log.d(TAG, "diagnostics logs cleared: persistent executor unavailable")
+            return
+        }
+        try {
+            diagnosticFileExecutor.execute {
+                try {
+                    persistentDiagnosticFile().writeText("", Charsets.UTF_8)
+                    File(cacheDir, "exports").listFiles()?.forEach { file ->
+                        if (file.isFile && file.name.startsWith("rokid-diagnostics-")) {
+                            file.delete()
+                        }
+                    }
+                    runOnUiThread {
+                        Toast.makeText(this, "诊断日志已清空", Toast.LENGTH_SHORT).show()
+                    }
+                    Log.d(TAG, "diagnostics logs cleared")
+                } catch (e: Exception) {
+                    Log.e(TAG, "clear diagnostics logs failed", e)
+                    runOnUiThread {
+                        Toast.makeText(this, "清空日志文件失败：${e.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "clear diagnostics logs rejected", e)
+            Toast.makeText(this, "已清空当前日志，日志文件清空任务被拒绝", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun collectDiagnosticsSnapshot(): String {
@@ -18621,6 +19399,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (::thumbnailExecutor.isInitialized) thumbnailExecutor.shutdown()
 
+        if (::diagnosticFileExecutor.isInitialized) diagnosticFileExecutor.shutdown()
+
         tts?.stop()
 
         tts?.shutdown()
@@ -18634,6 +19414,30 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     companion object {
+        private const val REALTIME_MIN_RAW_UPLOAD_QUALITY = 80
+        private const val REALTIME_SIDE_PROFILE_MIN_RAW_UPLOAD_QUALITY = 40
+        private const val REALTIME_MIN_UPLOAD_SHARPNESS = 450
+        private const val REALTIME_SIDE_PROFILE_MIN_UPLOAD_SHARPNESS = 520
+        private const val REALTIME_RAW_MIN_SKIN_RATIO = 0.045f
+        private const val REALTIME_SIDE_PROFILE_RAW_MIN_SKIN_RATIO = 0.055f
+        private const val REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_FACE_SIDE_PX = 70
+        private const val REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_QUALITY = 250
+        private const val REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_SHARPNESS = 700
+        private const val REALTIME_WIDE_NO_FACE_PRIMARY_RETRY_MIN_DISPATCH_SCORE = 600
+        private const val REALTIME_NO_FACE_UPLOAD_DIAG_TIMEOUT_MS = 700L
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_MIN_FACE_SIDE_PX = 90
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_LOW_Q_MIN_FACE_SIDE_PX = 70
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_MAX_YAW = 25f
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_LOW_Q_MAX_YAW = 35f
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_MAX_PITCH = 25f
+        private const val REALTIME_PRIMARY_UPLOAD_PRECHECK_TIMEOUT_MS = 700L
+        private const val REALTIME_WIDE_UPLOAD_PRECHECK_MAX_QUALITY = 120
+        private const val REALTIME_WIDE_UPLOAD_PRECHECK_MAX_FACE_SIDE_PX = 100
+        private const val REALTIME_WIDE_UPLOAD_PRECHECK_MAX_DISPATCH_SCORE = 350
+        private const val REALTIME_WIDE_UPLOAD_PRECHECK_TIMEOUT_MS = 700L
+        private const val REALTIME_PRIMARY_RETRY_AFTER_WIDE_NO_FACE_PRECHECK_MAX_YAW = 35f
+        private const val REALTIME_PRIMARY_RETRY_AFTER_WIDE_NO_FACE_PRECHECK_TIMEOUT_MS = 700L
+
 
         private const val TAG = "RokidCxrWireless"
 
@@ -18704,9 +19508,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val RESULT_BEEP_DURATION_MS = 180
 
-        private const val MAX_DIAGNOSTIC_LINES = 80
+        private const val MAX_DIAGNOSTIC_LINES = 220
 
-        private const val MAX_REALTIME_CLOUD_EVENT_LINES = 24
+        private const val MAX_REALTIME_CLOUD_EVENT_LINES = 80
+
+        private const val PERSISTENT_DIAGNOSTIC_FILE_NAME = "diagnostics.log"
+
+        private const val PERSISTENT_DIAGNOSTIC_MAX_BYTES = 2 * 1024 * 1024
+
+        private const val PERSISTENT_DIAGNOSTIC_TRIM_TO_BYTES = 1536 * 1024
+
+        private const val DIAGNOSTIC_EXPORT_RETENTION_MS = 24L * 60L * 60L * 1000L
 
         private const val DEFAULT_GALLERY_BATCH_SIZE = 5
 
@@ -18965,6 +19777,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val REALTIME_RECORD_DEDUPE_CACHE_MS = 2L * 60L * 1000L
 
         private const val REALTIME_CANDIDATE_MAX_AGE_MS = 3_000L
+        private const val REALTIME_HIGH_QUALITY_CANDIDATE_MIN_QUALITY = 1_200
+        private const val REALTIME_HIGH_QUALITY_CANDIDATE_MAX_AGE_MS = 4_500L
 
         private const val REALTIME_LOST_FACE_FLUSH_MS = 450L
 
@@ -19090,9 +19904,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         private const val REALTIME_RESCUE_MIN_QUALITY = 260
 
+        private const val REALTIME_RESCUE_QUALITY_GATE_MIN_QUALITY = 260
+
+        private const val REALTIME_RESCUE_SMALL_UPLOAD_PRECHECK_FACE_SIDE_PX = 60
+
+        private const val REALTIME_RESCUE_SMALL_UPLOAD_PRECHECK_MIN_QUALITY = 650
+
+        private const val REALTIME_RESCUE_UPLOAD_PRECHECK_TIMEOUT_MS = 700L
+
+        private const val REALTIME_RESCUE_TINY_FACE_SIDE_PX = 50
+
+        private const val REALTIME_RESCUE_TINY_SIDE_MIN_QUALITY = 420
+
+        private const val REALTIME_RESCUE_TINY_SIDE_MIN_SHARPNESS = 520
+
+        private const val REALTIME_RESCUE_TINY_SIDE_MIN_SKIN_RATIO = 0.10f
+
+        private const val REALTIME_RESCUE_ZERO_QUALITY_MIN_SHARPNESS = 420
+
         private const val REALTIME_RESCUE_NO_LOCAL_FACE_INTERVAL_MS = 5_000L
 
-        private const val REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO = 0.006f
+        private const val REALTIME_RESCUE_NO_LOCAL_MIN_SKIN_RATIO = 0.10f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MIN_REGION_AREA_RATIO = 0.002f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MAX_REGION_AREA_RATIO = 0.28f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_LARGE_REGION_AREA_RATIO = 0.16f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_LARGE_REGION_MIN_SKIN_RATIO = 0.28f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MAX_REGION_WIDTH_RATIO = 0.78f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MAX_REGION_HEIGHT_RATIO = 0.78f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MIN_ASPECT_RATIO = 0.55f
+
+        private const val REALTIME_RESCUE_NO_LOCAL_MAX_ASPECT_RATIO = 1.9f
 
         private const val REALTIME_RESCUE_CLOUD_MAX_FACE_NUM = 5
 
@@ -19752,6 +20600,8 @@ data class RealtimeRescueCandidate(
     val priority: Int,
     val sourceTrackId: Long?,
     val sourceFaceRect: Rect?,
+    val yaw: Float,
+    val pitch: Float,
     val qualityScore: Int,
     val dispatchScore: Int,
     val skinRatio: Float,
