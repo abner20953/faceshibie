@@ -11,6 +11,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -59,6 +60,9 @@ class EmbeddedRtmpReceiver(
         val lastAudioCodec: String = "",
         val firstVideoAtMs: Long = 0L,
         val lastDataAtMs: Long = 0L,
+        val disconnectCount: Long = 0L,
+        val recentDisconnectCount: Int = 0,
+        val lastDisconnectAtMs: Long = 0L,
         val message: String = "未启动"
     )
 
@@ -81,6 +85,9 @@ class EmbeddedRtmpReceiver(
     private var outboundChunkSize = DEFAULT_RTMP_CHUNK_SIZE
     private var lastSnapshotEmitAt = 0L
     private var lastAcknowledgedPayloadBytes = 0L
+    private var disconnectCount = 0L
+    private var lastDisconnectAtMs = 0L
+    private val recentDisconnectAtMs = ArrayDeque<Long>()
 
     fun start() {
         if (executor != null) {
@@ -206,13 +213,18 @@ class EmbeddedRtmpReceiver(
             }
         } catch (e: EOFException) {
             callback.onLog("RTMP 客户端断开: remote=$remote")
+            if (!stopRequested) {
+                recordClientDisconnect()
+            }
         } catch (e: SocketTimeoutException) {
             if (!stopRequested) {
                 callback.onLog("RTMP 客户端读取超时: remote=$remote", e)
+                recordClientDisconnect()
             }
         } catch (e: Exception) {
             if (!stopRequested) {
                 callback.onLog("RTMP 客户端处理异常: remote=$remote", e)
+                recordClientDisconnect()
             }
         } finally {
             try {
@@ -227,6 +239,23 @@ class EmbeddedRtmpReceiver(
                 remoteAddress = "",
                 message = if (stopRequested) "RTMP 接收服务正在停止" else "眼镜推流已断开，继续等待新连接..."
             )
+        }
+    }
+
+    private fun recordClientDisconnect(now: Long = System.currentTimeMillis()) {
+        disconnectCount += 1L
+        lastDisconnectAtMs = now
+        recentDisconnectAtMs.addLast(now)
+        trimRecentDisconnects(now)
+    }
+
+    private fun trimRecentDisconnects(now: Long = System.currentTimeMillis()) {
+        while (true) {
+            val first = recentDisconnectAtMs.firstOrNull() ?: break
+            if (now - first <= RECENT_DISCONNECT_WINDOW_MS) {
+                break
+            }
+            recentDisconnectAtMs.removeFirst()
         }
     }
 
@@ -378,7 +407,7 @@ class EmbeddedRtmpReceiver(
                 }
             }
             RTMP_MSG_USER_CONTROL -> handleUserControl(output, payload)
-            RTMP_MSG_AUDIO -> Unit
+            RTMP_MSG_AUDIO -> handleAudio(payload)
             RTMP_MSG_VIDEO -> handleVideo(payload, timestampMs)
             RTMP_MSG_DATA_AMF0, RTMP_MSG_DATA_AMF3 -> handleMetadata(payload)
             RTMP_MSG_COMMAND_AMF0, RTMP_MSG_COMMAND_AMF3 -> handleCommand(output, typeId, messageStreamId, payload)
@@ -559,6 +588,8 @@ class EmbeddedRtmpReceiver(
         message: String = snapshot.message
     ) {
         val oldMessage = snapshot.message
+        val now = System.currentTimeMillis()
+        trimRecentDisconnects(now)
         snapshot = snapshot.copy(
             running = running,
             listening = listening,
@@ -576,9 +607,11 @@ class EmbeddedRtmpReceiver(
             lastAudioCodec = lastAudioCodec,
             firstVideoAtMs = firstVideoAtMs,
             lastDataAtMs = lastDataAtMs,
+            disconnectCount = disconnectCount,
+            recentDisconnectCount = recentDisconnectAtMs.size,
+            lastDisconnectAtMs = lastDisconnectAtMs,
             message = message
         )
-        val now = System.currentTimeMillis()
         if (now - lastSnapshotEmitAt > SNAPSHOT_EMIT_INTERVAL_MS ||
             !running ||
             message != oldMessage ||
@@ -918,6 +951,7 @@ class EmbeddedRtmpReceiver(
         private const val SERVER_OUTBOUND_CHUNK_SIZE = 4096
         private const val SERVER_ACK_WINDOW_SIZE = 5_000_000
         private const val SERVER_ACK_EVERY_BYTES = 1_000_000L
+        private const val RECENT_DISCONNECT_WINDOW_MS = 60_000L
         private const val SERVER_ACCEPT_TIMEOUT_MS = 1000
         private const val SOCKET_READ_TIMEOUT_MS = 5000
         private const val SNAPSHOT_EMIT_INTERVAL_MS = 1000L
